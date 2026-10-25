@@ -34,7 +34,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a multi-target Dockerfile, CI (lint, typecheck, unit tests, integration tests, Docker builds).
 - `docs/ARCHITECTURE.md`.
 
-### Notes
+### Changed
 
-- Depends on `@smallseedlabs/proba-protocol` pinned to a commit of the unmerged PR #4
-  (see `PROTOCOL_PIN_NOTE.md`); switch to the `v0.2.0` tag once released.
+- Depend on `@smallseedlabs/proba-protocol` at the `v0.2.0` release tag (was a commit of then-unmerged PR #4).
