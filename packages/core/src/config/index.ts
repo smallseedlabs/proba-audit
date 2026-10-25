@@ -8,6 +8,7 @@
 import { hostname } from 'node:os';
 import { config as loadDotenv } from 'dotenv';
 import { z } from 'zod';
+import { metricPlatformSchema, type MetricPlatform } from '@smallseedlabs/proba-protocol/audit';
 
 const logLevels = ['trace', 'debug', 'info', 'warn', 'error', 'silent'] as const;
 
@@ -26,6 +27,8 @@ export const envSchema = z.object({
   EVENT_BUS: nonEmpty('redis-streams'),
   AUDIT_STORE: nonEmpty('clickhouse'),
   METRICS_STORE: nonEmpty('clickhouse'),
+  CHECKPOINT_STORE: nonEmpty('clickhouse'),
+  QUARANTINE_STORE: nonEmpty('clickhouse'),
 
   // Redis Streams
   REDIS_URL: nonEmpty('redis://localhost:6379'),
@@ -48,6 +51,39 @@ export const envSchema = z.object({
     .transform((v) => v === 'true'),
   SELF_AUDIT_WORKSPACE_ID: nonEmpty('seedbed'),
 
+  // Metrics ingestion (apps/metrics-ingester). PLATFORM_CONNECTORS is a list of
+  // platform:adapter pairs (for example meta:stub,google:stub); empty ingests nothing.
+  PLATFORM_CONNECTORS: z.string().default(''),
+  // The stub connector (development data source) refuses to start in production unless this is true.
+  ALLOW_STUB_CONNECTOR: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((v) => v === 'true'),
+  INGEST_WORKSPACE_ID: nonEmpty('seedbed'),
+  INGEST_INTERVAL_MS: positiveInt(60000),
+  // Per-connector interval overrides, platform:ms pairs (for example meta:30000,google:120000).
+  INGEST_INTERVAL_OVERRIDES: z.string().default(''),
+  INGEST_JITTER_RATIO: z.coerce.number().min(0).max(1).default(0.1),
+  INGEST_GRANULARITY: z.enum(['hour', 'day']).default('hour'),
+  INGEST_INITIAL_LOOKBACK_HOURS: positiveInt(48),
+  INGEST_MAX_ATTEMPTS: positiveInt(4),
+  INGEST_RETRY_BASE_MS: positiveInt(1000),
+  INGEST_RETRY_MAX_MS: positiveInt(30000),
+  INGEST_MAX_RATE_LIMIT_WAIT_MS: positiveInt(60000),
+  INGEST_FAILURE_BACKOFF_MAX_MS: positiveInt(600000),
+  INGEST_ACCOUNT_REFRESH_MS: positiveInt(300000),
+  INGEST_PAGE_SIZE: positiveInt(500),
+
+  // Stub connector data (development data source)
+  STUB_SEED: nonEmpty('proba-dev'),
+  STUB_RESTATE_EVERY_MINUTES: positiveInt(30),
+  STUB_RESTATE_REVISIONS: nonNegativeInt(2),
+  STUB_FAILURE_RATE: z.coerce.number().min(0).max(1).default(0),
+
+  // Rollup process (apps/rollup)
+  ROLLUP_INTERVAL_MS: positiveInt(30000),
+  ROLLUP_MAX_WINDOW_DAYS: positiveInt(7),
+
   // ClickHouse
   CLICKHOUSE_URL: nonEmpty('http://localhost:8123'),
   CLICKHOUSE_USER: nonEmpty('default'),
@@ -66,7 +102,13 @@ export interface AppConfig {
   service: { name: string; host: string; port: number };
   log: { level: Env['LOG_LEVEL'] };
   /** Registry names of the selected adapters. */
-  adapters: { eventBus: string; auditStore: string; metricsStore: string };
+  adapters: {
+    eventBus: string;
+    auditStore: string;
+    metricsStore: string;
+    checkpointStore: string;
+    quarantineStore: string;
+  };
   eventBus: {
     redisUrl: string;
     auditTopic: string;
@@ -89,6 +131,30 @@ export interface AppConfig {
     /** Workspace for self-audit events that belong to no workspace (for example an unparseable message). */
     selfAuditWorkspaceId: string;
   };
+  /** Which ad platforms are ingested, and through which adapter. */
+  connectors: {
+    pairs: { platform: MetricPlatform; adapter: string }[];
+    /** Explicit opt-in to run the stub connector in production. */
+    allowStub: boolean;
+    stub: { seed: string; restateEveryMinutes: number; restateRevisions: number; failureRate: number };
+  };
+  ingest: {
+    workspaceId: string;
+    intervalMs: number;
+    /** Per-platform interval overrides. */
+    intervalOverridesMs: Partial<Record<MetricPlatform, number>>;
+    jitterRatio: number;
+    granularity: 'hour' | 'day';
+    initialLookbackHours: number;
+    maxAttempts: number;
+    retryBaseMs: number;
+    retryMaxMs: number;
+    maxRateLimitWaitMs: number;
+    failureBackoffMaxMs: number;
+    accountRefreshMs: number;
+    pageSize: number;
+  };
+  rollup: { intervalMs: number; maxWindowDays: number };
   clickhouse: {
     url: string;
     username: string;
@@ -96,6 +162,36 @@ export interface AppConfig {
     database: string;
     migrationsDir: string;
   };
+}
+
+/** `meta:stub,google:stub` -> pairs. Each platform at most once; platforms come from the protocol enum. */
+export function parsePlatformConnectors(value: string): { platform: MetricPlatform; adapter: string }[] {
+  const pairs: { platform: MetricPlatform; adapter: string }[] = [];
+  for (const raw of value.split(',').map((v) => v.trim()).filter(Boolean)) {
+    const [platform, adapter, ...rest] = raw.split(':');
+    const parsed = metricPlatformSchema.safeParse(platform);
+    if (!parsed.success || !adapter || rest.length > 0 || !/^[a-z][a-z0-9-]*$/.test(adapter)) {
+      throw new Error(`"${raw}" is not platform:adapter (platform one of ${metricPlatformSchema.options.join(', ')}; adapter like "stub")`);
+    }
+    if (pairs.some((p) => p.platform === parsed.data)) throw new Error(`platform "${parsed.data}" is listed twice`);
+    pairs.push({ platform: parsed.data, adapter });
+  }
+  return pairs;
+}
+
+/** `meta:30000,google:120000` -> map of platform to ms. */
+export function parseIntervalOverrides(value: string): Partial<Record<MetricPlatform, number>> {
+  const out: Partial<Record<MetricPlatform, number>> = {};
+  for (const raw of value.split(',').map((v) => v.trim()).filter(Boolean)) {
+    const [platform, ms, ...rest] = raw.split(':');
+    const parsed = metricPlatformSchema.safeParse(platform);
+    const n = Number(ms);
+    if (!parsed.success || rest.length > 0 || !Number.isInteger(n) || n <= 0) {
+      throw new Error(`"${raw}" is not platform:milliseconds`);
+    }
+    out[parsed.data] = n;
+  }
+  return out;
 }
 
 export class ConfigError extends Error {
@@ -131,6 +227,21 @@ export function loadConfig(env: EnvSource = process.env, options: LoadConfigOpti
   }
   const e = parsed.data;
 
+  const issues: string[] = [];
+  let pairs: { platform: MetricPlatform; adapter: string }[] = [];
+  let overrides: Partial<Record<MetricPlatform, number>> = {};
+  try {
+    pairs = parsePlatformConnectors(e.PLATFORM_CONNECTORS);
+  } catch (err) {
+    issues.push(`PLATFORM_CONNECTORS: ${(err as Error).message}`);
+  }
+  try {
+    overrides = parseIntervalOverrides(e.INGEST_INTERVAL_OVERRIDES);
+  } catch (err) {
+    issues.push(`INGEST_INTERVAL_OVERRIDES: ${(err as Error).message}`);
+  }
+  if (issues.length > 0) throw new ConfigError(issues);
+
   return {
     env: e.NODE_ENV,
     isDevelopment: e.NODE_ENV === 'development',
@@ -142,7 +253,13 @@ export function loadConfig(env: EnvSource = process.env, options: LoadConfigOpti
       port: e.PORT,
     },
     log: { level: e.LOG_LEVEL },
-    adapters: { eventBus: e.EVENT_BUS, auditStore: e.AUDIT_STORE, metricsStore: e.METRICS_STORE },
+    adapters: {
+      eventBus: e.EVENT_BUS,
+      auditStore: e.AUDIT_STORE,
+      metricsStore: e.METRICS_STORE,
+      checkpointStore: e.CHECKPOINT_STORE,
+      quarantineStore: e.QUARANTINE_STORE,
+    },
     eventBus: {
       redisUrl: e.REDIS_URL,
       auditTopic: e.AUDIT_TOPIC,
@@ -161,6 +278,32 @@ export function loadConfig(env: EnvSource = process.env, options: LoadConfigOpti
       selfAudit: e.SELF_AUDIT_ENABLED,
       selfAuditWorkspaceId: e.SELF_AUDIT_WORKSPACE_ID,
     },
+    connectors: {
+      pairs,
+      allowStub: e.ALLOW_STUB_CONNECTOR,
+      stub: {
+        seed: e.STUB_SEED,
+        restateEveryMinutes: e.STUB_RESTATE_EVERY_MINUTES,
+        restateRevisions: e.STUB_RESTATE_REVISIONS,
+        failureRate: e.STUB_FAILURE_RATE,
+      },
+    },
+    ingest: {
+      workspaceId: e.INGEST_WORKSPACE_ID,
+      intervalMs: e.INGEST_INTERVAL_MS,
+      intervalOverridesMs: overrides,
+      jitterRatio: e.INGEST_JITTER_RATIO,
+      granularity: e.INGEST_GRANULARITY,
+      initialLookbackHours: e.INGEST_INITIAL_LOOKBACK_HOURS,
+      maxAttempts: e.INGEST_MAX_ATTEMPTS,
+      retryBaseMs: e.INGEST_RETRY_BASE_MS,
+      retryMaxMs: e.INGEST_RETRY_MAX_MS,
+      maxRateLimitWaitMs: e.INGEST_MAX_RATE_LIMIT_WAIT_MS,
+      failureBackoffMaxMs: e.INGEST_FAILURE_BACKOFF_MAX_MS,
+      accountRefreshMs: e.INGEST_ACCOUNT_REFRESH_MS,
+      pageSize: e.INGEST_PAGE_SIZE,
+    },
+    rollup: { intervalMs: e.ROLLUP_INTERVAL_MS, maxWindowDays: e.ROLLUP_MAX_WINDOW_DAYS },
     clickhouse: {
       url: e.CLICKHOUSE_URL,
       username: e.CLICKHOUSE_USER,

@@ -8,3 +8,4 @@ export * from './redis/index.js';
 export * from './clickhouse/index.js';
 export * from './runtime/index.js';
 export * from './postgres/index.js';
+export * from './stub/index.js';
