@@ -14,7 +14,7 @@ export default defineConfig({
   test: {
     globals: true,
     environment: 'node',
-    include: ['packages/*/src/**/*.integration.test.ts'],
+    include: ['packages/*/src/**/*.integration.test.ts', 'apps/*/src/**/*.integration.test.ts'],
     testTimeout: 30000,
     hookTimeout: 60000,
     fileParallelism: false, // Run test files sequentially: they share one Redis and one ClickHouse

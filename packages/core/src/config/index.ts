@@ -38,6 +38,16 @@ export const envSchema = z.object({
   BUS_MAX_DELIVERIES: positiveInt(5),
   BUS_MAX_STREAM_LENGTH: z.coerce.number().int().positive().optional(),
 
+  // Audit consumer
+  CONSUMER_RECLAIM_INTERVAL_MS: positiveInt(30000),
+  CONSUMER_RETRY_BASE_MS: positiveInt(500),
+  CONSUMER_RETRY_MAX_MS: positiveInt(30000),
+  SELF_AUDIT_ENABLED: z
+    .enum(['true', 'false'])
+    .default('true')
+    .transform((v) => v === 'true'),
+  SELF_AUDIT_WORKSPACE_ID: nonEmpty('seedbed'),
+
   // ClickHouse
   CLICKHOUSE_URL: nonEmpty('http://localhost:8123'),
   CLICKHOUSE_USER: nonEmpty('default'),
@@ -67,6 +77,17 @@ export interface AppConfig {
     claimIdleMs: number;
     maxDeliveries: number;
     maxStreamLength?: number;
+  };
+  consumer: {
+    /** How often the consumer reclaims pending messages of crashed consumers. */
+    reclaimIntervalMs: number;
+    /** Backoff between retries of a batch the store rejected (doubles up to the max). */
+    retryBaseMs: number;
+    retryMaxMs: number;
+    /** Emit the consumer's own audit events (processed batches, dead letters). */
+    selfAudit: boolean;
+    /** Workspace for self-audit events that belong to no workspace (for example an unparseable message). */
+    selfAuditWorkspaceId: string;
   };
   clickhouse: {
     url: string;
@@ -132,6 +153,13 @@ export function loadConfig(env: EnvSource = process.env, options: LoadConfigOpti
       claimIdleMs: e.BUS_CLAIM_IDLE_MS,
       maxDeliveries: e.BUS_MAX_DELIVERIES,
       maxStreamLength: e.BUS_MAX_STREAM_LENGTH,
+    },
+    consumer: {
+      reclaimIntervalMs: e.CONSUMER_RECLAIM_INTERVAL_MS,
+      retryBaseMs: e.CONSUMER_RETRY_BASE_MS,
+      retryMaxMs: e.CONSUMER_RETRY_MAX_MS,
+      selfAudit: e.SELF_AUDIT_ENABLED,
+      selfAuditWorkspaceId: e.SELF_AUDIT_WORKSPACE_ID,
     },
     clickhouse: {
       url: e.CLICKHOUSE_URL,

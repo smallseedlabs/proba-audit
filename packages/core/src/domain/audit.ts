@@ -84,8 +84,14 @@ export interface AuditAggregateRow {
 
 export interface AppendResult {
   inserted: number;
-  /** Events skipped because an event with the same eventId is already stored. */
+  /** Identical events skipped because an event with the same eventId and the same content is already stored. */
   duplicates: number;
+  /**
+   * eventIds that were NOT written because an event with that id is already
+   * stored (or earlier in the batch) with different content. The caller must
+   * dead-letter and log them.
+   */
+  conflicts: string[];
 }
 
 export interface ChainHead {
@@ -93,3 +99,29 @@ export interface ChainHead {
   hash: string;
   ingestedAt: string;
 }
+
+/** Locates a stored event cheaply: workspace and time narrow the ClickHouse scan. */
+export interface AuditEventRef {
+  eventId: string;
+  workspaceId: string;
+  /** The event's occurredAt (UTC ISO 8601, Z). */
+  occurredAt: string;
+}
+
+/**
+ * Options for AuditStore.readChain: events of one workspace in chain order
+ * (ingestedAt, then eventId). `from` is inclusive and `to` exclusive, on ingestedAt.
+ */
+export interface ReadChainOptions {
+  from?: string;
+  to?: string;
+  /** Continue after this event (keyset cursor in the chosen order). */
+  after?: { ingestedAt: string; eventId: string };
+  /** Default 'asc' (oldest first). */
+  order?: 'asc' | 'desc';
+  /** Default 1000, maximum 10000. */
+  limit?: number;
+}
+
+export const CHAIN_READ_DEFAULT_LIMIT = 1000;
+export const CHAIN_READ_MAX_LIMIT = 10_000;

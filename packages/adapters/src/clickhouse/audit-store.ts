@@ -5,12 +5,17 @@ import {
   type AppendResult,
   type AuditAggregateQuery,
   type AuditAggregateRow,
+  type AuditEventRef,
   type AuditFilter,
   type AuditGroupBy,
   type AuditQuery,
   type AuditStore,
   type ChainHead,
+  type ReadChainOptions,
   type StoredAuditEvent,
+  CHAIN_READ_DEFAULT_LIMIT,
+  CHAIN_READ_MAX_LIMIT,
+  sameContent,
 } from '@smallseedlabs/proba-audit-core';
 
 const TS = (name: string) => `parseDateTime64BestEffort({${name}:String}, 3, 'UTC')`;
@@ -222,38 +227,80 @@ export class ClickHouseAuditStore implements AuditStore {
   }
 
   async appendBatch(events: StoredAuditEvent[]): Promise<AppendResult> {
-    if (events.length === 0) return { inserted: 0, duplicates: 0 };
+    if (events.length === 0) return { inserted: 0, duplicates: 0, conflicts: [] };
 
-    const seen = new Set<string>();
-    const unique: StoredAuditEvent[] = [];
+    // First occurrence in the batch wins; a later one is a duplicate or a conflict.
+    const firstById = new Map<string, StoredAuditEvent>();
+    let duplicates = 0;
+    const conflicts = new Set<string>();
     for (const e of events) {
-      if (!seen.has(e.eventId)) {
-        seen.add(e.eventId);
-        unique.push(e);
-      }
+      const first = firstById.get(e.eventId);
+      if (!first) firstById.set(e.eventId, e);
+      else if (sameContent(first, e)) duplicates += 1;
+      else conflicts.add(e.eventId);
     }
-    // Look for already-stored copies, restricted to the batch's workspaces and
-    // time span so the primary index (workspace_id, occurred_at) prunes the scan.
-    const times = unique.map((e) => Date.parse(e.occurredAt));
-    const existing = await this.rows<{ event_id: string }>(
-      `SELECT event_id FROM audit_events
-       WHERE workspace_id IN {workspaces:Array(String)}
-         AND occurred_at >= ${TS('min')} AND occurred_at <= ${TS('max')}
-         AND event_id IN {ids:Array(UUID)}`,
-      {
-        workspaces: [...new Set(unique.map((e) => e.workspaceId))],
-        min: new Date(Math.min(...times)).toISOString(),
-        max: new Date(Math.max(...times)).toISOString(),
-        ids: unique.map((e) => e.eventId),
-      }
-    );
-    const stored = new Set(existing.map((r) => r.event_id));
-    const fresh = unique.filter((e) => !stored.has(e.eventId));
+    const unique = [...firstById.values()];
+
+    const stored = new Map((await this.findExisting(unique)).map((e) => [e.eventId, e]));
+    const fresh: StoredAuditEvent[] = [];
+    for (const e of unique) {
+      const existing = stored.get(e.eventId);
+      if (!existing) fresh.push(e);
+      else if (sameContent(existing, e)) duplicates += 1;
+      else conflicts.add(e.eventId);
+    }
 
     if (fresh.length > 0) {
       await this.client.insert({ table: 'audit_events', values: fresh.map(toRow), format: 'JSONEachRow' });
     }
-    return { inserted: fresh.length, duplicates: events.length - fresh.length };
+    return { inserted: fresh.length, duplicates, conflicts: [...conflicts] };
+  }
+
+  /** Look up stored copies, restricted to the refs' workspaces and time span so the primary index prunes the scan. */
+  async findExisting(refs: AuditEventRef[]): Promise<StoredAuditEvent[]> {
+    if (refs.length === 0) return [];
+    const times = refs.map((r) => Date.parse(r.occurredAt));
+    const rows = await this.rows<AuditRow>(
+      `SELECT * FROM audit_events
+       WHERE workspace_id IN {workspaces:Array(String)}
+         AND occurred_at >= ${TS('min')} AND occurred_at <= ${TS('max')}
+         AND event_id IN {ids:Array(UUID)}`,
+      {
+        workspaces: [...new Set(refs.map((r) => r.workspaceId))],
+        min: new Date(Math.min(...times)).toISOString(),
+        max: new Date(Math.max(...times)).toISOString(),
+        ids: [...new Set(refs.map((r) => r.eventId))],
+      }
+    );
+    return rows.map(fromRow);
+  }
+
+  async readChain(workspaceId: string, options: ReadChainOptions = {}): Promise<StoredAuditEvent[]> {
+    const limit = Math.min(options.limit ?? CHAIN_READ_DEFAULT_LIMIT, CHAIN_READ_MAX_LIMIT);
+    const asc = (options.order ?? 'asc') === 'asc';
+    const clauses = ['workspace_id = {workspaceId:String}'];
+    const params: Record<string, unknown> = { workspaceId, limit };
+    if (options.from !== undefined) {
+      clauses.push(`ingested_at >= ${TS('from')}`);
+      params.from = options.from;
+    }
+    if (options.to !== undefined) {
+      clauses.push(`ingested_at < ${TS('to')}`);
+      params.to = options.to;
+    }
+    if (options.after !== undefined) {
+      clauses.push(`(ingested_at, event_id) ${asc ? '>' : '<'} (${TS('afterAt')}, {afterId:UUID})`);
+      params.afterAt = options.after.ingestedAt;
+      params.afterId = options.after.eventId;
+    }
+    const dir = asc ? 'ASC' : 'DESC';
+    // ingested_at is not in the sorting key: this reads the workspace. Meant for verification jobs.
+    const rows = await this.rows<AuditRow>(
+      `SELECT * FROM audit_events WHERE ${clauses.join(' AND ')}
+       ORDER BY ingested_at ${dir}, event_id ${dir} LIMIT {limit:UInt32}`,
+      params
+    );
+    return rows.map(fromRow);
   }
 
   async query(query: AuditQuery): Promise<StoredAuditEvent[]> {

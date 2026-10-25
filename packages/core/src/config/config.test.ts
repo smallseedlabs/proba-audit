@@ -31,6 +31,20 @@ describe('loadConfig', () => {
     expect(c.eventBus).toMatchObject({ batchSize: 250, maxStreamLength: 100000, consumerName: 'c-1' });
   });
 
+  it('has consumer defaults and reads overrides', () => {
+    expect(loadConfig({}).consumer).toEqual({
+      reclaimIntervalMs: 30000,
+      retryBaseMs: 500,
+      retryMaxMs: 30000,
+      selfAudit: true,
+      selfAuditWorkspaceId: 'seedbed',
+    });
+    expect(
+      loadConfig({ SELF_AUDIT_ENABLED: 'false', CONSUMER_RETRY_MAX_MS: '1000', SELF_AUDIT_WORKSPACE_ID: 'ops' }).consumer
+    ).toMatchObject({ selfAudit: false, retryMaxMs: 1000, selfAuditWorkspaceId: 'ops' });
+    expect(() => loadConfig({ SELF_AUDIT_ENABLED: 'maybe' })).toThrow(/SELF_AUDIT_ENABLED/);
+  });
+
   it('accepts adapter names that are not built in (new adapters need no schema change)', () => {
     expect(loadConfig({ EVENT_BUS: 'kafka' }).adapters.eventBus).toBe('kafka');
   });

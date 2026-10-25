@@ -55,7 +55,7 @@ export function runAuditStoreContract(name: string, factory: () => Promise<Audit
       });
       const minimal = makeStoredAuditEvent({ workspaceId, occurredAt: '2026-10-25T10:00:05.000Z' });
       const result = await store.appendBatch([full, minimal]);
-      expect(result).toEqual({ inserted: 2, duplicates: 0 });
+      expect(result).toEqual({ inserted: 2, duplicates: 0, conflicts: [] });
 
       const got = await store.query({ workspaceId, order: 'asc' });
       expect(got).toHaveLength(2);
@@ -67,13 +67,76 @@ export function runAuditStoreContract(name: string, factory: () => Promise<Audit
       const store = await create();
       const workspaceId = uniqueName('ws');
       const e = makeStoredAuditEvent({ workspaceId });
-      expect(await store.appendBatch([e, e])).toEqual({ inserted: 1, duplicates: 1 });
-      expect(await store.appendBatch([e])).toEqual({ inserted: 0, duplicates: 1 });
+      expect(await store.appendBatch([e, e])).toEqual({ inserted: 1, duplicates: 1, conflicts: [] });
+      expect(await store.appendBatch([e])).toEqual({ inserted: 0, duplicates: 1, conflicts: [] });
       expect(await store.query({ workspaceId })).toHaveLength(1);
     });
 
+    it('treats a redelivery that differs only in chain fields as a duplicate', async () => {
+      const store = await create();
+      const workspaceId = uniqueName('ws');
+      const e = makeStoredAuditEvent({ workspaceId });
+      await store.appendBatch([e]);
+      const rechained = { ...e, prevHash: randomHash(), hash: randomHash(), ingestedAt: '2026-10-25T10:05:00.000Z' };
+      expect(await store.appendBatch([rechained])).toEqual({ inserted: 0, duplicates: 1, conflicts: [] });
+    });
+
+    it('does not write an eventId that is stored with different content and reports it as a conflict', async () => {
+      const store = await create();
+      const workspaceId = uniqueName('ws');
+      const e = makeStoredAuditEvent({ workspaceId, action: 'command.received' });
+      await store.appendBatch([e]);
+      const altered = { ...e, action: 'command.rejected', outcome: 'denied' as const };
+      const other = makeStoredAuditEvent({ workspaceId });
+      const result = await store.appendBatch([altered, other]);
+      expect(result).toEqual({ inserted: 1, duplicates: 0, conflicts: [e.eventId] });
+      const stored = await store.query({ workspaceId, order: 'asc' });
+      expect(stored).toHaveLength(2);
+      expect(stored.find((x) => x.eventId === e.eventId)?.action).toBe('command.received');
+    });
+
+    it('reports a conflict between two events with the same id inside one batch (first wins)', async () => {
+      const store = await create();
+      const workspaceId = uniqueName('ws');
+      const e = makeStoredAuditEvent({ workspaceId, action: 'command.received' });
+      const clash = { ...e, action: 'command.rejected' };
+      expect(await store.appendBatch([e, clash])).toEqual({ inserted: 1, duplicates: 0, conflicts: [e.eventId] });
+      expect((await store.query({ workspaceId }))[0]?.action).toBe('command.received');
+    });
+
+    it('finds existing events by reference', async () => {
+      const store = await create();
+      const workspaceId = uniqueName('ws');
+      const a = makeStoredAuditEvent({ workspaceId });
+      const b = makeStoredAuditEvent({ workspaceId });
+      const missing = makeStoredAuditEvent({ workspaceId });
+      await store.appendBatch([a, b]);
+      const found = await store.findExisting([a, b, missing].map((e) => ({ eventId: e.eventId, workspaceId, occurredAt: e.occurredAt })));
+      expect(found.map((e) => e.eventId).sort()).toEqual([a.eventId, b.eventId].sort());
+      expect(found.find((e) => e.eventId === a.eventId)).toEqual(a);
+      expect(await store.findExisting([])).toEqual([]);
+    });
+
+    it('reads a workspace in chain order with ranges, cursors and descending order', async () => {
+      const store = await create();
+      const workspaceId = uniqueName('ws');
+      const at = (s: number) => `2026-10-25T10:00:0${s}.000Z`;
+      const events = [1, 2, 3, 4].map((i) => makeStoredAuditEvent({ workspaceId, ingestedAt: at(i), details: { i } }));
+      await store.appendBatch([events[2]!, events[0]!, events[3]!, events[1]!]);
+      await store.appendBatch([makeStoredAuditEvent({ workspaceId: uniqueName('other'), ingestedAt: at(2) })]);
+      const idx = (r: { details: Record<string, unknown> }[]) => r.map((e) => e.details.i);
+      expect(idx(await store.readChain(workspaceId))).toEqual([1, 2, 3, 4]);
+      expect(idx(await store.readChain(workspaceId, { order: 'desc', limit: 2 }))).toEqual([4, 3]);
+      expect(idx(await store.readChain(workspaceId, { from: at(2), to: at(4) }))).toEqual([2, 3]);
+      expect(idx(await store.readChain(workspaceId, { to: at(3), order: 'desc', limit: 1 }))).toEqual([2]);
+      const page1 = await store.readChain(workspaceId, { limit: 2 });
+      const tail = page1[1]!;
+      expect(idx(await store.readChain(workspaceId, { limit: 2, after: { ingestedAt: tail.ingestedAt, eventId: tail.eventId } }))).toEqual([3, 4]);
+      expect(await store.readChain(uniqueName('empty'))).toEqual([]);
+    });
+
     it('appends an empty batch as a no-op', async () => {
-      expect(await (await create()).appendBatch([])).toEqual({ inserted: 0, duplicates: 0 });
+      expect(await (await create()).appendBatch([])).toEqual({ inserted: 0, duplicates: 0, conflicts: [] });
     });
 
     it('returns a whole trace oldest first', async () => {

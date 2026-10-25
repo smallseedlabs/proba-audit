@@ -4,6 +4,7 @@ import {
   runEventBusContract,
   runIdGeneratorContract,
   runMetricsStoreContract,
+  runOutboxStoreContract,
   runPlatformConnectorContract,
   makeObservation,
 } from '@smallseedlabs/proba-audit-core/testing';
@@ -11,11 +12,13 @@ import { InMemoryAuditStore } from './audit-store.js';
 import { ManualClock, SequentialIdGenerator } from './clock-ids.js';
 import { InMemoryEventBus } from './event-bus.js';
 import { InMemoryMetricsStore } from './metrics-store.js';
+import { InMemoryOutboxStore } from './outbox-store.js';
 import { StaticPlatformConnector } from './platform-connector.js';
 import { RandomIdGenerator, SystemClock } from '../runtime/system.js';
 
 runEventBusContract('memory', async () => ({ bus: new InMemoryEventBus() }));
 runAuditStoreContract('memory', async () => ({ store: new InMemoryAuditStore() }));
+runOutboxStoreContract('memory', async () => ({ store: new InMemoryOutboxStore() }));
 runMetricsStoreContract('memory', async () => ({ store: new InMemoryMetricsStore() }));
 runClockContract('SystemClock', () => new SystemClock());
 runClockContract('ManualClock', () => new ManualClock(new Date()));

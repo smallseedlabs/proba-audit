@@ -5,12 +5,17 @@ import {
   type AppendResult,
   type AuditAggregateQuery,
   type AuditAggregateRow,
+  type AuditEventRef,
   type AuditFilter,
   type AuditGroupBy,
   type AuditQuery,
   type AuditStore,
   type ChainHead,
+  type ReadChainOptions,
   type StoredAuditEvent,
+  CHAIN_READ_DEFAULT_LIMIT,
+  CHAIN_READ_MAX_LIMIT,
+  sameContent,
 } from '@smallseedlabs/proba-audit-core';
 
 export function matchesAuditFilter(e: StoredAuditEvent, f: AuditFilter): boolean {
@@ -63,15 +68,44 @@ export class InMemoryAuditStore implements AuditStore {
   async appendBatch(events: StoredAuditEvent[]): Promise<AppendResult> {
     let inserted = 0;
     let duplicates = 0;
+    const conflicts: string[] = [];
     for (const e of events) {
-      if (this.events.has(e.eventId)) {
-        duplicates += 1;
-      } else {
+      const existing = this.events.get(e.eventId);
+      if (!existing) {
         this.events.set(e.eventId, structuredClone(e));
         inserted += 1;
+      } else if (sameContent(existing, e)) {
+        duplicates += 1;
+      } else if (!conflicts.includes(e.eventId)) {
+        conflicts.push(e.eventId);
       }
     }
-    return { inserted, duplicates };
+    return { inserted, duplicates, conflicts };
+  }
+
+  async findExisting(refs: AuditEventRef[]): Promise<StoredAuditEvent[]> {
+    return refs.flatMap((r) => {
+      const e = this.events.get(r.eventId);
+      return e && e.workspaceId === r.workspaceId ? [structuredClone(e)] : [];
+    });
+  }
+
+  async readChain(workspaceId: string, options: ReadChainOptions = {}): Promise<StoredAuditEvent[]> {
+    const limit = Math.min(options.limit ?? CHAIN_READ_DEFAULT_LIMIT, CHAIN_READ_MAX_LIMIT);
+    const dir = (options.order ?? 'asc') === 'asc' ? 1 : -1;
+    const cmp = (a: { ingestedAt: string; eventId: string }, b: { ingestedAt: string; eventId: string }): number =>
+      Date.parse(a.ingestedAt) - Date.parse(b.ingestedAt) || a.eventId.localeCompare(b.eventId);
+    return [...this.events.values()]
+      .filter(
+        (e) =>
+          e.workspaceId === workspaceId &&
+          (options.from === undefined || Date.parse(e.ingestedAt) >= Date.parse(options.from)) &&
+          (options.to === undefined || Date.parse(e.ingestedAt) < Date.parse(options.to)) &&
+          (options.after === undefined || dir * cmp(e, options.after) > 0)
+      )
+      .sort((a, b) => dir * cmp(a, b))
+      .slice(0, limit)
+      .map((e) => structuredClone(e));
   }
 
   async query(query: AuditQuery): Promise<StoredAuditEvent[]> {

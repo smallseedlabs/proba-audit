@@ -58,15 +58,15 @@ describe('ClickHouse migrations', () => {
       const migrations = loadMigrations(migrationsDir);
 
       const first = await runMigrations(db, migrations);
-      expect(first.applied).toHaveLength(3);
+      expect(first.applied).toHaveLength(4);
       const second = await runMigrations(db, migrations);
       expect(second.applied).toEqual([]);
-      expect(second.skipped).toHaveLength(3);
+      expect(second.skipped).toHaveLength(4);
 
       const rows = await (
         await client.query({ query: 'SELECT version, name FROM schema_migrations ORDER BY version', format: 'JSONEachRow' })
       ).json<{ version: number; name: string }>();
-      expect(rows.map((r) => r.version)).toEqual([1, 2, 3]);
+      expect(rows.map((r) => r.version)).toEqual([1, 2, 3, 4]);
 
       const tables = await (
         await client.query({
@@ -82,6 +82,23 @@ describe('ClickHouse migrations', () => {
         metric_rollups_hourly: 'ReplacingMergeTree',
         schema_migrations: 'MergeTree',
       });
+    } finally {
+      await client.close();
+    }
+  });
+
+  it('audit_events fsyncs every insert so an acknowledged event is durable', async () => {
+    const client = createClickHouseClient(options(MIGRATION_DB));
+    try {
+      const [t] = await (
+        await client.query({
+          query: "SELECT create_table_query FROM system.tables WHERE database = {db:String} AND name = 'audit_events'",
+          query_params: { db: MIGRATION_DB },
+          format: 'JSONEachRow',
+        })
+      ).json<{ create_table_query: string }>();
+      expect(t.create_table_query).toMatch(/fsync_after_insert = 1/);
+      expect(t.create_table_query).toMatch(/fsync_part_directory = 1/);
     } finally {
       await client.close();
     }
