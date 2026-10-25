@@ -59,11 +59,10 @@ Adding one (for example Kafka) means one adapter, one registration and one confi
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#how-to-swap-or-add-an-adapter-for-example-kafka).
 Every adapter must pass its port's contract suite (`runEventBusContract(...)` etc. from `@smallseedlabs/proba-audit-core/testing`).
 
-## Temporary: protocol dependency
+## Protocol dependency
 
-The audit/metric contract comes from `@smallseedlabs/proba-protocol/audit`, which is in the **unmerged**
-[proba-protocol PR #4](https://github.com/smallseedlabs/proba-protocol/pull/4). Until it is released, the dependency is pinned to an immutable commit.
-**TODO:** switch to the `v0.2.0` tag once released; see [PROTOCOL_PIN_NOTE.md](PROTOCOL_PIN_NOTE.md).
+The audit/metric contract comes from `@smallseedlabs/proba-protocol/audit` (released in proba-protocol `v0.2.0`),
+installed from the release tag: `github:smallseedlabs/proba-protocol#v0.2.0`. Schemas are never copied into this repo.
 
 ## License
 
