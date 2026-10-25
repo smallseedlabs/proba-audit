@@ -163,12 +163,38 @@ export class AuditConsumer {
     return this.heads.get(workspaceId);
   }
 
+  /**
+   * The stream or the consumer group vanished while we were running (for example
+   * Redis was flushed, or someone deleted the stream). Redis answers NOGROUP to
+   * every read until the group exists again.
+   */
+  private isMissingGroup(err: unknown): boolean {
+    return err instanceof Error && err.message.includes('NOGROUP');
+  }
+
+  /**
+   * Re-create the stream and consumer group (subscribe() does XGROUP CREATE ...
+   * MKSTREAM). A new group starts at the beginning of the stream; anything that was
+   * already stored is skipped as an identical redelivery, so a replay is safe.
+   */
+  private async recreateGroup(): Promise<void> {
+    const old = this.subscription;
+    this.subscription = null;
+    await old?.close().catch(() => undefined);
+    await this.attach();
+    this.deps.logger.warn('consumer group was missing; recreated it', {
+      lifecycle: 'group_recreated',
+      topic: this.o.topic,
+      group: this.o.group,
+    });
+  }
+
   private async run(): Promise<void> {
-    const sub = this.subscription as Subscription;
     let lastReclaim = 0;
     let idleBackoff = this.o.retryBaseMs;
     while (this.running) {
       try {
+        const sub = this.subscription as Subscription;
         let messages: BusMessage[] = [];
         if (Date.now() - lastReclaim >= this.o.reclaimIntervalMs) {
           lastReclaim = Date.now();
@@ -184,8 +210,18 @@ export class AuditConsumer {
         if (messages.length > 0) await this.processWithRetry(messages);
         idleBackoff = this.o.retryBaseMs;
       } catch (err) {
+        let failure = err;
+        if (this.isMissingGroup(err) && this.running) {
+          try {
+            await this.recreateGroup();
+            idleBackoff = this.o.retryBaseMs;
+            continue;
+          } catch (recreateErr) {
+            failure = recreateErr; // fall through to the normal backoff
+          }
+        }
         // The bus itself failed (for example Redis is down): back off and try again.
-        this.deps.logger.error('consumer loop error', { err, retryInMs: idleBackoff });
+        this.deps.logger.error('consumer loop error', { err: failure, retryInMs: idleBackoff });
         await this.sleep(idleBackoff);
         idleBackoff = Math.min(idleBackoff * 2, this.o.retryMaxMs);
       }
