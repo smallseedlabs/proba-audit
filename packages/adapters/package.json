@@ -17,6 +17,10 @@
     "@clickhouse/client": "^1.5.0",
     "@smallseedlabs/proba-audit-core": "*",
     "@smallseedlabs/proba-protocol": "github:smallseedlabs/proba-protocol#v0.2.0",
+    "pg": "^8.23.1",
     "redis": "^4.7.0"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.23.1"
   }
 }

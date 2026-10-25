@@ -27,7 +27,7 @@ cp .env.example .env           # local placeholders; .env is gitignored
 docker compose up -d clickhouse redis
 npm run migrate                # creates the database and applies migrations
 npm test                       # unit tests (in-memory adapters)
-npm run test:integration       # adapter contract tests against ClickHouse + Redis
+npm run test:integration       # contract + end-to-end tests against ClickHouse + Redis (+ Postgres for the outbox: docker compose --profile test up -d postgres)
 ```
 
 Run the whole stack in containers:

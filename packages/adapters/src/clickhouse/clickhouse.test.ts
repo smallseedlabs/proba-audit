@@ -103,23 +103,24 @@ describe('migration runner', () => {
       '0001_audit_events.sql',
       '0002_metric_observations.sql',
       '0003_metric_rollups.sql',
+      '0004_audit_events_durability.sql',
     ]);
-    expect(m.map((x) => x.statements.length)).toEqual([1, 1, 2]);
-    expect(new Set(m.map((x) => x.checksum)).size).toBe(3);
+    expect(m.map((x) => x.statements.length)).toEqual([1, 1, 2, 1]);
+    expect(new Set(m.map((x) => x.checksum)).size).toBe(4);
   });
 
   it('keeps every statement idempotent', () => {
     for (const m of loadMigrations(migrationsDir)) {
-      for (const s of m.statements) expect(s).toMatch(/^CREATE (TABLE|DATABASE) IF NOT EXISTS/);
+      for (const s of m.statements) expect(s).toMatch(/^(CREATE (TABLE|DATABASE) IF NOT EXISTS|ALTER TABLE \w+ MODIFY SETTING)/);
     }
   });
 
   it('applies pending migrations in order and records them', async () => {
     const { db, commands, recorded } = fakeDb();
     const result = await runMigrations(db, loadMigrations(migrationsDir));
-    expect(result.applied).toHaveLength(3);
-    expect(commands).toHaveLength(4);
-    expect(recorded.map((r) => r.version)).toEqual([1, 2, 3]);
+    expect(result.applied).toHaveLength(4);
+    expect(commands).toHaveLength(5);
+    expect(recorded.map((r) => r.version)).toEqual([1, 2, 3, 4]);
   });
 
   it('skips applied migrations and only runs new ones', async () => {
@@ -127,9 +128,13 @@ describe('migration runner', () => {
     const { db, commands, recorded } = fakeDb([{ version: 1, name: all[0].name, checksum: all[0].checksum }]);
     const result = await runMigrations(db, all);
     expect(result.skipped).toEqual(['0001_audit_events.sql']);
-    expect(result.applied).toEqual(['0002_metric_observations.sql', '0003_metric_rollups.sql']);
-    expect(commands).toHaveLength(3);
-    expect(recorded.map((r) => r.version)).toEqual([2, 3]);
+    expect(result.applied).toEqual([
+      '0002_metric_observations.sql',
+      '0003_metric_rollups.sql',
+      '0004_audit_events_durability.sql',
+    ]);
+    expect(commands).toHaveLength(4);
+    expect(recorded.map((r) => r.version)).toEqual([2, 3, 4]);
   });
 
   it('refuses to continue when an applied migration was edited', async () => {

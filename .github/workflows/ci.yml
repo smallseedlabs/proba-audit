@@ -65,7 +65,7 @@ jobs:
         run: npm run test:ci
 
   integration-test:
-    name: Integration Tests (ClickHouse + Redis)
+    name: Integration Tests (ClickHouse + Redis + Postgres)
     runs-on: ubuntu-latest
     services:
       clickhouse:
@@ -94,6 +94,22 @@ jobs:
         ports:
           - 6379:6379
 
+      # Only for the PostgresOutboxStore tests (the outbox lives in the emitting service's database).
+      postgres:
+        image: postgres:16-alpine
+        env:
+          # Throwaway credentials of this CI-only service container.
+          POSTGRES_USER: proba
+          POSTGRES_PASSWORD: proba
+          POSTGRES_DB: proba_audit_outbox_test
+        options: >-
+          --health-cmd "pg_isready -U proba -d proba_audit_outbox_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+        ports:
+          - 5432:5432
+
     env:
       NODE_ENV: test
       LOG_LEVEL: warn
@@ -103,6 +119,7 @@ jobs:
       CLICKHOUSE_USER: proba
       CLICKHOUSE_PASSWORD: proba
       CLICKHOUSE_DATABASE: proba_audit
+      OUTBOX_TEST_DATABASE_URL: postgresql://proba:proba@localhost:5432/proba_audit_outbox_test
 
     steps:
       - uses: actions/checkout@v4
@@ -120,7 +137,8 @@ jobs:
         run: npm run migrate
 
       # Runs the adapter contract suites (Redis Streams event bus, ClickHouse audit
-      # and metrics stores), the migration tests and the default-adapter wiring test.
+      # and metrics stores, Postgres outbox), the migration tests, the default-adapter
+      # wiring test and the audit-consumer end-to-end tests.
       - name: Run integration tests (0 skipped)
         run: npm run test:integration:ci
 

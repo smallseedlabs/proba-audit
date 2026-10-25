@@ -24,7 +24,7 @@ describe('createRuntime with the default adapters (Redis Streams + ClickHouse)',
       const event = makeStoredAuditEvent({ workspaceId: `rt-${rt.ids.uuid()}` });
       await rt.eventBus.publish(topic, event);
       const [msg] = await sub.read<typeof event>({ blockMs: 1000 });
-      expect(await rt.auditStore.appendBatch([msg.payload])).toEqual({ inserted: 1, duplicates: 0 });
+      expect(await rt.auditStore.appendBatch([msg.payload])).toEqual({ inserted: 1, duplicates: 0, conflicts: [] });
       await sub.ack([msg.id]);
       expect(await rt.auditStore.query({ workspaceId: event.workspaceId })).toEqual([event]);
       await sub.close();
