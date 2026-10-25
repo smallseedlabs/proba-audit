@@ -1,0 +1,156 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run ESLint
+        run: npm run lint
+
+  typecheck:
+    name: Type Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run TypeScript compiler (sources and tests)
+        run: npm run typecheck
+
+      - name: Build all workspaces
+        run: npm run build
+
+  test:
+    name: Unit Tests (in-memory)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run unit tests (fails on any skipped/todo test)
+        run: npm run test:ci
+
+  integration-test:
+    name: Integration Tests (ClickHouse + Redis)
+    runs-on: ubuntu-latest
+    services:
+      clickhouse:
+        image: clickhouse/clickhouse-server:24.8-alpine
+        env:
+          CLICKHOUSE_USER: proba
+          CLICKHOUSE_PASSWORD: proba
+          CLICKHOUSE_DB: proba_audit
+          CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: '1'
+        options: >-
+          --health-cmd "wget --no-verbose --tries=1 --spider http://127.0.0.1:8123/ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+          --ulimit nofile=262144:262144
+        ports:
+          - 8123:8123
+
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+
+    env:
+      NODE_ENV: test
+      LOG_LEVEL: warn
+      REDIS_URL: redis://localhost:6379
+      CLICKHOUSE_URL: http://localhost:8123
+      # Throwaway credentials of the CI-only service container above.
+      CLICKHOUSE_USER: proba
+      CLICKHOUSE_PASSWORD: proba
+      CLICKHOUSE_DATABASE: proba_audit
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run migrations (builds first)
+        run: npm run migrate
+
+      # Runs the adapter contract suites (Redis Streams event bus, ClickHouse audit
+      # and metrics stores), the migration tests and the default-adapter wiring test.
+      - name: Run integration tests (0 skipped)
+        run: npm run test:integration:ci
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-test-report
+          path: test-reports/
+          if-no-files-found: ignore
+
+  docker:
+    name: Docker Build (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [audit-consumer, audit-api, metrics-ingester, rollup, migrate]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          target: ${{ matrix.target }}
+          push: false
+          tags: proba-audit-${{ matrix.target }}:test
+          cache-from: type=gha,scope=${{ matrix.target }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.target }}
