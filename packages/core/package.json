@@ -1,0 +1,35 @@
+{
+  "name": "@smallseedlabs/proba-audit-core",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Ports, domain types, config and logger for proba-audit",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./testing": {
+      "types": "./dist/testing/index.d.ts",
+      "import": "./dist/testing/index.js"
+    }
+  },
+  "license": "Apache-2.0",
+  "dependencies": {
+    "@smallseedlabs/proba-protocol": "github:smallseedlabs/proba-protocol#4cfd9955c0010d8cc39e43d769c0b1ff8f3f64b5",
+    "dotenv": "^16.4.5",
+    "pino": "^9.3.2",
+    "pino-pretty": "^11.2.2",
+    "zod": "^3.23.8"
+  },
+  "peerDependencies": {
+    "vitest": "^2.0.5"
+  },
+  "peerDependenciesMeta": {
+    "vitest": {
+      "optional": true
+    }
+  }
+}
