@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Audit pipeline: `AuditEmitter` port with bus and outbox emitters, `OutboxStore` port
+  (`InMemoryOutboxStore`, `PostgresOutboxStore` + `migrations/postgres/0001_audit_outbox.sql`),
+  `OutboxRelay`, `verifyChain`, `AuditedReader`, and the `audit-consumer` app (consumer group,
+  validate, dedupe by `eventId` and content hash, derived tags, per-workspace hash chain,
+  XACK after the durable write, DLQ, graceful shutdown, pending reclaim, self-audit events).
+- `AuditStore.findExisting` and `AuditStore.readChain`; `AppendResult.conflicts`.
+- ClickHouse migration `0004` (`fsync_after_insert` on `audit_events`).
+- Postgres service for the outbox integration tests (compose profile `test`, CI service).
 - npm workspaces monorepo: `packages/core`, `packages/adapters` and the apps
   `audit-consumer`, `audit-api`, `metrics-ingester`, `rollup` (foundation only:
   each loads config, logs its lifecycle, serves `/health` and exits cleanly on SIGTERM).

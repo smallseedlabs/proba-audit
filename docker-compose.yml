@@ -37,6 +37,25 @@ services:
       timeout: 3s
       retries: 5
 
+  # Postgres is NOT part of the audit stack. It exists only to run the
+  # PostgresOutboxStore integration tests:
+  #   docker compose --profile test up -d postgres
+  postgres:
+    profiles: ["test"]
+    image: postgres:16-alpine
+    container_name: proba-audit-postgres-test
+    environment:
+      POSTGRES_USER: proba
+      POSTGRES_PASSWORD: proba
+      POSTGRES_DB: proba_audit_outbox_test
+    ports:
+      - "${POSTGRES_HOST_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U proba -d proba_audit_outbox_test"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   # One-shot: create the database and apply ClickHouse migrations.
   # docker compose --profile apps run --rm migrate
   migrate:
