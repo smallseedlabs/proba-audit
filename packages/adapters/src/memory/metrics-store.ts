@@ -176,6 +176,7 @@ export class InMemoryMetricsStore implements MetricsStore {
       }
       if (accounts && !accounts.has(`${r.platform}|${r.accountId}`)) continue;
       if (filter.campaignId !== undefined && r.campaignId !== filter.campaignId) continue;
+      if (filter.sourceGranularity !== undefined && r.sourceGranularity !== filter.sourceGranularity) continue;
       const bucket = dims.has('bucket') ? (filter.bucket === 'day' ? (r.bucketDate ?? r.bucketStart.slice(0, 10)) : r.bucketStart) : undefined;
       const id = [
         dims.has('platform') ? r.platform : '',

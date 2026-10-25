@@ -8,6 +8,8 @@ export {
   buildAuditEvent,
   canonicalizeAuditEvent,
   generateSpanId,
+  isValidTimeZone,
+  validateMetricObservation,
   validateAuditEvent,
   validateStoredAuditEvent,
 } from '@smallseedlabs/proba-protocol/audit';

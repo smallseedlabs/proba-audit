@@ -420,6 +420,10 @@ export class ClickHouseMetricsStore implements MetricsStore {
       clauses.push('campaign_id = {campaignId:String}');
       params.campaignId = filter.campaignId;
     }
+    if (filter.sourceGranularity !== undefined) {
+      clauses.push('source_granularity = {sourceGranularity:String}');
+      params.sourceGranularity = filter.sourceGranularity;
+    }
     const bucketExpr = filter.bucket === 'day' ? 'toString(bucket_date)' : "formatDateTime(bucket_start, '%Y-%m-%dT%H:%i:%S.000Z', 'UTC')";
     const keys = [
       ...(dims.has('platform') ? ['toString(platform) AS platform'] : []),

@@ -319,6 +319,11 @@ export function runMetricsStoreContract(name: string, factory: () => Promise<Met
         [[accountId, '2026-10-25', 'EUR', 30], [accountId, '2026-10-25', 'USD', 1640]].sort()
       );
 
+      const onlyDaySource = await store.aggregateRollups({ bucket: 'hour', ...win, groupBy: [], accounts, sourceGranularity: 'day' });
+      expect(onlyDaySource).toEqual([]);
+      const onlyHourSource = await store.aggregateRollups({ bucket: 'hour', ...win, groupBy: [], accounts, sourceGranularity: 'hour' });
+      expect(onlyHourSource.map((a) => a.currency).sort()).toEqual(['EUR', 'USD']);
+
       expect(await store.aggregateRollups({ bucket: 'hour', ...win, groupBy: ['campaign'], accounts: [] })).toEqual([]);
       expect(await store.aggregateRollups({ bucket: 'hour', ...win, groupBy: ['campaign'], accounts: [{ platform: 'meta', accountId: uniqueName('none') }] })).toEqual([]);
     });
