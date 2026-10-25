@@ -11,7 +11,7 @@ proba-audit is the audit trail and ad-metrics analytics backend of Proba.
 
 The event and observation shapes are defined once, in
 [proba-protocol](https://github.com/smallseedlabs/proba-protocol) (`@smallseedlabs/proba-protocol/audit`).
-This repo never redefines them. (Pinned to the `v0.2.0` release tag.)
+This repo never redefines them. (Pinned to the `v0.3.0` release tag.)
 
 This PR is the **foundation only**: ports, default adapters, config, logger, migrations and
 runnable-but-empty processes. The consumer, API, ingester and rollup logic come later.

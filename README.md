@@ -61,8 +61,8 @@ Every adapter must pass its port's contract suite (`runEventBusContract(...)` et
 
 ## Protocol dependency
 
-The audit/metric contract comes from `@smallseedlabs/proba-protocol/audit` (released in proba-protocol `v0.2.0`),
-installed from the release tag: `github:smallseedlabs/proba-protocol#v0.2.0`. Schemas are never copied into this repo.
+The audit/metric contract comes from `@smallseedlabs/proba-protocol/audit` (released in proba-protocol `v0.3.0`),
+installed from the release tag: `github:smallseedlabs/proba-protocol#v0.3.0`. Schemas are never copied into this repo.
 
 ## License
 
