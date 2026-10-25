@@ -1,0 +1,124 @@
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8-alpine
+    container_name: proba-audit-clickhouse
+    environment:
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-proba}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-proba}
+      CLICKHOUSE_DB: ${CLICKHOUSE_DATABASE:-proba_audit}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ports:
+      - "${CLICKHOUSE_HTTP_HOST_PORT:-8123}:8123"
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://127.0.0.1:8123/ping || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    container_name: proba-audit-redis
+    # AOF persistence ON: the audit stream must survive a Redis restart.
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    ports:
+      - "${REDIS_HOST_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # One-shot: create the database and apply ClickHouse migrations.
+  # docker compose --profile apps run --rm migrate
+  migrate:
+    profiles: ["apps"]
+    build:
+      context: .
+      target: migrate
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    environment: &app-env
+      NODE_ENV: production
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      REDIS_URL: redis://redis:6379
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-proba}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-proba}
+      CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-proba_audit}
+      EVENT_BUS: ${EVENT_BUS:-redis-streams}
+      AUDIT_STORE: ${AUDIT_STORE:-clickhouse}
+      METRICS_STORE: ${METRICS_STORE:-clickhouse}
+
+  audit-consumer:
+    profiles: ["apps"]
+    build:
+      context: .
+      target: audit-consumer
+    container_name: proba-audit-consumer
+    depends_on: &app-deps
+      clickhouse:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      <<: *app-env
+      PORT: 3101
+    ports:
+      - "${AUDIT_CONSUMER_HOST_PORT:-3101}:3101"
+    restart: unless-stopped
+
+  audit-api:
+    profiles: ["apps"]
+    build:
+      context: .
+      target: audit-api
+    container_name: proba-audit-api
+    depends_on: *app-deps
+    environment:
+      <<: *app-env
+      PORT: 3100
+    ports:
+      - "${AUDIT_API_HOST_PORT:-3100}:3100"
+    restart: unless-stopped
+
+  metrics-ingester:
+    profiles: ["apps"]
+    build:
+      context: .
+      target: metrics-ingester
+    container_name: proba-metrics-ingester
+    depends_on: *app-deps
+    environment:
+      <<: *app-env
+      PORT: 3102
+    ports:
+      - "${METRICS_INGESTER_HOST_PORT:-3102}:3102"
+    restart: unless-stopped
+
+  rollup:
+    profiles: ["apps"]
+    build:
+      context: .
+      target: rollup
+    container_name: proba-rollup
+    depends_on: *app-deps
+    environment:
+      <<: *app-env
+      PORT: 3103
+    ports:
+      - "${ROLLUP_HOST_PORT:-3103}:3103"
+    restart: unless-stopped
+
+volumes:
+  clickhouse_data:
+  redis_data:
