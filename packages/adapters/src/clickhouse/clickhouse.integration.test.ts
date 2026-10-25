@@ -6,10 +6,13 @@ import {
   makeStoredAuditEvent,
   runAuditStoreContract,
   runMetricsStoreContract,
+  runCheckpointStoreContract,
+  runQuarantineStoreContract,
 } from '@smallseedlabs/proba-audit-core/testing';
 import { createClickHouseClient, ensureDatabase, type ClickHouseOptions } from './client.js';
 import { ClickHouseAuditStore } from './audit-store.js';
 import { ClickHouseMetricsStore } from './metrics-store.js';
+import { ClickHouseCheckpointStore, ClickHouseQuarantineStore } from './ingest-state-stores.js';
 import { clickHouseMigrationDb } from './migrate-db.js';
 import { loadMigrations, runMigrations } from './migrate.js';
 
@@ -33,6 +36,14 @@ runAuditStoreContract('clickhouse', async () => ({
 
 runMetricsStoreContract('clickhouse', async () => ({
   store: new ClickHouseMetricsStore({ client: createClickHouseClient(options(TEST_DB)), ownsClient: true }),
+}));
+
+runCheckpointStoreContract('clickhouse', async () => ({
+  store: new ClickHouseCheckpointStore({ client: createClickHouseClient(options(TEST_DB)), ownsClient: true }),
+}));
+
+runQuarantineStoreContract('clickhouse', async () => ({
+  store: new ClickHouseQuarantineStore({ client: createClickHouseClient(options(TEST_DB)), ownsClient: true }),
 }));
 
 describe('ClickHouse migrations', () => {
