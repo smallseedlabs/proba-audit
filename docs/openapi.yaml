@@ -10,6 +10,11 @@ info:
     The workspace is decided by the server from the authenticated session. There is no workspace
     parameter, and unknown query parameters are rejected with `400`.
 
+    Raw text of events (`/v1/events/{eventId}/content`, `/v1/traces/{traceId}/content`) is served to
+    administrators only, only when the deployment sets `AUDIT_CONTENT_ENABLED=true`, and every such read
+    is itself recorded (`audit.event_viewed` / `audit.trace_viewed` with `details.contentIncluded: true`).
+    Other routes never return text: events only say `hasContent`.
+
     Every response carries `X-Trace-Id` (also in error bodies). Every authenticated read is itself
     recorded in the audit trail (`data_access.*`).
 
@@ -166,6 +171,33 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/RateLimited' }
+  /v1/events/{eventId}/content:
+    get:
+      tags: [Audit]
+      operationId: getEventContent
+      summary: The raw text of one event (administrators only)
+      description: |
+        Administrators only; viewers get `403`. `404` when the event has no text, and `404` with code
+        `content_disabled` when the deployment does not serve text. `verified` is false when the stored text
+        no longer matches the digest the hash chain covers. The read is audited as `audit.event_viewed`
+        with `details.contentIncluded: true`.
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: The text of the event.
+          headers: { X-Trace-Id: { $ref: '#/components/headers/XTraceId' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EventContent' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
   /v1/traces:
     get:
       tags: [Audit]
@@ -208,6 +240,31 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/TraceTree' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /v1/traces/{traceId}/content:
+    get:
+      tags: [Audit]
+      operationId: getTraceContent
+      summary: The raw text of every event of a trace (administrators only)
+      description: |
+        Administrators only. Events without text (or whose text was removed by retention) are left out.
+        Audited as `audit.trace_viewed` with `details.contentIncluded: true`.
+      parameters:
+        - name: traceId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: The texts of the trace, oldest first.
+          headers: { X-Trace-Id: { $ref: '#/components/headers/XTraceId' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TraceContent' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -508,6 +565,8 @@ components:
         hash: { type: [string, 'null'], pattern: '^[0-9a-f]{64}$' }
         ingestedAt: { type: string, format: date-time }
         schemaVersion: { type: integer, minimum: 1 }
+        hasContent: { type: boolean, const: true, description: 'Raw text exists for this event (administrators read it at /content).' }
+        contentDigest: { type: string, pattern: '^[0-9a-f]{64}$', description: 'SHA-256 of the canonical text, covered by the hash. Administrators only.' }
     Target:
       type: object
       additionalProperties: false
@@ -627,11 +686,50 @@ components:
             properties:
               type:
                 type: string
-                enum: [invalid_event, workspace_mismatch, hash_mismatch, broken_link, bad_genesis, non_monotonic_ingested_at]
+                enum: [invalid_event, workspace_mismatch, hash_mismatch, broken_link, bad_genesis, non_monotonic_ingested_at, content_mismatch]
               eventId: { type: string }
               detail: { type: string }
         complete: { type: boolean }
         truncated: { type: boolean, description: Present (true) when the event bound stopped verification early. }
+        content:
+          type: object
+          description: Present when raw text is enabled. Text removed by retention counts as `missing`, not as a problem.
+          required: [checked, missing]
+          properties:
+            checked: { type: integer, description: Stored texts compared with their digests. }
+            missing: { type: integer, description: Events with a digest whose text is no longer stored. }
+    EventContent:
+      type: object
+      additionalProperties: false
+      required: [eventId, traceId, spanId, action, occurredAt, content, contentDigest, verified]
+      properties:
+        eventId: { type: string, format: uuid }
+        traceId: { type: string, format: uuid }
+        spanId: { type: string, pattern: '^[0-9a-f]{16}$' }
+        action: { type: string }
+        occurredAt: { type: string, format: date-time }
+        content:
+          type: object
+          additionalProperties: false
+          required: [kind, text, truncated, originalLength, redactions]
+          properties:
+            kind: { type: string, description: 'For example user_message, brain_reply, brain_clarification, explanation.' }
+            text: { type: string, maxLength: 16384, description: Secrets masked by the producer. }
+            truncated: { type: boolean }
+            originalLength: { type: integer, minimum: 0 }
+            redactions: { type: integer, minimum: 0 }
+        contentDigest: { type: string, pattern: '^[0-9a-f]{64}$' }
+        verified: { type: boolean, description: 'False when the stored text no longer hashes to contentDigest (altered after it was chained).' }
+    TraceContent:
+      type: object
+      additionalProperties: false
+      required: [traceId, items, truncated]
+      properties:
+        traceId: { type: string, format: uuid }
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/EventContent' }
+        truncated: { type: boolean }
     Freshness:
       type: object
       required: [asOf, rollupsComputedAt, observationsFetchedAt]

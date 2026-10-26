@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Raw text of audit events (protocol 0.3.3 `AuditEvent.content`), off by default (`AUDIT_CONTENT_ENABLED`, `AUDIT_CONTENT_STORE`): `AuditContentStore` port with ClickHouse (`audit_event_content`,
+  migration `0008`, own table so it can have its own retention and grants) and memory adapters and a contract suite; the consumer stores the text there and only a SHA-256
+  `contentDigest` in `audit_events`, covered by the hash chain; `verifyChain` can compare stored text with the digest (`content_mismatch`; text removed by retention counts as missing);
+  audit-api `GET /v1/events/{id}/content` and `/v1/traces/{id}/content` for administrators only, each read audited (`audit.event_viewed` / `audit.trace_viewed`, `contentIncluded: true`),
+  `hasContent` on events, digest shown to administrators only. Tests for gating, digest and tamper detection, flag off, idempotence.
+
 - `audit-api`: a Fastify, read-only HTTP API under `/v1`: event search with every filter, cursor pagination and a hard page cap, event by id, trace list and
   span-tree view, bounded chain verification (admin), analytics summary / compare / top campaigns with data freshness, facets, `/health` and `/ready`.
   Zod-validated query parameters (no free SQL, unknown parameters rejected), workspace scope injected from the authenticated session, Firebase ID token

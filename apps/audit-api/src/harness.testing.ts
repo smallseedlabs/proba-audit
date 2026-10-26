@@ -11,6 +11,7 @@ import {
   loadConfig,
   type AppConfig,
   type AuditEmitter,
+  type AuditContent,
   type AuditEvent,
   type ChainLink,
   type MetricObservation,
@@ -19,6 +20,7 @@ import {
   type Subscription,
 } from '@smallseedlabs/proba-audit-core';
 import {
+  InMemoryAuditContentStore,
   InMemoryAuditStore,
   InMemoryEventBus,
   InMemoryMetricsStore,
@@ -84,6 +86,7 @@ export interface Harness {
   app: FastifyInstance;
   config: AppConfig;
   store: InMemoryAuditStore;
+  contentStore: InMemoryAuditContentStore;
   metrics: InMemoryMetricsStore;
   bus: InMemoryEventBus;
   logger: MemoryLogger;
@@ -100,6 +103,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
   const ids = new SequentialIdGenerator();
   const logger = new MemoryLogger();
   const store = new InMemoryAuditStore();
+  const contentStore = new InMemoryAuditContentStore();
   const metrics = new InMemoryMetricsStore(clock);
   const bus = new InMemoryEventBus(clock);
   const limiter = options.limiter ?? new InMemoryRateLimiter(clock);
@@ -112,6 +116,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
     verifier: new StaticTokenVerifier({ tokens: config.api.staticTokens, nodeEnv: config.env }),
     limiter,
     auditStore: store,
+    auditContentStore: contentStore,
     metricsStore: metrics,
     scope: createStaticScope(WORKSPACE, config.api.analyticsAccounts).resolve,
     emitter: options.emitter ? options.emitter(bus, strict) : strict,
@@ -124,6 +129,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
     app,
     config,
     store,
+    contentStore,
     metrics,
     bus,
     logger,
@@ -202,4 +208,25 @@ export function makeObservation(overrides: Partial<MetricObservation> = {}): Met
     revision: 0,
     ...overrides,
   };
+}
+
+/**
+ * Seed events that carry raw text the way the consumer stores them: the event row gets `contentDigest` (covered by
+ * its hash), the text goes to the content store. Returns the stored events in order.
+ */
+export async function seedWithContent(
+  h: Harness,
+  items: { event?: Partial<AuditEvent>; content: AuditContent }[]
+): Promise<StoredAuditEvent[]> {
+  const events = items.map((i) => makeEvent({ ...i.event, content: i.content }));
+  const chained = chainAll(events);
+  await h.store.appendBatch(chained);
+  await h.contentStore.put(
+    chained.flatMap((c, i) =>
+      c.contentDigest
+        ? [{ workspaceId: c.workspaceId, eventId: c.eventId, occurredAt: c.occurredAt, content: items[i].content, contentDigest: c.contentDigest }]
+        : []
+    )
+  );
+  return chained;
 }

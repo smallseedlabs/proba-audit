@@ -76,6 +76,9 @@ services:
       CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-proba_audit}
       EVENT_BUS: ${EVENT_BUS:-redis-streams}
       AUDIT_STORE: ${AUDIT_STORE:-clickhouse}
+      # Raw text of events (protocol 0.3.3 `content`): off unless set to true. Same value for audit-consumer and audit-api.
+      AUDIT_CONTENT_ENABLED: ${AUDIT_CONTENT_ENABLED:-false}
+      AUDIT_CONTENT_STORE: ${AUDIT_CONTENT_STORE:-clickhouse}
       METRICS_STORE: ${METRICS_STORE:-clickhouse}
       CHECKPOINT_STORE: ${CHECKPOINT_STORE:-clickhouse}
       QUARANTINE_STORE: ${QUARANTINE_STORE:-clickhouse}

@@ -1,8 +1,11 @@
 import {
   AnalyticsValidationError,
   buildTraceTree,
+  digestAuditContent,
   verifyChain,
   type AccessContext,
+  type AuditContent,
+  type AuditContentStore,
   type AuditedAnalyticsReader,
   type AuditedReader,
   type AuditFacets,
@@ -37,6 +40,10 @@ import {
 
 export interface ReadServiceDeps {
   auditStore: AuditStore;
+  /** Raw text of events. Used only when `contentEnabled`. */
+  contentStore?: AuditContentStore;
+  /** AUDIT_CONTENT_ENABLED: the content routes answer 404 and events never say `hasContent` when false. */
+  contentEnabled?: boolean;
   metricsStore: MetricsStore;
   reader: AuditedReader;
   analytics: AuditedAnalyticsReader;
@@ -48,8 +55,37 @@ export interface ReadServiceDeps {
 /** What a request adds to the audit event of its own read: the route and the caller's role, never data. */
 export type ReadMeta = { route: string; role: string };
 
+/**
+ * An event as the API returns it: the chain fields as stored, but never the raw text. `hasContent` says whether
+ * text exists (read it at /v1/events/{id}/content, administrators only). The digest of the text is shown to
+ * administrators only: a short, guessable message could be confirmed from its digest.
+ */
+export type ApiEvent = Omit<StoredAuditEvent, 'content' | 'contentDigest'> & { hasContent?: true; contentDigest?: string };
+
+/** The raw text of one event, with proof that it is the text the hash chain covers. */
+export interface EventContent {
+  eventId: string;
+  traceId: string;
+  spanId: string;
+  action: string;
+  occurredAt: string;
+  content: AuditContent;
+  /** SHA-256 of the canonical text, as recorded in the event (and so in the hash chain). */
+  contentDigest: string;
+  /** True when the stored text hashes to `contentDigest`. False means the text was altered after it was chained. */
+  verified: boolean;
+}
+
+export interface TraceContent {
+  traceId: string;
+  /** Events of the trace that have text, oldest first. */
+  items: EventContent[];
+  /** True when the trace has more events than were loaded. */
+  truncated: boolean;
+}
+
 export interface EventsPage {
-  events: StoredAuditEvent[];
+  events: ApiEvent[];
   nextCursor: string | null;
   from: string | null;
   to: string | null;
@@ -101,6 +137,14 @@ export interface FacetsResponse extends AuditFacets {
 export class ReadService {
   constructor(private readonly d: ReadServiceDeps) {}
 
+  /** Strip raw text and (for non-admins) the digest, flag text that exists. */
+  private expose(event: StoredAuditEvent, role: string): ApiEvent {
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    const { content: _content, contentDigest, ...rest } = event;
+    const has = this.d.contentEnabled === true && contentDigest !== undefined;
+    return { ...rest, ...(has ? { hasContent: true as const } : {}), ...(has && role === 'admin' ? { contentDigest } : {}) };
+  }
+
   async searchEvents(ctx: AccessContext, q: EventsQuery, meta: ReadMeta): Promise<EventsPage> {
     const anchored = q.traceId !== undefined || q.goalId !== undefined || q.threadId !== undefined;
     const window = resolveWindow(q, { now: this.d.clock.now(), ...API_LIMITS.events, anchored });
@@ -134,7 +178,7 @@ export class ReadService {
       meta
     );
     return {
-      events: page.events,
+      events: page.events.map((e) => this.expose(e, meta.role)),
       nextCursor: page.nextCursor ? eventCursor.encode(page.nextCursor, q.order) : null,
       from: window.from ?? null,
       to: window.to ?? null,
@@ -143,10 +187,84 @@ export class ReadService {
     };
   }
 
-  async getEvent(ctx: AccessContext, eventId: string, meta: ReadMeta): Promise<StoredAuditEvent> {
+  async getEvent(ctx: AccessContext, eventId: string, meta: ReadMeta): Promise<ApiEvent> {
     const event = await this.d.reader.read(ctx, 'events.get', { eventId }, (e) => (e ? 1 : 0), () => this.d.auditStore.getEvent(ctx.workspaceId, eventId), meta);
     if (!event) throw new ApiError(404, 'not_found', 'There is no event with this id.');
-    return event;
+    return this.expose(event, meta.role);
+  }
+
+  private requireContentEnabled(): AuditContentStore {
+    if (this.d.contentEnabled !== true || !this.d.contentStore) {
+      throw new ApiError(404, 'content_disabled', 'Raw text is not enabled on this deployment.');
+    }
+    return this.d.contentStore;
+  }
+
+  private toEventContent(event: StoredAuditEvent, stored: { content: AuditContent; contentDigest: string }): EventContent {
+    const digest = event.contentDigest as string;
+    return {
+      eventId: event.eventId,
+      traceId: event.traceId,
+      spanId: event.spanId,
+      action: event.action,
+      occurredAt: event.occurredAt,
+      content: stored.content,
+      contentDigest: digest,
+      verified: stored.contentDigest === digest && digestAuditContent(stored.content) === digest,
+    };
+  }
+
+  /**
+   * The raw text of one event. The route is admin-only (checked by the caller); this is audited as
+   * `audit.event_viewed` with `contentIncluded: true`, whether or not text was found.
+   */
+  async getEventContent(ctx: AccessContext, eventId: string, meta: ReadMeta): Promise<EventContent> {
+    const store = this.requireContentEnabled();
+    const found = await this.d.reader.readContent(
+      ctx,
+      'audit.event_viewed',
+      'events.content',
+      { eventId },
+      (r: EventContent | null) => (r ? 1 : 0),
+      async () => {
+        const event = await this.d.auditStore.getEvent(ctx.workspaceId, eventId);
+        if (!event || event.contentDigest === undefined) return null;
+        const stored = await store.get(ctx.workspaceId, eventId);
+        return stored ? this.toEventContent(event, stored) : null;
+      },
+      { type: 'audit_event', id: eventId },
+      meta
+    );
+    if (!found) throw new ApiError(404, 'not_found', 'There is no raw text for this event.');
+    return found;
+  }
+
+  /** The raw text of every event of a trace that has some, oldest first. Audited as `audit.trace_viewed` with `contentIncluded: true`. */
+  async getTraceContent(ctx: AccessContext, traceId: string, meta: ReadMeta): Promise<TraceContent> {
+    const store = this.requireContentEnabled();
+    const result = await this.d.reader.readContent(
+      ctx,
+      'audit.trace_viewed',
+      'traces.content',
+      { traceId },
+      (r: TraceContent | null) => (r ? r.items.length : 0),
+      async () => {
+        const page = await this.d.auditStore.search({ workspaceId: ctx.workspaceId, traceId, order: 'asc', limit: API_LIMITS.traceMaxEvents });
+        if (page.events.length === 0) return null;
+        const withText = page.events.filter((e) => e.contentDigest !== undefined);
+        const rows = new Map((await store.getMany(ctx.workspaceId, withText.map((e) => e.eventId))).map((r) => [r.eventId, r]));
+        const items: EventContent[] = [];
+        for (const event of withText) {
+          const stored = rows.get(event.eventId);
+          if (stored) items.push(this.toEventContent(event, stored));
+        }
+        return { traceId, items, truncated: page.nextCursor !== null };
+      },
+      { type: 'trace', id: traceId },
+      meta
+    );
+    if (!result) throw new ApiError(404, 'not_found', 'There is no trace with this id.');
+    return result;
   }
 
   async getTrace(ctx: AccessContext, traceId: string, meta: ReadMeta): Promise<TraceTree> {
@@ -214,7 +332,13 @@ export class ReadService {
       'chain.verify',
       q,
       (r) => r.checked,
-      () => verifyChain(this.d.auditStore, ctx.workspaceId, { from: q.from, to: q.to }, { maxEvents: this.d.chain.maxEvents }),
+      () =>
+        verifyChain(
+          this.d.auditStore,
+          ctx.workspaceId,
+          { from: q.from, to: q.to },
+          { maxEvents: this.d.chain.maxEvents, ...(this.d.contentEnabled && this.d.contentStore ? { contentStore: this.d.contentStore } : {}) }
+        ),
       meta
     );
   }

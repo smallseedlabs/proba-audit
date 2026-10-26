@@ -9,6 +9,7 @@ import {
   type AccessContext,
   type AppConfig,
   type AuditEmitter,
+  type AuditContentStore,
   type AuditStore,
   type Clock,
   type Logger,
@@ -58,6 +59,8 @@ export interface ServerDeps {
   verifier: TokenVerifier;
   limiter: RateLimiter;
   auditStore: AuditStore;
+  /** Raw text of events: served to administrators only, and only when config.content.enabled. */
+  auditContentStore?: AuditContentStore;
   metricsStore: MetricsStore;
   scope: ScopeResolver;
   /** Used for the reads themselves: if the audit event cannot be sent, the read is refused (fails closed). */
@@ -106,6 +109,8 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
   );
   const reads = new ReadService({
     auditStore: deps.auditStore,
+    ...(deps.auditContentStore ? { contentStore: deps.auditContentStore } : {}),
+    contentEnabled: config.content.enabled,
     metricsStore: deps.metricsStore,
     reader,
     analytics,
@@ -348,6 +353,14 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
         return reads.getEvent(contextOf(request, session), eventId, metaOf(request, session));
       });
 
+      v1.get('/events/:eventId/content', async (request) => {
+        // Raw text: administrators only. A viewer is refused (and the refusal is audited) before anything is read.
+        const session = await requireRole(request, 'admin');
+        parseWith(noQuerySchema, request.query);
+        const { eventId } = parseWith(eventParamsSchema, request.params, 'path');
+        return reads.getEventContent(contextOf(request, session), eventId, metaOf(request, session));
+      });
+
       v1.get('/traces', async (request) => {
         const session = need(request);
         return reads.listTraces(contextOf(request, session), parseWith(tracesQuerySchema, request.query), metaOf(request, session));
@@ -358,6 +371,13 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
         parseWith(noQuerySchema, request.query);
         const { traceId } = parseWith(traceParamsSchema, request.params, 'path');
         return reads.getTrace(contextOf(request, session), traceId, metaOf(request, session));
+      });
+
+      v1.get('/traces/:traceId/content', async (request) => {
+        const session = await requireRole(request, 'admin');
+        parseWith(noQuerySchema, request.query);
+        const { traceId } = parseWith(traceParamsSchema, request.params, 'path');
+        return reads.getTraceContent(contextOf(request, session), traceId, metaOf(request, session));
       });
 
       v1.get('/chain/verify', async (request, reply) => {
