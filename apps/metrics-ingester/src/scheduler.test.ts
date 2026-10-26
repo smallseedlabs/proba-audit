@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { ManualClock } from '@smallseedlabs/proba-audit-adapters';
+import { InMemoryLeaseStore } from '@smallseedlabs/proba-audit-adapters';
 import { makeHarness, type Harness } from './harness.testing.js';
-import { LeaseTable, nextDelayMs } from './scheduler.js';
+import { nextDelayMs } from './scheduler.js';
 
 const open: Harness[] = [];
 afterEach(async () => {
@@ -46,21 +46,6 @@ describe('nextDelayMs', () => {
   });
 });
 
-describe('LeaseTable', () => {
-  it('allows one holder per key until release or expiry', () => {
-    const clock = new ManualClock();
-    const t = new LeaseTable(clock);
-    expect(t.tryAcquire('a', 1000)).toBe(true);
-    expect(t.tryAcquire('a', 1000)).toBe(false);
-    expect(t.tryAcquire('b', 1000)).toBe(true);
-    t.release('a');
-    expect(t.tryAcquire('a', 1000)).toBe(true);
-    clock.advance(1001);
-    expect(t.isHeld('a')).toBe(false);
-    expect(t.tryAcquire('a', 1000)).toBe(true); // expired lease can be taken over
-  });
-});
-
 describe('IngestScheduler', () => {
   it('discovers every account of every connector', async () => {
     const h = harness();
@@ -83,6 +68,43 @@ describe('IngestScheduler', () => {
     expect(h.logger.records.some((r) => r.fields.lifecycle === 'sync_skipped_overlap')).toBe(true);
     // The lease is released afterwards.
     expect(await h.scheduler.syncNow('meta', 'stub_meta_acct_1')).not.toBeNull();
+  });
+
+  it('two replicas on one lease store never sync the same account at once', async () => {
+    const leases = new InMemoryLeaseStore();
+    const a = harness({ leases, ownerId: 'replica-a' });
+    const b = harness({ leases, ownerId: 'replica-b' });
+    await Promise.all([a.scheduler.refreshAccounts(), b.scheduler.refreshAccounts()]);
+    const [fromA, fromB] = await Promise.all([a.scheduler.syncNow('meta', 'stub_meta_acct_1'), b.scheduler.syncNow('meta', 'stub_meta_acct_1')]);
+    expect([fromA, fromB].filter((o) => o === null)).toHaveLength(1);
+    expect([fromA, fromB].filter((o) => o?.status === 'completed')).toHaveLength(1);
+    const loser = fromA === null ? a : b;
+    expect(loser.logger.records.some((r) => r.fields.lifecycle === 'sync_skipped_overlap')).toBe(true);
+    // Different accounts do not block each other across replicas, and the lease is released afterwards.
+    const [x, y] = await Promise.all([a.scheduler.syncNow('meta', 'stub_meta_acct_2'), b.scheduler.syncNow('meta', 'stub_meta_acct_3')]);
+    expect([x?.status, y?.status]).toEqual(['completed', 'completed']);
+    expect(await b.scheduler.syncNow('meta', 'stub_meta_acct_1')).not.toBeNull();
+  });
+
+  it('takes over an account whose lease expired (a replica that died mid-sync)', async () => {
+    const h = harness({ ownerId: 'replica-b' });
+    await h.scheduler.refreshAccounts();
+    await h.leases.tryAcquire('ingest:meta:stub_meta_acct_1', 'replica-a-dead', 60_000);
+    expect(await h.scheduler.syncNow('meta', 'stub_meta_acct_1')).toBeNull();
+    h.clock.advance(60_001);
+    expect((await h.scheduler.syncNow('meta', 'stub_meta_acct_1'))?.status).toBe('completed');
+  });
+
+  it('skips the run when the lease store is unavailable (fails closed) and recovers', async () => {
+    const h = harness();
+    await h.scheduler.refreshAccounts();
+    const tryAcquire = h.leases.tryAcquire.bind(h.leases);
+    h.leases.tryAcquire = () => Promise.reject(new Error('lease store down'));
+    expect(await h.scheduler.syncNow('meta', 'stub_meta_acct_1')).toBeNull();
+    expect(h.logger.records.some((r) => r.fields.lifecycle === 'sync_skipped_lease_unavailable')).toBe(true);
+    expect(h.emitter.actions()).not.toContain('metrics.fetch_started');
+    h.leases.tryAcquire = tryAcquire;
+    expect((await h.scheduler.syncNow('meta', 'stub_meta_acct_1'))?.status).toBe('completed');
   });
 
   it('different accounts run side by side', async () => {

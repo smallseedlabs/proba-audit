@@ -36,6 +36,9 @@ export const envSchema = z.object({
   // HMAC key that signs the anchors. Required (at least 32 characters) in production; outside production an empty key falls back to a fixed development key.
   ANCHOR_HMAC_KEY: z.string().default(''),
   ANCHOR_DATABASE_URL: z.string().default(''),
+  // Exclusive claims (leases) that keep replicas from doing the same work at once: one sync per ad account (metrics-ingester), one rollup run
+  // per workspace (rollup), one writer per workspace chain (audit-consumer). `redis` (uses REDIS_URL) is shared by every replica; `memory` is per process.
+  LEASE_STORE: nonEmpty('memory'),
   // The in-memory adapters lose everything on restart and are per process: they refuse to start in production
   // unless this is true (a deliberate, temporary opt-in, for example a smoke test of a production image).
   ALLOW_IN_MEMORY_ADAPTERS: z
@@ -63,6 +66,8 @@ export const envSchema = z.object({
 
   // Audit consumer
   CONSUMER_RECLAIM_INTERVAL_MS: positiveInt(30000),
+  // How long the audit-consumer's per-workspace write lease (LEASE_STORE) lives without being renewed; one batch is written well within it.
+  CONSUMER_LEASE_TTL_MS: positiveInt(30000),
   CONSUMER_RETRY_BASE_MS: positiveInt(500),
   CONSUMER_RETRY_MAX_MS: positiveInt(30000),
   SELF_AUDIT_ENABLED: z
@@ -238,6 +243,7 @@ export interface AppConfig {
     quarantineStore: string;
     auditContentStore: string;
     anchorStore: string;
+    leaseStore: string;
   };
   /** Chain anchors (ANCHOR_STORE): the key that signs them and the database of the `postgres` adapter. */
   anchors: { hmacKey: string; databaseUrl: string };
@@ -259,6 +265,8 @@ export interface AppConfig {
   consumer: {
     /** How often the consumer reclaims pending messages of crashed consumers. */
     reclaimIntervalMs: number;
+    /** TTL of the per-workspace write lease (LEASE_STORE). */
+    leaseTtlMs: number;
     /** Backoff between retries of a batch the store rejected (doubles up to the max). */
     retryBaseMs: number;
     retryMaxMs: number;
@@ -447,6 +455,7 @@ export function loadConfig(env: EnvSource = process.env, options: LoadConfigOpti
       quarantineStore: e.QUARANTINE_STORE,
       auditContentStore: e.AUDIT_CONTENT_STORE,
       anchorStore: e.ANCHOR_STORE,
+      leaseStore: e.LEASE_STORE,
     },
     anchors: { hmacKey: e.ANCHOR_HMAC_KEY, databaseUrl: e.ANCHOR_DATABASE_URL },
     allowInMemoryAdapters: e.ALLOW_IN_MEMORY_ADAPTERS,
@@ -468,6 +477,7 @@ export function loadConfig(env: EnvSource = process.env, options: LoadConfigOpti
       retryMaxMs: e.CONSUMER_RETRY_MAX_MS,
       selfAudit: e.SELF_AUDIT_ENABLED,
       selfAuditWorkspaceId: e.SELF_AUDIT_WORKSPACE_ID,
+      leaseTtlMs: e.CONSUMER_LEASE_TTL_MS,
     },
     connectors: {
       pairs,

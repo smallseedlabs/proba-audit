@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import {
+  LeaseHeldError,
   chainEvent,
   verifyChain,
   type AuditEvent,
@@ -7,6 +8,7 @@ import {
 } from '@smallseedlabs/proba-audit-core';
 import {
   InMemoryAnchorStore,
+  InMemoryLeaseStore,
   InMemoryAuditStore,
   InMemoryEventBus,
   ManualClock,
@@ -492,6 +494,93 @@ describe('AuditConsumer: chain anchors', () => {
     const { h } = setup();
     await h.publish(makeEvent());
     expect((await h.pump()).result.written).toBe(1);
+  });
+});
+
+describe('AuditConsumer: workspace write leases (several instances)', () => {
+  const second = (first: Setup, leases: InMemoryLeaseStore, anchors?: InMemoryAnchorStore) =>
+    setup({ bus: first.bus, store: first.store, leases, ...(anchors ? { anchors } : {}), consumerName: 'consumer-2' });
+
+  it('two instances alternating on one workspace keep one valid chain (heads are re-read under the lease)', async () => {
+    const leases = new InMemoryLeaseStore();
+    const anchors = new InMemoryAnchorStore({ hmacKey: 'lease-test-anchor-key-0123456789-0123456789' });
+    const a = setup({ leases, anchors, consumerName: 'consumer-1' });
+    const b = second(a, leases, anchors);
+    for (let i = 0; i < 3; i += 1) {
+      a.clock.advance(5);
+      b.clock.advance(5);
+      await a.h.publish(makeEvent(), makeEvent());
+      await a.h.pump();
+      await a.h.publish(makeEvent());
+      await b.h.pump();
+    }
+    expect(await verifyChain(a.store, 'seedbed', {}, { anchorStore: anchors, pageSize: 2 })).toMatchObject({ ok: true, checked: 9, anchor: { checked: true, count: 9 } });
+  });
+
+  it('without leases a second writer breaks the chain (what the lease prevents)', async () => {
+    const a = setup({ consumerName: 'consumer-1' });
+    const b = setup({ bus: a.bus, store: a.store, consumerName: 'consumer-2' });
+    await a.h.publish(makeEvent());
+    await a.h.pump();
+    await a.h.publish(makeEvent());
+    await b.h.pump();
+    await a.h.publish(makeEvent());
+    await a.h.pump(); // a still trusts the head it cached before b wrote
+    expect((await verifyChain(a.store, 'seedbed')).ok).toBe(false);
+  });
+
+  it('a workspace leased by another instance fails the batch, acknowledges nothing, and succeeds once it is free', async () => {
+    const leases = new InMemoryLeaseStore();
+    const a = setup({ leases, consumerName: 'consumer-1' });
+    await leases.tryAcquire('audit-consumer:workspace:seedbed', 'consumer-2', 60_000);
+    await a.h.publish(makeEvent());
+    const messages = await a.h.read();
+    await expect(a.h.consumer.processBatch(messages)).rejects.toBeInstanceOf(LeaseHeldError);
+    expect(await stored(a.store, 'seedbed')).toHaveLength(0);
+    expect(await a.h.pending()).toBe(1);
+    await leases.release('audit-consumer:workspace:seedbed', 'consumer-2');
+    expect(await a.h.consumer.processBatch(messages)).toMatchObject({ written: 1 });
+    expect(await a.h.pending()).toBe(0);
+  });
+
+  it('takes all leases or none, and releases them after the batch (also a failed one)', async () => {
+    const leases = new InMemoryLeaseStore();
+    const a = setup({ leases, consumerName: 'consumer-1' });
+    await leases.tryAcquire('audit-consumer:workspace:zeta', 'consumer-2', 60_000);
+    await a.h.publish(makeEvent({ workspaceId: 'alpha' }), makeEvent({ workspaceId: 'zeta' }));
+    const messages = await a.h.read();
+    await expect(a.h.consumer.processBatch(messages)).rejects.toBeInstanceOf(LeaseHeldError);
+    expect(await leases.tryAcquire('audit-consumer:workspace:alpha', 'probe', 1000)).toBe(true); // alpha was given back
+    await leases.release('audit-consumer:workspace:alpha', 'probe');
+    await leases.release('audit-consumer:workspace:zeta', 'consumer-2');
+
+    a.store.appendBatch = () => Promise.reject(new Error('store down'));
+    await expect(a.h.consumer.processBatch(messages)).rejects.toThrow('store down');
+    expect(await leases.tryAcquire('audit-consumer:workspace:alpha', 'probe', 1000)).toBe(true); // released after the failure
+  });
+
+  it('writes nothing when a lease was lost during the batch (renewal fails just before the write)', async () => {
+    const leases = new InMemoryLeaseStore();
+    const a = setup({ leases, consumerName: 'consumer-1' });
+    leases.renew = async () => false;
+    await a.h.publish(makeEvent());
+    const messages = await a.h.read();
+    await expect(a.h.consumer.processBatch(messages)).rejects.toThrow(/lost/);
+    expect(await stored(a.store, 'seedbed')).toHaveLength(0);
+  });
+
+  it('keeps ingesting through the retry loop while another instance holds the lease', async () => {
+    const leases = new InMemoryLeaseStore();
+    const a = setup({ leases, consumerName: 'consumer-1' });
+    await leases.tryAcquire('audit-consumer:workspace:seedbed', 'consumer-2', 60_000);
+    await a.h.publish(makeEvent(), makeEvent());
+    await a.h.consumer.start();
+    await new Promise((r) => setTimeout(r, 60));
+    expect(await stored(a.store, 'seedbed')).toHaveLength(0);
+    expect(a.h.errors().some((r) => r.msg === 'batch failed, nothing acknowledged; retrying')).toBe(true);
+    await leases.release('audit-consumer:workspace:seedbed', 'consumer-2');
+    await waitFor(async () => (await stored(a.store, 'seedbed')).length === 2);
+    expect(await verifyChain(a.store, 'seedbed')).toMatchObject({ ok: true, checked: 2 });
   });
 });
 

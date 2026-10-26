@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { MemoryLogger, type AuditDraft, type AuditEmitter, type AuditEvent, type MetricObservation, type MetricsStore } from '@smallseedlabs/proba-audit-core';
 import { makeObservation } from '@smallseedlabs/proba-audit-core/testing';
-import { InMemoryCheckpointStore, InMemoryMetricsStore, ManualClock, SequentialIdGenerator } from '@smallseedlabs/proba-audit-adapters';
+import { InMemoryCheckpointStore, InMemoryLeaseStore, InMemoryMetricsStore, ManualClock, SequentialIdGenerator } from '@smallseedlabs/proba-audit-adapters';
 import { RollupWorker } from './rollup-worker.js';
 
 class Recorder implements AuditEmitter {
@@ -15,22 +15,25 @@ class Recorder implements AuditEmitter {
   }
 }
 
-function setup(store?: MetricsStore, opts: { maxWindowDays?: number } = {}) {
+function setup(store?: MetricsStore, opts: { maxWindowDays?: number; leases?: InMemoryLeaseStore; ownerId?: string } = {}) {
   const clock = new ManualClock('2026-10-28T12:00:00.000Z');
   const metricsStore = store ?? new InMemoryMetricsStore(clock);
   const checkpoints = new InMemoryCheckpointStore(clock);
   const emitter = new Recorder();
   const logger = new MemoryLogger();
+  const leases = opts.leases ?? new InMemoryLeaseStore(clock);
   const worker = new RollupWorker({
     metricsStore,
     checkpoints,
+    leases,
+    ownerId: opts.ownerId ?? 'rollup-1',
     emitter,
     clock,
     ids: new SequentialIdGenerator(),
     logger,
     options: { workspaceId: 'ws_test', serviceName: 'rollup', intervalMs: 10, maxWindowDays: opts.maxWindowDays ?? 7 },
   });
-  return { clock, metricsStore, checkpoints, emitter, logger, worker };
+  return { clock, metricsStore, checkpoints, leases, emitter, logger, worker };
 }
 
 const hourObs = (accountId: string, hourIso: string, n: number, extra: Partial<MetricObservation> = {}): MetricObservation => {
@@ -168,6 +171,8 @@ describe('RollupWorker', () => {
     const b = new RollupWorker({
       metricsStore: a.metricsStore,
       checkpoints: a.checkpoints,
+      leases: a.leases,
+      ownerId: 'rollup-2',
       clock: a.clock,
       ids: new SequentialIdGenerator(),
       logger: new MemoryLogger(),
@@ -184,5 +189,42 @@ describe('RollupWorker', () => {
     while (emitter.drafts.length === 0 && Date.now() < end) await new Promise((r) => setTimeout(r, 10));
     await worker.stop();
     expect(emitter.drafts[0]?.action).toBe('metrics.rollup_run');
+  });
+});
+
+describe('RollupWorker leases', () => {
+  it('two replicas on one lease store: only one run at a time, the other reports idle', async () => {
+    const leases = new InMemoryLeaseStore();
+    const a = setup(undefined, { leases, ownerId: 'replica-a' });
+    const b = setup(a.metricsStore, { leases, ownerId: 'replica-b' });
+    await a.metricsStore.upsertObservations(WS, [hourObs('l', '2026-10-28T08:00:00.000Z', 0)]);
+    const [x, y] = await Promise.all([a.worker.runOnce(), b.worker.runOnce()]);
+    expect([x.status, y.status].sort()).toEqual(['completed', 'idle']);
+    expect(a.emitter.drafts.length + b.emitter.drafts.length).toBe(1);
+  });
+
+  it('releases the lease after a run, also a failed one', async () => {
+    const leases = new InMemoryLeaseStore();
+    const { worker, metricsStore } = setup(undefined, { leases });
+    await metricsStore.upsertObservations(WS, [hourObs('l', '2026-10-28T08:00:00.000Z', 0)]);
+    await worker.runOnce();
+    expect(await leases.tryAcquire('rollup:ws_test', 'someone-else', 1000)).toBe(true);
+  });
+
+  it('is idle while another instance holds the lease, and takes over when it expires', async () => {
+    const { worker, metricsStore, leases, clock } = setup();
+    await metricsStore.upsertObservations(WS, [hourObs('l', '2026-10-28T08:00:00.000Z', 0)]);
+    await leases.tryAcquire('rollup:ws_test', 'dead-replica', 60_000);
+    expect(await worker.runOnce()).toEqual({ status: 'idle' });
+    clock.advance(60_001);
+    expect(await worker.runOnce()).toMatchObject({ status: 'completed' });
+  });
+
+  it('is idle (fails closed) when the lease store is unavailable', async () => {
+    const { worker, metricsStore, leases, logger } = setup();
+    await metricsStore.upsertObservations(WS, [hourObs('l', '2026-10-28T08:00:00.000Z', 0)]);
+    leases.tryAcquire = () => Promise.reject(new Error('lease store down'));
+    expect(await worker.runOnce()).toEqual({ status: 'idle' });
+    expect(logger.records.some((r) => r.fields.lifecycle === 'rollup_skipped_lease_unavailable')).toBe(true);
   });
 });

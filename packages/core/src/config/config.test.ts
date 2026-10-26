@@ -14,6 +14,7 @@ describe('loadConfig', () => {
       quarantineStore: 'clickhouse',
       auditContentStore: 'clickhouse',
       anchorStore: 'memory',
+      leaseStore: 'memory',
     });
     expect(c.content.enabled).toBe(false);
     expect(c.connectors.pairs).toEqual([]);
@@ -53,6 +54,7 @@ describe('loadConfig', () => {
   it('has consumer defaults and reads overrides', () => {
     expect(loadConfig({}).consumer).toEqual({
       reclaimIntervalMs: 30000,
+      leaseTtlMs: 30000,
       retryBaseMs: 500,
       retryMaxMs: 30000,
       selfAudit: true,
@@ -96,6 +98,16 @@ describe('loadConfig', () => {
     expect(text).not.toContain('hunter2');
     expect(text).not.toContain('secretpw');
     expect(text).toContain('REDACTED');
+  });
+});
+
+describe('lease config', () => {
+  it('defaults to the memory store and reads LEASE_STORE and CONSUMER_LEASE_TTL_MS', () => {
+    expect(loadConfig({}).adapters.leaseStore).toBe('memory');
+    const c = loadConfig({ LEASE_STORE: 'redis', CONSUMER_LEASE_TTL_MS: '5000' });
+    expect(c.adapters.leaseStore).toBe('redis');
+    expect(c.consumer.leaseTtlMs).toBe(5000);
+    expect(() => loadConfig({ CONSUMER_LEASE_TTL_MS: '0' })).toThrow(/CONSUMER_LEASE_TTL_MS/);
   });
 });
 

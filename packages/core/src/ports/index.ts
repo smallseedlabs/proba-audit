@@ -5,6 +5,7 @@ export * from './event-bus.js';
 export * from './audit-store.js';
 export * from './audit-content-store.js';
 export * from './anchor-store.js';
+export * from './lease-store.js';
 export * from './metrics-store.js';
 export * from './platform-connector.js';
 export * from './audit-emitter.js';

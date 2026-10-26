@@ -4,6 +4,7 @@ import type {
   CheckpointStore,
   Clock,
   IdGenerator,
+  LeaseStore,
   Logger,
   MetricsStore,
 } from '@smallseedlabs/proba-audit-core';
@@ -17,12 +18,18 @@ export interface RollupWorkerOptions {
   intervalMs: number;
   /** A run recomputes at most this many days at a time (larger changed windows are split). */
   maxWindowDays: number;
+  /** TTL of the run lease: a run that hangs longer than this may be replaced by another instance. Default max(5 intervals, 10 min). */
+  leaseTtlMs?: number;
 }
 
 export interface RollupWorkerDeps {
   metricsStore: MetricsStore;
   /** Holds the watermark, so a restarted worker continues where the last one stopped. */
   checkpoints: CheckpointStore;
+  /** One run at a time per workspace: across replicas when the LeaseStore is shared (LEASE_STORE=redis). */
+  leases: LeaseStore;
+  /** Owner id of this instance's lease; unique per process (Runtime.instanceId). */
+  ownerId: string;
   emitter?: AuditEmitter;
   clock: Clock;
   ids: IdGenerator;
@@ -54,13 +61,12 @@ export interface RollupRunResult {
  *
  * Daily buckets are local days in each observation's `timezone` (UTC by default), summed
  * whole. `reach` is never summed. The watermark moves only after a run succeeds, so a
- * failed run is simply repeated. Run ONE replica (see docs/ARCHITECTURE.md, "Metrics flow").
+ * failed run is simply repeated. One run at a time (lease `rollup:<workspaceId>`): across replicas when the LeaseStore is shared, otherwise run ONE replica (see docs/ARCHITECTURE.md, "Metrics flow").
  */
 export class RollupWorker {
   private timer?: ReturnType<typeof setTimeout>;
   private running = false;
   private current?: Promise<unknown>;
-  private busy = false;
 
   constructor(private readonly deps: RollupWorkerDeps) {}
 
@@ -68,13 +74,26 @@ export class RollupWorker {
     return { workspaceId: this.deps.options.workspaceId, source: 'rollup', accountId: '*', stream: 'changed_since' };
   }
 
+  private get leaseKey(): string {
+    return `rollup:${this.deps.options.workspaceId}`;
+  }
+
   async runOnce(): Promise<RollupRunResult> {
-    if (this.busy) return { status: 'idle' }; // overlap protection: one run at a time
-    this.busy = true;
+    const { leases, ownerId, logger, options } = this.deps;
+    const ttl = options.leaseTtlMs ?? Math.max(options.intervalMs * 5, 10 * 60_000);
+    try {
+      if (!(await leases.tryAcquire(this.leaseKey, ownerId, ttl))) return { status: 'idle' }; // overlap protection: one run at a time
+    } catch (err) {
+      // Fail closed: without the lease store nobody can say that no other run is going on. The next tick tries again.
+      logger.error('rollup skipped: lease store unavailable', { lifecycle: 'rollup_skipped_lease_unavailable', err });
+      return { status: 'idle' };
+    }
     try {
       return await this.run();
     } finally {
-      this.busy = false;
+      await leases.release(this.leaseKey, ownerId).catch((err: unknown) => {
+        logger.warn('lease release failed; it will expire on its own', { lifecycle: 'lease_release_failed', err });
+      });
     }
   }
 

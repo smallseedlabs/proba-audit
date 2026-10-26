@@ -16,6 +16,7 @@ import { StubConnectorNotAllowedError, StubPlatformConnector } from '../stub/stu
 import { InMemoryEventBus } from '../memory/event-bus.js';
 import { InMemoryAnchorStore } from '../memory/anchor-store.js';
 import { InMemoryAuditStore } from '../memory/audit-store.js';
+import { InMemoryLeaseStore } from '../memory/lease-store.js';
 import { InMemoryMetricsStore } from '../memory/metrics-store.js';
 import { AnchorKeyRequiredError } from './anchor-key.js';
 import { InMemoryAdaptersNotAllowedError } from './in-memory-guard.js';
@@ -68,6 +69,7 @@ describe('createRuntime', () => {
     expect(r.checkpointStore.names()).toEqual(['clickhouse', 'memory']);
     expect(r.quarantineStore.names()).toEqual(['clickhouse', 'memory']);
     expect(r.anchorStore.names()).toEqual(['memory', 'postgres']);
+    expect(r.leaseStore.names()).toEqual(['memory', 'redis']);
     expect(r.platformConnector.names()).toEqual(['stub']);
   });
 });
@@ -196,6 +198,35 @@ describe('chain anchors (ANCHOR_STORE, ANCHOR_HMAC_KEY)', () => {
   it('ANCHOR_STORE=postgres needs ANCHOR_DATABASE_URL', async () => {
     const err = await failure(loadConfig({ ...memoryEnv, NODE_ENV: 'development', ANCHOR_STORE: 'postgres' }));
     expect((err as Error).message).toContain('ANCHOR_DATABASE_URL');
+  });
+});
+
+describe('leases (LEASE_STORE)', () => {
+  const prod = (extra: Record<string, string> = {}) => loadConfig({ ...memoryEnv, AUDIT_CONTENT_STORE: 'memory', NODE_ENV: 'production', ...extra });
+
+  it('creates the lease store only for services that take leases, with a distinct instance id per runtime', async () => {
+    const config = loadConfig({ ...memoryEnv, NODE_ENV: 'development' });
+    const without = await createRuntime(config, { logger: new MemoryLogger() });
+    expect(without.leaseStore).toBeUndefined();
+    const a = await createRuntime(config, { logger: new MemoryLogger(), usesLeases: true });
+    const b = await createRuntime(config, { logger: new MemoryLogger(), usesLeases: true });
+    expect(a.leaseStore).toBeInstanceOf(InMemoryLeaseStore);
+    expect(a.instanceId).not.toBe(b.instanceId);
+    await Promise.all([without.close(), a.close(), b.close()]);
+  });
+
+  it('an in-memory lease store counts for the production guard only with usesLeases', async () => {
+    const config = prod({ ALLOW_IN_MEMORY_ADAPTERS: 'false' });
+    const refused = async (usesLeases: boolean) =>
+      ((await createRuntime(config, { logger: new MemoryLogger(), usesLeases }).catch((e: unknown) => e)) as InMemoryAdaptersNotAllowedError).adapters;
+    expect(await refused(true)).toContain('LEASE_STORE');
+    expect(await refused(false)).not.toContain('LEASE_STORE');
+  });
+
+  it('an unknown LEASE_STORE fails with the list of adapters', async () => {
+    await expect(
+      createRuntime(loadConfig({ ...memoryEnv, NODE_ENV: 'development', LEASE_STORE: 'etcd' }), { logger: new MemoryLogger(), usesLeases: true })
+    ).rejects.toThrow(UnknownAdapterError);
   });
 });
 

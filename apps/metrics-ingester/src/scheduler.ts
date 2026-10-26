@@ -1,6 +1,7 @@
 import type {
   ConnectorAccount,
   Clock,
+  LeaseStore,
   Logger,
   MetricPlatform,
   PlatformConnector,
@@ -19,13 +20,20 @@ export interface SchedulerOptions {
   failureBackoffMaxMs: number;
   /** How often listAccounts is called again to pick up accounts that were added or removed. */
   accountRefreshMs: number;
-  /** A lease older than this is considered abandoned (a hung run) and may be taken over. */
+  /** A lease older than this is considered abandoned (a hung run) and may be taken over by any instance. */
   leaseTtlMs?: number;
 }
 
 export interface SchedulerDeps {
   connectors: ReadonlyMap<MetricPlatform, PlatformConnector>;
   engine: SyncEngine;
+  /**
+   * At most one sync per (platform, account) at a time: with a shared LeaseStore (LEASE_STORE=redis) that holds across
+   * replicas, with the in-memory one inside this process only.
+   */
+  leases: LeaseStore;
+  /** Owner id of this instance's leases; unique per process (Runtime.instanceId). */
+  ownerId: string;
   clock: Clock;
   logger: Logger;
   options: SchedulerOptions;
@@ -38,37 +46,6 @@ interface Task {
   failures: number;
   timer?: ReturnType<typeof setTimeout>;
   stopped: boolean;
-}
-
-/**
- * In-process lease table: at most one sync per (platform, account) at a time.
- * A lease expires after its ttl, so a hung run cannot block the account forever.
- *
- * SINGLE-INSTANCE ASSUMPTION: the lease lives in this process. Run ONE metrics-ingester
- * replica. Two replicas would not corrupt data (runs are idempotent and revision-ordered),
- * but they would pull the same windows twice and waste platform quota. See
- * docs/ARCHITECTURE.md, "Metrics flow".
- */
-export class LeaseTable {
-  private readonly held = new Map<string, number>();
-
-  constructor(private readonly clock: Clock) {}
-
-  tryAcquire(key: string, ttlMs: number): boolean {
-    const now = this.clock.now().getTime();
-    const until = this.held.get(key);
-    if (until !== undefined && until > now) return false;
-    this.held.set(key, now + ttlMs);
-    return true;
-  }
-
-  release(key: string): void {
-    this.held.delete(key);
-  }
-
-  isHeld(key: string): boolean {
-    return (this.held.get(key) ?? 0) > this.clock.now().getTime();
-  }
 }
 
 /** Delay before the next run: the interval, spread by jitter; grown exponentially after failures; never below a platform hint. */
@@ -90,18 +67,18 @@ export function nextDelayMs(input: {
 
 /**
  * Runs one SyncEngine loop per (platform, account) of every configured connector.
- * Runs of the same account never overlap (lease); different accounts run concurrently.
+ * Runs of the same account never overlap (lease, also between replicas when the LeaseStore is shared);
+ * different accounts run concurrently. Two replicas on one shared LeaseStore both schedule every account, but a
+ * sync only runs on the replica that holds its lease at that moment, so the platform is not pulled twice.
  */
 export class IngestScheduler {
   private readonly tasks = new Map<string, Task>();
-  private readonly leases: LeaseTable;
   private readonly random: () => number;
   private refreshTimer?: ReturnType<typeof setTimeout>;
   private running = false;
   private readonly inFlight = new Set<Promise<unknown>>();
 
   constructor(private readonly deps: SchedulerDeps) {
-    this.leases = new LeaseTable(deps.clock);
     this.random = deps.random ?? Math.random;
   }
 
@@ -193,13 +170,25 @@ export class IngestScheduler {
 
   private async runTask(task: Task, connector: PlatformConnector): Promise<SyncOutcome | null> {
     const { logger, options } = this.deps;
-    const leaseKey = `${task.platform}:${task.account.accountId}`;
+    const leaseKey = `ingest:${task.platform}:${task.account.accountId}`;
     const ttl = options.leaseTtlMs ?? Math.max(this.intervalFor(task.platform) * 5, 5 * 60_000);
-    if (!this.leases.tryAcquire(leaseKey, ttl)) {
-      logger.warn('sync skipped: previous run still in progress', {
-        lifecycle: 'sync_skipped_overlap',
+    const { leases, ownerId } = this.deps;
+    try {
+      if (!(await leases.tryAcquire(leaseKey, ownerId, ttl))) {
+        logger.warn('sync skipped: previous run still in progress', {
+          lifecycle: 'sync_skipped_overlap',
+          platform: task.platform,
+          accountId: task.account.accountId,
+        });
+        return null;
+      }
+    } catch (err) {
+      // Fail closed: without the lease store nobody can say the account is free. The loop tries again at its next interval.
+      logger.error('sync skipped: lease store unavailable', {
+        lifecycle: 'sync_skipped_lease_unavailable',
         platform: task.platform,
         accountId: task.account.accountId,
+        err,
       });
       return null;
     }
@@ -208,7 +197,9 @@ export class IngestScheduler {
       task.failures = outcome.status === 'failed' ? task.failures + 1 : 0;
       return outcome;
     } finally {
-      this.leases.release(leaseKey);
+      await leases.release(leaseKey, ownerId).catch((err: unknown) => {
+        logger.warn('lease release failed; it will expire on its own', { lifecycle: 'lease_release_failed', leaseKey, err });
+      });
     }
   }
 

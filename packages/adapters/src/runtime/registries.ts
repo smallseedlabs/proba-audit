@@ -1,3 +1,4 @@
+import { hostname } from 'node:os';
 import {
   AdapterRegistry,
   type AnchorStore,
@@ -9,6 +10,7 @@ import {
   type Clock,
   type EventBus,
   type IdGenerator,
+  type LeaseStore,
   type Logger,
   type MetricPlatform,
   type MetricsStore,
@@ -27,6 +29,8 @@ import { InMemoryCheckpointStore } from '../memory/checkpoint-store.js';
 import { InMemoryQuarantineStore } from '../memory/quarantine-store.js';
 import { StubPlatformConnector, STUB_ADAPTER_NAME } from '../stub/stub-platform-connector.js';
 import { InMemoryAnchorStore } from '../memory/anchor-store.js';
+import { InMemoryLeaseStore } from '../memory/lease-store.js';
+import { RedisLeaseStore } from '../redis/lease-store.js';
 import { PostgresAnchorStore } from '../postgres/anchor-store.js';
 import { InMemoryAuditStore } from '../memory/audit-store.js';
 import { InMemoryEventBus } from '../memory/event-bus.js';
@@ -62,6 +66,8 @@ export interface Registries {
   auditContentStore: AdapterRegistry<AuditContentStore, AdapterDeps>;
   /** Signed heads of the hash chains, kept outside the audit store: ANCHOR_STORE. */
   anchorStore: AdapterRegistry<AnchorStore, AdapterDeps>;
+  /** Exclusive claims between replicas (one sync per account, one rollup run, one chain writer per workspace): LEASE_STORE. */
+  leaseStore: AdapterRegistry<LeaseStore, AdapterDeps>;
   metricsStore: AdapterRegistry<MetricsStore, AdapterDeps>;
   checkpointStore: AdapterRegistry<CheckpointStore, AdapterDeps>;
   quarantineStore: AdapterRegistry<QuarantineStore, AdapterDeps>;
@@ -113,6 +119,10 @@ export function createDefaultRegistries(): Registries {
     })
     .register('memory', ({ config }) => new InMemoryAnchorStore({ hmacKey: resolveAnchorHmacKey(config) }));
 
+  const leaseStore = new AdapterRegistry<LeaseStore, AdapterDeps>('LeaseStore')
+    .register('memory', ({ clock }) => new InMemoryLeaseStore(clock))
+    .register('redis', ({ config, logger }) => new RedisLeaseStore({ url: config.eventBus.redisUrl, logger }));
+
   const metricsStore = new AdapterRegistry<MetricsStore, AdapterDeps>('MetricsStore')
     .register('clickhouse', ({ clickhouse, clock }) =>
       new ClickHouseMetricsStore({ client: createClickHouseClient(clickhouse), clock, ownsClient: true })
@@ -157,7 +167,7 @@ export function createDefaultRegistries(): Registries {
     .register('memory', ({ clock }) => new InMemoryRateLimiter(clock))
     .register('redis', ({ config, logger }) => new RedisRateLimiter({ url: config.eventBus.redisUrl, logger }));
 
-  return { eventBus, auditStore, auditContentStore, anchorStore, metricsStore, checkpointStore, quarantineStore, platformConnector, tokenVerifier, rateLimiter };
+  return { eventBus, auditStore, auditContentStore, anchorStore, leaseStore, metricsStore, checkpointStore, quarantineStore, platformConnector, tokenVerifier, rateLimiter };
 }
 
 /**
@@ -205,6 +215,10 @@ export interface Runtime {
   auditContentStore: AuditContentStore;
   /** Signed chain heads. Only created with `usesAnchors` (audit-consumer, audit-api). */
   anchorStore?: AnchorStore;
+  /** Leases between replicas. Only created with `usesLeases` (audit-consumer, metrics-ingester, rollup). */
+  leaseStore?: LeaseStore;
+  /** Identifies this process as the owner of its leases: service, host, pid and a random part, so a restarted process never inherits its predecessor's leases. */
+  instanceId: string;
   metricsStore: MetricsStore;
   checkpointStore: CheckpointStore;
   quarantineStore: QuarantineStore;
@@ -226,6 +240,11 @@ export interface CreateRuntimeOptions {
    */
   usesAnchors?: boolean;
   /**
+   * audit-consumer, metrics-ingester and rollup set this: they create LEASE_STORE and refuse an in-memory lease store in production
+   * (a per-process lease cannot keep two replicas apart). Other services skip both.
+   */
+  usesLeases?: boolean;
+  /**
    * The ClickHouse user this process connects as: `consumer` for the writers (audit-consumer, metrics-ingester, rollup),
    * `api` for the read-only audit-api. Omitted: the shared CLICKHOUSE_USER.
    */
@@ -237,7 +256,7 @@ export interface CreateRuntimeOptions {
  * adapters unless ALLOW_IN_MEMORY_ADAPTERS=true (InMemoryAdaptersNotAllowedError), before anything is created.
  */
 export async function createRuntime(config: AppConfig, options: CreateRuntimeOptions): Promise<Runtime> {
-  assertInMemoryAdaptersAllowed(config, { includeRateLimiter: options.usesRateLimiter, includeAnchorStore: options.usesAnchors });
+  assertInMemoryAdaptersAllowed(config, { includeRateLimiter: options.usesRateLimiter, includeAnchorStore: options.usesAnchors, includeLeaseStore: options.usesLeases });
   const registries = options.registries ?? createDefaultRegistries();
   const deps: AdapterDeps = {
     config,
@@ -250,6 +269,7 @@ export async function createRuntime(config: AppConfig, options: CreateRuntimeOpt
   const auditStore = await registries.auditStore.create(config.adapters.auditStore, deps);
   const auditContentStore = await registries.auditContentStore.create(config.adapters.auditContentStore, deps);
   const anchorStore = options.usesAnchors ? await registries.anchorStore.create(config.adapters.anchorStore, deps) : undefined;
+  const leaseStore = options.usesLeases ? await registries.leaseStore.create(config.adapters.leaseStore, deps) : undefined;
   const metricsStore = await registries.metricsStore.create(config.adapters.metricsStore, deps);
   const checkpointStore = await registries.checkpointStore.create(config.adapters.checkpointStore, deps);
   const quarantineStore = await registries.quarantineStore.create(config.adapters.quarantineStore, deps);
@@ -259,6 +279,7 @@ export async function createRuntime(config: AppConfig, options: CreateRuntimeOpt
     auditStore: config.adapters.auditStore,
     auditContentStore: config.adapters.auditContentStore,
     ...(anchorStore ? { anchorStore: config.adapters.anchorStore } : {}),
+    ...(leaseStore ? { leaseStore: config.adapters.leaseStore } : {}),
     contentEnabled: config.content.enabled,
     metricsStore: config.adapters.metricsStore,
     checkpointStore: config.adapters.checkpointStore,
@@ -273,6 +294,8 @@ export async function createRuntime(config: AppConfig, options: CreateRuntimeOpt
     auditStore,
     auditContentStore,
     ...(anchorStore ? { anchorStore } : {}),
+    ...(leaseStore ? { leaseStore } : {}),
+    instanceId: `${config.service.name}:${hostname()}:${process.pid}:${deps.ids.uuid()}`,
     metricsStore,
     checkpointStore,
     quarantineStore,
@@ -282,6 +305,7 @@ export async function createRuntime(config: AppConfig, options: CreateRuntimeOpt
         auditStore.close(),
         auditContentStore.close(),
         anchorStore?.close(),
+        leaseStore?.close(),
         metricsStore.close(),
         checkpointStore.close(),
         quarantineStore.close(),

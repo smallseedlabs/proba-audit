@@ -23,6 +23,7 @@ import {
   ClickHouseCheckpointStore,
   ClickHouseMetricsStore,
   ClickHouseQuarantineStore,
+  InMemoryLeaseStore,
   ManualClock,
   RandomIdGenerator,
   RedisStreamsEventBus,
@@ -157,6 +158,8 @@ async function world(options: { timezone?: string; restateRevisions?: number; em
     new RollupWorker({
       metricsStore: s.metrics,
       checkpoints: s.checkpoints,
+      leases: new InMemoryLeaseStore(clock),
+      ownerId: 'rollup-test',
       clock,
       ids,
       logger,

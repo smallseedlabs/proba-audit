@@ -14,14 +14,18 @@ import {
   loadConfig,
   buildAuditContent,
   verifyChain,
+  type AnchorStore,
   type AuditEvent,
+  type LeaseStore,
 } from '@smallseedlabs/proba-audit-core';
 import { uniqueName } from '@smallseedlabs/proba-audit-core/testing';
 import {
   ClickHouseAuditContentStore,
   ClickHouseAuditStore,
+  InMemoryAnchorStore,
   PostgresOutboxStore,
   RandomIdGenerator,
+  RedisLeaseStore,
   RedisStreamsEventBus,
   SystemClock,
   clickHouseMigrationDb,
@@ -63,7 +67,7 @@ afterEach(async () => {
 });
 
 /** A consumer wired to real Redis and ClickHouse. Pass topic/group/bus/store to share them (restart, second consumer). */
-function stack(options: { topic?: string; group?: string; bus?: RedisStreamsEventBus; store?: ClickHouseAuditStore; consumerName?: string; selfAudit?: boolean; overrides?: object } = {}): Stack {
+function stack(options: { topic?: string; group?: string; bus?: RedisStreamsEventBus; store?: ClickHouseAuditStore; consumerName?: string; selfAudit?: boolean; overrides?: object; leases?: LeaseStore; anchors?: AnchorStore } = {}): Stack {
   const topic = options.topic ?? uniqueName('topic');
   const group = options.group ?? uniqueName('group');
   const bus = options.bus ?? new RedisStreamsEventBus({ url: config.eventBus.redisUrl });
@@ -77,6 +81,8 @@ function stack(options: { topic?: string; group?: string; bus?: RedisStreamsEven
     group,
     selfAudit: options.selfAudit ?? false,
     consumerName: options.consumerName,
+    leases: options.leases,
+    anchors: options.anchors,
     overrides: { blockMs: 100, retryBaseMs: 20, retryMaxMs: 100, ...options.overrides },
   });
   closers.push(async () => {
@@ -326,6 +332,33 @@ describe('audit pipeline: Redis -> consumer -> ClickHouse', () => {
     expect(self).toMatchObject({ category: 'system', actor: { type: 'service', id: 'audit-consumer' }, outcome: 'success' });
     expect(await count(s.store, ws)).toBe(3);
     expect(await verifyChain(s.store, ws)).toMatchObject({ ok: true, checked: 3 });
+  });
+});
+
+describe('audit pipeline: two consumer instances on Redis leases', () => {
+  it('two running consumers in one group keep one verified, anchored chain per workspace', async () => {
+    const keyPrefix = `proba:test:lease:${uniqueName('p')}`;
+    const leasesA = new RedisLeaseStore({ url: config.eventBus.redisUrl, keyPrefix });
+    const leasesB = new RedisLeaseStore({ url: config.eventBus.redisUrl, keyPrefix });
+    const anchors = new InMemoryAnchorStore({ hmacKey: 'integration-anchor-key-0123456789-0123456789' });
+    closers.push(async () => {
+      await Promise.all([leasesA.close(), leasesB.close()]);
+    });
+    const a = stack({ consumerName: 'consumer-a', leases: leasesA, anchors, overrides: { batchSize: 5 } });
+    const b = stack({ topic: a.topic, group: a.group, bus: a.bus, store: a.store, consumerName: 'consumer-b', leases: leasesB, anchors, overrides: { batchSize: 5 } });
+    const ws = a.ws('lease');
+    await a.h.consumer.start();
+    await b.h.consumer.start();
+    for (let round = 0; round < 8; round += 1) {
+      await a.h.publish(...Array.from({ length: 6 }, (_, i) => makeEvent({ workspaceId: ws, details: { round, i } })));
+    }
+    await waitFor(async () => (await count(a.store, ws)) === 48);
+    await waitFor(async () => (await a.h.pending()) === 0);
+    expect(await verifyChain(a.store, ws, {}, { pageSize: 10, anchorStore: anchors })).toMatchObject({
+      ok: true,
+      checked: 48,
+      anchor: { checked: true, count: 48 },
+    });
   });
 });
 

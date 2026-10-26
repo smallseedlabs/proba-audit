@@ -94,6 +94,9 @@ services:
       ANCHOR_STORE: ${ANCHOR_STORE:-postgres}
       ANCHOR_HMAC_KEY: ${ANCHOR_HMAC_KEY:-}
       ANCHOR_DATABASE_URL: ${ANCHOR_DATABASE_URL:-postgresql://anchors:${ANCHOR_DB_PASSWORD:-anchors}@anchor-db:5432/proba_audit_anchors}
+      # Leases between replicas (audit-consumer, metrics-ingester, rollup): shared through Redis.
+      LEASE_STORE: ${LEASE_STORE:-redis}
+      CONSUMER_LEASE_TTL_MS: ${CONSUMER_LEASE_TTL_MS:-30000}
       # Which analytics library serves which ad platform. Empty: the ingester idles.
       # The development data source is meta:stub (see the metrics-e2e profile).
       PLATFORM_CONNECTORS: ${PLATFORM_CONNECTORS:-}

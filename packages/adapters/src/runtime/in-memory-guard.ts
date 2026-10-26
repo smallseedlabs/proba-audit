@@ -18,6 +18,8 @@ export interface InMemoryGuardOptions {
   includeRateLimiter?: boolean;
   /** Only audit-consumer and audit-api use the anchor store; the other services do not need ANCHOR_STORE to be durable. */
   includeAnchorStore?: boolean;
+  /** Only audit-consumer, metrics-ingester and rollup take leases; the other services do not need LEASE_STORE to be shared. */
+  includeLeaseStore?: boolean;
 }
 
 /** The config keys (for example `AUDIT_STORE`) whose selected adapter is the in-memory one. */
@@ -32,6 +34,7 @@ export function selectedInMemoryAdapters(config: AppConfig, options: InMemoryGua
   ];
   if (options.includeRateLimiter) candidates.push(['AUDIT_API_RATE_LIMITER', config.api.adapters.rateLimiter]);
   if (options.includeAnchorStore) candidates.push(['ANCHOR_STORE', config.adapters.anchorStore]);
+  if (options.includeLeaseStore) candidates.push(['LEASE_STORE', config.adapters.leaseStore]);
   return candidates.filter(([, adapter]) => adapter === IN_MEMORY_ADAPTER_NAME).map(([key]) => key);
 }
 

@@ -24,10 +24,16 @@
  * and written with the next batch, or, after a restart, from the live chain.
  *
  * Single writer: the cached chain heads assume that ONE consumer instance writes
- * to the store at a time (see docs/ARCHITECTURE.md). Run one replica.
+ * to the store at a time (see docs/ARCHITECTURE.md). Run one replica, or give every replica the same LeaseStore
+ * (`deps.leases`): a batch then takes a lease per workspace it touches, so only one instance chains and writes a
+ * given workspace at a time, and heads and counts are re-read from the store under the lease instead of trusted
+ * from the cache (another instance may have written since). A lease that is held elsewhere makes the batch fail
+ * with LeaseHeldError: nothing is acknowledged and the batch is retried with backoff.
  */
 
 import {
+  LeaseHeldError,
+  LeaseLostError,
   chainEvent,
   contentHash,
   digestAuditContent,
@@ -45,6 +51,7 @@ import {
   type Clock,
   type EventBus,
   type IdGenerator,
+  type LeaseStore,
   type Logger,
   type StoredAuditContent,
   type StoredAuditEvent,
@@ -70,6 +77,8 @@ export interface AuditConsumerOptions {
   selfAuditWorkspaceId: string;
   /** Store the raw text of events (needs `AuditConsumerDeps.contentStore`). When false the text is dropped. Default false. */
   contentEnabled?: boolean;
+  /** TTL of the per-workspace write lease (needs `AuditConsumerDeps.leases`). Default 30 s. */
+  leaseTtlMs?: number;
 }
 
 export interface AuditConsumerDeps {
@@ -79,6 +88,13 @@ export interface AuditConsumerDeps {
   contentStore?: AuditContentStore;
   /** Where the signed chain heads go. Omit to write no anchors. */
   anchors?: AnchorStore;
+  /**
+   * Shared lease store: with it several consumer instances can write safely (one writer per workspace at a time).
+   * Omit for the single-replica mode, which caches chain heads in memory.
+   */
+  leases?: LeaseStore;
+  /** Owner id of this instance's leases; unique per process. Default: `options.consumerName`. */
+  leaseOwnerId?: string;
   clock: Clock;
   ids: IdGenerator;
   logger: Logger;
@@ -125,6 +141,17 @@ interface Candidate {
 
 const errorMessage = (err: unknown): string => (err instanceof Error ? err.message : String(err));
 
+/** The workspace ids named by the raw payloads of a batch, de-duplicated and sorted (a fixed order of acquisition). */
+function workspacesOf(messages: BusMessage[]): string[] {
+  const ids = new Set<string>();
+  for (const m of messages) {
+    if (typeof m.payload !== 'object' || m.payload === null) continue;
+    const id = (m.payload as { workspaceId?: unknown }).workspaceId;
+    if (typeof id === 'string' && id !== '') ids.add(id);
+  }
+  return [...ids].sort();
+}
+
 function traceIdOf(payload: unknown): string | undefined {
   if (typeof payload === 'object' && payload !== null) {
     const id = (payload as { traceId?: unknown }).traceId;
@@ -140,6 +167,8 @@ export class AuditConsumer {
   private readonly counts = new Map<string, number>();
   /** Anchors that could not be stored yet (anchor store down), per workspace: the newest claim wins. */
   private readonly pendingAnchors = new Map<string, ChainAnchorClaim>();
+  /** Lease keys held for the batch in flight (batches run one at a time). */
+  private heldLeases: string[] = [];
   private subscription: Subscription | null = null;
   private running = false;
   private loop: Promise<void> | null = null;
@@ -290,6 +319,67 @@ export class AuditConsumer {
    * this call is acknowledged.
    */
   async processBatch(messages: BusMessage[]): Promise<BatchResult> {
+    const leases = this.deps.leases;
+    if (!leases) return this.processBatchUnleased(messages);
+    await this.acquireLeases(leases, workspacesOf(messages));
+    try {
+      return await this.processBatchUnleased(messages);
+    } finally {
+      await this.releaseLeases(leases);
+    }
+  }
+
+  private leaseOwner(): string {
+    return this.deps.leaseOwnerId ?? this.o.consumerName;
+  }
+
+  /**
+   * One lease per workspace in the batch (the ids are read from the raw payloads: events that turn out invalid or duplicate
+   * are covered too, which only costs a little exclusivity). All or none: when one is held elsewhere the ones taken are given
+   * back and LeaseHeldError is thrown. Heads and counts of these workspaces are forgotten: they are read again under the lease.
+   */
+  private async acquireLeases(leases: LeaseStore, workspaceIds: string[]): Promise<void> {
+    const ttl = this.o.leaseTtlMs ?? 30_000;
+    const taken: string[] = [];
+    try {
+      for (const workspaceId of workspaceIds) {
+        const key = `audit-consumer:workspace:${workspaceId}`;
+        if (!(await leases.tryAcquire(key, this.leaseOwner(), ttl))) throw new LeaseHeldError(key);
+        taken.push(key);
+      }
+    } catch (err) {
+      await Promise.allSettled(taken.map((key) => leases.release(key, this.leaseOwner())));
+      throw err;
+    }
+    this.heldLeases = taken;
+    for (const workspaceId of workspaceIds) {
+      this.heads.delete(workspaceId);
+      this.counts.delete(workspaceId);
+    }
+  }
+
+  private async releaseLeases(leases: LeaseStore): Promise<void> {
+    const keys = this.heldLeases;
+    this.heldLeases = [];
+    for (const key of keys) {
+      await leases.release(key, this.leaseOwner()).catch((err: unknown) => {
+        // The lease expires by itself; the next batch of this workspace may have to wait for that.
+        this.deps.logger.warn('lease release failed; it will expire on its own', { err: new Error(errorMessage(err)), lease: key });
+      });
+    }
+  }
+
+  /** Just before the write: the leases must still be ours (a slow batch may have outlived them). Throws LeaseLostError, writing nothing. */
+  private async assertLeasesHeld(): Promise<void> {
+    const leases = this.deps.leases;
+    if (!leases?.renew) return;
+    const ttl = this.o.leaseTtlMs ?? 30_000;
+    for (const key of this.heldLeases) {
+      if (!(await leases.renew(key, this.leaseOwner(), ttl))) throw new LeaseLostError(key);
+    }
+  }
+
+  private async processBatchUnleased(messages: BusMessage[]): Promise<BatchResult> {
     const { store, ids, clock, logger: rootLogger } = this.deps;
     const sub = await this.attach();
     const batchId = ids.uuid();
@@ -416,6 +506,7 @@ export class AuditConsumer {
     }
 
     // 5b. Durable write. If this throws nothing has been acknowledged.
+    await this.assertLeasesHeld();
     const written = new Map<string, number>();
     if (chained.length > 0) {
       const result = await store.appendBatch(chained);
