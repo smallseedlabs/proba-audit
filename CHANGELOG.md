@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `audit-api`: a Fastify, read-only HTTP API under `/v1`: event search with every filter, cursor pagination and a hard page cap, event by id, trace list and
+  span-tree view, bounded chain verification (admin), analytics summary / compare / top campaigns with data freshness, facets, `/health` and `/ready`.
+  Zod-validated query parameters (no free SQL, unknown parameters rejected), workspace scope injected from the authenticated session, Firebase ID token
+  verification through a `TokenVerifier` port (Firebase and static adapters), allow-list/domain and viewer/admin authorisation from configuration, every call audited
+  (`data_access.read`, `data_access.metrics_*`, `auth.denied`), a `RateLimiter` port (memory and Redis adapters), CORS allow-list, `X-Trace-Id` on every response.
+  `docs/openapi.yaml`, kept in sync by a test.
+- `AuditStore.search`, `getEvent`, `listTraces`, `facets` and `MetricsStore.getFreshness` (memory and ClickHouse, with contract suites); `buildTraceTree`;
+  `verifyChain` `maxEvents` bound; ClickHouse migration `0007` (skip indexes for event id, campaign, action, ingestion time).
+
 - Metrics flow on a development data source: the finalised `PlatformConnector` port (accounts, campaigns, incremental
   `fetchObservations` by cursor, capabilities, typed rate-limit/transient/auth errors, `runPlatformConnectorContract`),
   `StubPlatformConnector` (deterministic from seed and clock, per-account timezone, controllable restatements, injectable faults,
@@ -26,7 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- proba-audit pins proba-protocol `v0.3.0`.
+- proba-audit pins proba-protocol `v0.3.1`.
 - `StaticPlatformConnector` implements the new port.
 
 ### Fixed
