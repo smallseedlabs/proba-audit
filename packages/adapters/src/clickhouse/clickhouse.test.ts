@@ -2,7 +2,9 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { loadConfig } from '@smallseedlabs/proba-audit-core';
 import { makeObservation, makeStoredAuditEvent } from '@smallseedlabs/proba-audit-core/testing';
+import { clickHouseOptionsFor } from './client.js';
 import { buildAggregateSql, buildAuditWhere, fromRow, toRow } from './audit-store.js';
 import { fromContentRow, toContentRow } from './audit-content-store.js';
 import { fromObservationRow, toObservationRow } from './metrics-store.js';
@@ -218,5 +220,24 @@ describe('migration 0009', () => {
   it('copies inserted_at and computed_at so the rollup watermark does not rewind', () => {
     expect(sql).toMatch(/INSERT INTO metric_observations_ws[\s\S]*inserted_at\)[\s\S]*inserted_at\s+FROM metric_observations/);
     expect(sql).toMatch(/computed_at(, timezone, bucket_date)?\s+FROM metric_rollups_hourly/);
+  });
+});
+
+describe('clickHouseOptionsFor', () => {
+  const base = { CLICKHOUSE_URL: 'http://ch:8123', CLICKHOUSE_USER: 'proba', CLICKHOUSE_PASSWORD: 'shared', CLICKHOUSE_DATABASE: 'db1' };
+
+  it('uses the shared user without a role, and for a role with no user of its own', () => {
+    const config = loadConfig(base);
+    const expected = { url: 'http://ch:8123', database: 'db1', username: 'proba', password: 'shared' };
+    expect(clickHouseOptionsFor(config)).toEqual(expected);
+    expect(clickHouseOptionsFor(config, 'consumer')).toEqual(expected);
+    expect(clickHouseOptionsFor(config, 'api')).toEqual(expected);
+  });
+
+  it('uses the role user for that role only', () => {
+    const config = loadConfig({ ...base, CLICKHOUSE_API_USER: 'proba_api', CLICKHOUSE_API_PASSWORD: 'api-pw' });
+    expect(clickHouseOptionsFor(config, 'api')).toEqual({ url: 'http://ch:8123', database: 'db1', username: 'proba_api', password: 'api-pw' });
+    expect(clickHouseOptionsFor(config, 'consumer').username).toBe('proba');
+    expect(clickHouseOptionsFor(config).username).toBe('proba');
   });
 });

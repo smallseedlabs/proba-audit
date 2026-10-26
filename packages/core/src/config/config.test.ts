@@ -98,6 +98,41 @@ describe('loadConfig', () => {
   });
 });
 
+describe('ClickHouse roles', () => {
+  it('every role falls back to CLICKHOUSE_USER / CLICKHOUSE_PASSWORD', () => {
+    const c = loadConfig({ CLICKHOUSE_USER: 'proba', CLICKHOUSE_PASSWORD: 'pw' });
+    for (const role of ['consumer', 'api', 'migrator'] as const) {
+      expect(c.clickhouse.roles[role]).toEqual({ username: 'proba', password: 'pw' });
+    }
+  });
+
+  it('uses the role user and password when set, per role', () => {
+    const c = loadConfig({
+      CLICKHOUSE_USER: 'proba',
+      CLICKHOUSE_PASSWORD: 'shared',
+      CLICKHOUSE_API_USER: 'proba_api',
+      CLICKHOUSE_API_PASSWORD: 'api-pw',
+      CLICKHOUSE_MIGRATOR_USER: 'proba_migrator',
+      CLICKHOUSE_MIGRATOR_PASSWORD: 'mig-pw',
+    });
+    expect(c.clickhouse.roles.api).toEqual({ username: 'proba_api', password: 'api-pw' });
+    expect(c.clickhouse.roles.migrator).toEqual({ username: 'proba_migrator', password: 'mig-pw' });
+    expect(c.clickhouse.roles.consumer).toEqual({ username: 'proba', password: 'shared' });
+  });
+
+  it('rejects a role user without a password, and a password without a user', () => {
+    expect(() => loadConfig({ CLICKHOUSE_CONSUMER_USER: 'proba_consumer' })).toThrow(/CLICKHOUSE_CONSUMER_PASSWORD/);
+    expect(() => loadConfig({ CLICKHOUSE_API_PASSWORD: 'x' })).toThrow(/CLICKHOUSE_API_USER/);
+  });
+
+  it('redacts the role passwords for logging', () => {
+    const c = loadConfig({ CLICKHOUSE_API_USER: 'proba_api', CLICKHOUSE_API_PASSWORD: 'api-secret-pw' });
+    const text = JSON.stringify(redactConfig(c));
+    expect(text).not.toContain('api-secret-pw');
+    expect(text).toContain('proba_api');
+  });
+});
+
 describe('metrics ingestion config', () => {
   it('parses PLATFORM_CONNECTORS into ordered platform:adapter pairs', () => {
     const c = loadConfig({ PLATFORM_CONNECTORS: 'meta:stub, google:stub ,reddit:reddit-lib', ALLOW_STUB_CONNECTOR: 'true' });

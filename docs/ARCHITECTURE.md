@@ -104,6 +104,22 @@ throws `InMemoryAdaptersNotAllowedError` (listing the offending variables) befor
 is the deliberate opt-in (default `false`). Outside production nothing changes. The guard is keyed on the registry name `memory`; an adapter you register
 under another name is your responsibility.
 
+### ClickHouse privileges
+
+One ClickHouse user for everything would let the read API (internet-facing) rewrite or drop the audit trail. Three roles, each with the least it needs
+(`scripts/clickhouse-roles.sql` creates them; run it once per environment as an admin, after `npm run migrate`):
+
+| Role | Used by | Grants |
+|------|---------|--------|
+| `consumer` (`CLICKHOUSE_CONSUMER_USER` / `_PASSWORD`) | audit-consumer, metrics-ingester, rollup | `INSERT` + `SELECT` on the audit and metrics tables (`CheckpointStore.delete` is not granted: only tests and tools use it). No `UPDATE`, `DELETE`, `DROP`, `TRUNCATE` or DDL. |
+| `api` (`CLICKHOUSE_API_USER` / `_PASSWORD`) | audit-api, `metrics-report` | `SELECT` only. |
+| `migrator` (`CLICKHOUSE_MIGRATOR_USER` / `_PASSWORD`) | `npm run migrate` | DDL on the database. Nothing else uses it. |
+
+Each process picks its role through `createRuntime(config, { clickhouseRole })`; `clickHouseOptionsFor(config, role)` resolves the credentials. A role without its own
+user **falls back to `CLICKHOUSE_USER` / `CLICKHOUSE_PASSWORD`**, so the single-user local docker stack works without applying the SQL. A role user without a password (or the reverse) is a
+configuration error. Role passwords are redacted from the logged config. A migration that adds a table needs a matching `GRANT` in the roles script. This limits what a compromised
+process can do to the audit trail, but the consumer can still insert rows: the hash chain and the anchor (below) are what make tampering visible.
+
 ### EventBus delivery model
 
 At-least-once, with consumer groups. `read` delivers new messages, which stay *pending* until `ack`. `reclaimPending`

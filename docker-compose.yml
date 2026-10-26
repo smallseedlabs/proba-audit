@@ -74,6 +74,13 @@ services:
       CLICKHOUSE_USER: ${CLICKHOUSE_USER:-proba}
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-proba}
       CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-proba_audit}
+      # Optional least-privilege users (scripts/clickhouse-roles.sql). Unset: every service uses CLICKHOUSE_USER above.
+      CLICKHOUSE_CONSUMER_USER: ${CLICKHOUSE_CONSUMER_USER:-}
+      CLICKHOUSE_CONSUMER_PASSWORD: ${CLICKHOUSE_CONSUMER_PASSWORD:-}
+      CLICKHOUSE_API_USER: ${CLICKHOUSE_API_USER:-}
+      CLICKHOUSE_API_PASSWORD: ${CLICKHOUSE_API_PASSWORD:-}
+      CLICKHOUSE_MIGRATOR_USER: ${CLICKHOUSE_MIGRATOR_USER:-}
+      CLICKHOUSE_MIGRATOR_PASSWORD: ${CLICKHOUSE_MIGRATOR_PASSWORD:-}
       EVENT_BUS: ${EVENT_BUS:-redis-streams}
       AUDIT_STORE: ${AUDIT_STORE:-clickhouse}
       # Raw text of events (protocol 0.3.3 `content`): off unless set to true. Same value for audit-consumer and audit-api.

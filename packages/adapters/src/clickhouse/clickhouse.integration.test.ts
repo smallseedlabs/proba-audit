@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { loadConfig } from '@smallseedlabs/proba-audit-core';
@@ -199,5 +200,110 @@ describe('ClickHouse storage details', () => {
     });
     await expect(store.ping()).rejects.toBeDefined();
     await store.close();
+  });
+});
+
+describe('ClickHouse roles (scripts/clickhouse-roles.sql)', () => {
+  const ROLES_DB = `${TEST_DB}_roles`;
+  const users = { consumer: 'proba_test_consumer', api: 'proba_test_api', migrator: 'proba_test_migrator' };
+  const rolesFor = (user: string, password: string): ClickHouseOptions => ({ ...base, database: ROLES_DB, username: user, password });
+  const admin = () => createClickHouseClient(options('default'));
+
+  beforeAll(async () => {
+    const c = admin();
+    await c.command({ query: `DROP DATABASE IF EXISTS ${ROLES_DB}` });
+    await c.close();
+    await ensureDatabase(options(ROLES_DB));
+    const client = createClickHouseClient(options(ROLES_DB));
+    await runMigrations(clickHouseMigrationDb(client), loadMigrations(migrationsDir));
+    // The production script, with test user names, a test database and test passwords.
+    const sql = readFileSync(resolve(__dirname, '../../../../scripts/clickhouse-roles.sql'), 'utf8')
+      .replace(/--.*$/gm, '')
+      .replaceAll('proba_audit.', `${ROLES_DB}.`)
+      .replaceAll('proba_consumer', users.consumer)
+      .replaceAll('proba_api', users.api)
+      .replaceAll('proba_migrator', users.migrator)
+      .replace('__CONSUMER_PASSWORD__', 'consumer-pw')
+      .replace('__API_PASSWORD__', 'api-pw')
+      .replace('__MIGRATOR_PASSWORD__', 'migrator-pw');
+    for (const statement of sql.split(';').map((x) => x.trim()).filter(Boolean)) await client.command({ query: statement });
+    await client.close();
+  });
+
+  afterAll(async () => {
+    const c = admin();
+    await c.command({ query: `DROP DATABASE IF EXISTS ${ROLES_DB}` });
+    for (const u of Object.values(users)) await c.command({ query: `DROP USER IF EXISTS ${u}` });
+    await c.close();
+  });
+
+  it('the consumer role writes and reads audit and metrics data, including rollups', async () => {
+    const o = rolesFor(users.consumer, 'consumer-pw');
+    const audit = new ClickHouseAuditStore({ client: createClickHouseClient(o), ownsClient: true });
+    const metrics = new ClickHouseMetricsStore({ client: createClickHouseClient(o), ownsClient: true });
+    const checkpoints = new ClickHouseCheckpointStore({ client: createClickHouseClient(o), ownsClient: true });
+    try {
+      const workspaceId = `roles-${Date.now()}`;
+      const event = makeStoredAuditEvent({ workspaceId });
+      await audit.appendBatch([event]);
+      expect((await audit.getChainHead(workspaceId))?.hash).toBe(event.hash);
+
+      const observation = makeObservation({ accountId: 'roles-acc' });
+      await metrics.upsertObservations(workspaceId, [observation]);
+      const changed = await metrics.changedSince(workspaceId);
+      expect(changed).not.toBeNull();
+      const rolled = await metrics.computeRollups({ workspaceId, bucket: 'hour', from: changed!.from, to: changed!.to });
+      expect(rolled).toBeGreaterThan(0);
+
+      const key = { workspaceId, source: 'meta', accountId: 'a', stream: 'hour' };
+      await checkpoints.set(key, { cursor: 'c', runId: 'r' });
+      expect((await checkpoints.get(key))?.cursor).toBe('c');
+    } finally {
+      await Promise.all([audit.close(), metrics.close(), checkpoints.close()]);
+    }
+  });
+
+  it('the consumer role cannot rewrite, truncate or drop the audit trail', async () => {
+    const client = createClickHouseClient(rolesFor(users.consumer, 'consumer-pw'));
+    try {
+      for (const query of [
+        'ALTER TABLE audit_events UPDATE action = \'x\' WHERE 1',
+        'ALTER TABLE audit_events DELETE WHERE 1',
+        'TRUNCATE TABLE audit_events',
+        'DROP TABLE audit_events',
+        'CREATE TABLE intruder (a UInt8) ENGINE = Memory',
+      ]) {
+        await expect(client.command({ query }), query).rejects.toThrow(/Not enough privileges|ACCESS_DENIED/);
+      }
+    } finally {
+      await client.close();
+    }
+  });
+
+  it('the api role reads but cannot write anything', async () => {
+    const o = rolesFor(users.api, 'api-pw');
+    const audit = new ClickHouseAuditStore({ client: createClickHouseClient(o), ownsClient: true });
+    const metrics = new ClickHouseMetricsStore({ client: createClickHouseClient(o), ownsClient: true });
+    try {
+      await expect(audit.readChain(`nobody-${Date.now()}`, { order: 'asc', limit: 1 })).resolves.toEqual([]);
+      await expect(metrics.getFreshness(`nobody-${Date.now()}`, [])).resolves.toBeDefined();
+      await expect(audit.appendBatch([makeStoredAuditEvent()])).rejects.toThrow(/Not enough privileges|ACCESS_DENIED/);
+      await expect(metrics.upsertObservations('ws', [makeObservation()])).rejects.toThrow(/Not enough privileges|ACCESS_DENIED/);
+    } finally {
+      await Promise.all([audit.close(), metrics.close()]);
+    }
+  });
+
+  it('the migrator role applies migrations', async () => {
+    const o = rolesFor(users.migrator, 'migrator-pw');
+    const client = createClickHouseClient(o);
+    try {
+      const result = await runMigrations(clickHouseMigrationDb(client), loadMigrations(migrationsDir));
+      expect(result.applied).toEqual([]);
+      await client.command({ query: 'CREATE TABLE IF NOT EXISTS migrator_probe (a UInt8) ENGINE = Memory' });
+      await client.command({ query: 'DROP TABLE migrator_probe' });
+    } finally {
+      await client.close();
+    }
   });
 });

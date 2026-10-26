@@ -18,7 +18,7 @@ async function main(): Promise<void> {
   const waitSeconds = waitArg ? Number(waitArg.split('=')[1]) : 0;
   const config = loadConfigFromEnvironment({ serviceName: 'metrics-report', defaultPort: 0 });
   const logger = createLogger({ service: config.service.name, level: 'warn', env: config.env });
-  const runtime = await createRuntime(config, { logger });
+  const runtime = await createRuntime(config, { logger, clickhouseRole: 'api' });
   const connectors = await createConnectors(config, { logger, clock: runtime.clock, ids: runtime.ids });
 
   try {
