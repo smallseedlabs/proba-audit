@@ -33,14 +33,21 @@ export class RedisRateLimiter implements RateLimiter {
   private connecting?: Promise<void>;
 
   constructor(private readonly options: RedisRateLimiterOptions) {
-    this.client = createClient({ url: options.url });
+    const timeoutMs = options.connectTimeoutMs ?? 3000;
+    this.client = createClient({
+      url: options.url,
+      // Never queue commands while disconnected and never retry in a tight loop: a limiter that cannot
+      // reach Redis must answer immediately (fail open), not hold the request.
+      disableOfflineQueue: true,
+      socket: { connectTimeout: timeoutMs, reconnectStrategy: (retries) => Math.min(retries * 200, 5000) },
+    });
     this.client.on('error', (err) => options.logger?.error('rate limiter redis error', { err }));
   }
 
   async hit(key: string, limit: number, windowMs: number): Promise<RateLimitDecision> {
     try {
       await this.connect();
-      const reply = (await this.client.eval(HIT_SCRIPT, { keys: [this.key(key)], arguments: [String(windowMs)] })) as [number, number];
+      const reply = (await this.withTimeout(this.client.eval(HIT_SCRIPT, { keys: [this.key(key)], arguments: [String(windowMs)] }))) as [number, number];
       return decide(Number(reply[0]), Number(reply[1]), limit, true);
     } catch (err) {
       this.options.logger?.error('rate limiter unavailable, allowing the request', { err });
@@ -51,7 +58,7 @@ export class RedisRateLimiter implements RateLimiter {
   async peek(key: string, limit: number, windowMs: number): Promise<RateLimitDecision> {
     try {
       await this.connect();
-      const [count, ttl] = await Promise.all([this.client.get(this.key(key)), this.client.pTTL(this.key(key))]);
+      const [count, ttl] = await this.withTimeout(Promise.all([this.client.get(this.key(key)), this.client.pTTL(this.key(key))]));
       return decide(Number(count ?? 0), ttl > 0 ? ttl : windowMs, limit, false);
     } catch (err) {
       this.options.logger?.error('rate limiter unavailable, allowing the request', { err });
@@ -60,7 +67,12 @@ export class RedisRateLimiter implements RateLimiter {
   }
 
   async close(): Promise<void> {
-    if (this.client.isOpen) await this.client.quit();
+    if (!this.client.isOpen) return;
+    if (this.client.isReady) {
+      await this.client.quit().catch(() => this.client.disconnect());
+    } else {
+      await this.client.disconnect(); // still connecting or reconnecting: there is nothing to quit
+    }
   }
 
   private key(key: string): string {
@@ -82,7 +94,7 @@ export class RedisRateLimiter implements RateLimiter {
   private withTimeout<T>(promise: Promise<T>): Promise<T> {
     let timer: NodeJS.Timeout;
     const timeout = new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new Error('Redis connect timed out')), this.options.connectTimeoutMs ?? 3000);
+      timer = setTimeout(() => reject(new Error('Redis did not answer in time')), this.options.connectTimeoutMs ?? 3000);
     });
     return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
   }
