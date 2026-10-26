@@ -78,10 +78,25 @@ const dayFloor = (ms: number): number => Math.floor(ms / DAY_MS) * DAY_MS;
 const keyOf = (o: MetricObservation): string =>
   [o.platform, o.accountId, o.campaignId, o.adsetId ?? '', o.adId ?? '', o.granularity, o.periodStart].join('|');
 
+/**
+ * The store keeps money as Decimal(18,6) and fractions as Float64, so a value read back can
+ * differ from the one written in the last digits. Differences below 1e-6 are not a change:
+ * treating them as one would rewrite (and re-roll-up) the same period on every pull.
+ */
+const MEASURE_EPSILON = 1e-6;
+
 function sameMeasure(a: MetricObservation, b: MetricObservation): boolean {
   if (a.currency !== b.currency) return false;
   const keys = new Set([...Object.keys(a.metrics), ...Object.keys(b.metrics)] as (keyof MetricObservation['metrics'])[]);
-  for (const k of keys) if ((a.metrics[k] ?? null) !== (b.metrics[k] ?? null)) return false;
+  for (const k of keys) {
+    const x = a.metrics[k];
+    const y = b.metrics[k];
+    if (x === undefined || y === undefined) {
+      if (x !== y) return false;
+    } else if (Math.abs(x - y) > MEASURE_EPSILON) {
+      return false;
+    }
+  }
   return true;
 }
 

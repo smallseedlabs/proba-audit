@@ -52,7 +52,7 @@ const isoUtc = z.string().datetime({ message: 'must be an ISO 8601 UTC timestamp
 const campaignId = z
   .string()
   .max(ANALYTICS_LIMITS.maxCampaignIdLength)
-  .regex(/^[A-Za-z0-9_.:\-]+$/, 'letters, digits and _ . : - only');
+  .regex(/^[A-Za-z0-9_.:-]+$/, 'letters, digits and _ . : - only');
 const granularity = z.enum(['hour', 'day']);
 
 const period = z.object({ from: isoUtc, to: isoUtc }).strict();
