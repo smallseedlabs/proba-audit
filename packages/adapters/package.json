@@ -16,7 +16,7 @@
   "dependencies": {
     "@clickhouse/client": "^1.5.0",
     "@smallseedlabs/proba-audit-core": "*",
-    "@smallseedlabs/proba-protocol": "github:smallseedlabs/proba-protocol#v0.3.3",
+    "@smallseedlabs/proba-protocol": "github:smallseedlabs/proba-protocol#v0.1.2",
     "jose": "^6.2.13",
     "pg": "^8.23.1",
     "redis": "^4.7.0"
