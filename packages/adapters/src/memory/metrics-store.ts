@@ -4,7 +4,9 @@ import {
   alignWindow,
   bucketStart,
   dayBucket,
+  type AccountRef,
   type ChangedWindow,
+  type MetricsFreshness,
   type Clock,
   type MetricAggregate,
   type RollupAggregateFilter,
@@ -225,6 +227,24 @@ export class InMemoryMetricsStore implements MetricsStore {
         if (rest.metrics.revenue !== undefined) rest.metrics.revenue = Math.round(rest.metrics.revenue * 1e6) / 1e6;
         return rest;
       });
+  }
+
+  async getFreshness(accounts: readonly AccountRef[]): Promise<MetricsFreshness> {
+    const allowed = new Set(accounts.map((a) => `${a.platform}|${a.accountId}`));
+    let rollupsComputedAt: number | null = null;
+    let observationsFetchedAt: number | null = null;
+    for (const r of this.rollups.values()) {
+      if (!allowed.has(`${r.platform}|${r.accountId}`)) continue;
+      rollupsComputedAt = Math.max(rollupsComputedAt ?? -Infinity, Date.parse(r.computedAt));
+    }
+    for (const o of this.observations.values()) {
+      if (!allowed.has(`${o.platform}|${o.accountId}`)) continue;
+      observationsFetchedAt = Math.max(observationsFetchedAt ?? -Infinity, Date.parse(o.fetchedAt));
+    }
+    return {
+      rollupsComputedAt: rollupsComputedAt === null ? null : new Date(rollupsComputedAt).toISOString(),
+      observationsFetchedAt: observationsFetchedAt === null ? null : new Date(observationsFetchedAt).toISOString(),
+    };
   }
 
   async changedSince(since?: string): Promise<ChangedWindow | null> {

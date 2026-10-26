@@ -13,6 +13,14 @@ import type {
   ReadChainOptions,
   StoredAuditEvent,
 } from '../domain/audit.js';
+import type {
+  AuditFacets,
+  AuditFacetsQuery,
+  AuditSearchPage,
+  AuditSearchQuery,
+  TraceListPage,
+  TraceListQuery,
+} from '../domain/audit-read.js';
 
 export interface AuditStore {
   /**
@@ -25,6 +33,22 @@ export interface AuditStore {
   /** Stored events with the given ids (those that exist). Order is unspecified. */
   findExisting(refs: AuditEventRef[]): Promise<StoredAuditEvent[]>;
   query(query: AuditQuery): Promise<StoredAuditEvent[]>;
+  /**
+   * Keyset-paginated search for the read API: filters, free text on action and target,
+   * sorted by (occurredAt, eventId) in the requested order. Reads one extra row to know
+   * whether `nextCursor` is needed. Use this instead of `query` (offset paging) for UIs.
+   */
+  search(query: AuditSearchQuery): Promise<AuditSearchPage>;
+  /** One event by id, only when it belongs to `workspaceId`; null otherwise. */
+  getEvent(workspaceId: string, eventId: string): Promise<StoredAuditEvent | null>;
+  /**
+   * Recently active traces of a workspace, newest activity first, with a summary each
+   * (see summarizeTrace). A trace is listed when one of its events falls in [from, to); the
+   * summary always covers all of the trace's events.
+   */
+  listTraces(query: TraceListQuery): Promise<TraceListPage>;
+  /** Distinct values (with counts) for the filter facets of one workspace, capped per facet. */
+  facets(query: AuditFacetsQuery): Promise<AuditFacets>;
   /** All events of one trace, oldest first. */
   getTrace(traceId: string, options?: { workspaceId?: string; limit?: number }): Promise<StoredAuditEvent[]>;
   aggregate(query: AuditAggregateQuery): Promise<AuditAggregateRow[]>;

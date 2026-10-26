@@ -1,12 +1,29 @@
 import {
+  AUDIT_FACET_DEFAULT_LIMIT,
+  AUDIT_FACET_MAX_LIMIT,
+  AUDIT_FACET_NAMES,
   AUDIT_QUERY_DEFAULT_LIMIT,
   AUDIT_QUERY_MAX_LIMIT,
+  AUDIT_SEARCH_DEFAULT_LIMIT,
+  AUDIT_SEARCH_MAX_LIMIT,
+  TRACE_LIST_DEFAULT_LIMIT,
+  TRACE_LIST_MAX_LIMIT,
+  summarizeTrace,
   bucketStart,
   type AppendResult,
   type AuditAggregateQuery,
   type AuditAggregateRow,
   type AuditEventRef,
+  type AuditFacetName,
+  type AuditFacetValue,
+  type AuditFacets,
+  type AuditFacetsQuery,
   type AuditFilter,
+  type AuditSearchPage,
+  type AuditSearchQuery,
+  type TraceListPage,
+  type TraceListQuery,
+  type TraceSummary,
   type AuditGroupBy,
   type AuditQuery,
   type AuditStore,
@@ -37,6 +54,37 @@ export function matchesAuditFilter(e: StoredAuditEvent, f: AuditFilter): boolean
     (f.to === undefined || Date.parse(e.occurredAt) < Date.parse(f.to))
   );
 }
+
+/** Case-insensitive substring match on action, target type and target id (the `text` search). */
+export function matchesText(e: StoredAuditEvent, text: string | undefined): boolean {
+  if (text === undefined || text === '') return true;
+  const needle = text.toLowerCase();
+  return [e.action, e.target?.type, e.target?.id].some((v) => v !== undefined && v.toLowerCase().includes(needle));
+}
+
+function facetValue(e: StoredAuditEvent, name: AuditFacetName): string | undefined {
+  switch (name) {
+    case 'service':
+      return e.service;
+    case 'action':
+      return e.action;
+    case 'category':
+      return e.category;
+    case 'outcome':
+      return e.outcome;
+    case 'riskLevel':
+      return e.riskLevel;
+    case 'actorType':
+      return e.actor.type;
+    case 'actorId':
+      return e.actor.id;
+    case 'campaignId':
+      return e.campaignId;
+  }
+}
+
+const compareSort = (a: StoredAuditEvent, b: StoredAuditEvent): number =>
+  Date.parse(a.occurredAt) - Date.parse(b.occurredAt) || a.eventId.localeCompare(b.eventId);
 
 function groupValue(e: StoredAuditEvent, key: AuditGroupBy): string {
   switch (key) {
@@ -116,6 +164,76 @@ export class InMemoryAuditStore implements AuditStore {
       .sort((a, b) => dir * (a.occurredAt.localeCompare(b.occurredAt) || a.eventId.localeCompare(b.eventId)))
       .slice(query.offset ?? 0, (query.offset ?? 0) + limit)
       .map((e) => structuredClone(e));
+  }
+
+  async search(query: AuditSearchQuery): Promise<AuditSearchPage> {
+    const limit = Math.min(query.limit ?? AUDIT_SEARCH_DEFAULT_LIMIT, AUDIT_SEARCH_MAX_LIMIT);
+    const dir = (query.order ?? 'desc') === 'asc' ? 1 : -1;
+    const after = query.after;
+    const rows = [...this.events.values()]
+      .filter((e) => matchesAuditFilter(e, query) && matchesText(e, query.text))
+      .sort((a, b) => dir * compareSort(a, b))
+      .filter((e) => after === undefined || dir * compareSort(e, { occurredAt: after.occurredAt, eventId: after.eventId } as StoredAuditEvent) > 0)
+      .slice(0, limit + 1);
+    const events = rows.slice(0, limit).map((e) => structuredClone(e));
+    const last = events[events.length - 1];
+    return {
+      events,
+      nextCursor: rows.length > limit && last ? { occurredAt: last.occurredAt, eventId: last.eventId } : null,
+    };
+  }
+
+  async getEvent(workspaceId: string, eventId: string): Promise<StoredAuditEvent | null> {
+    const e = this.events.get(eventId);
+    return e && e.workspaceId === workspaceId ? structuredClone(e) : null;
+  }
+
+  async listTraces(query: TraceListQuery): Promise<TraceListPage> {
+    const limit = Math.min(query.limit ?? TRACE_LIST_DEFAULT_LIMIT, TRACE_LIST_MAX_LIMIT);
+    const inWindow = (e: StoredAuditEvent): boolean =>
+      (query.from === undefined || Date.parse(e.occurredAt) >= Date.parse(query.from)) &&
+      (query.to === undefined || Date.parse(e.occurredAt) < Date.parse(query.to));
+    const byTrace = new Map<string, StoredAuditEvent[]>();
+    const active = new Map<string, number>();
+    for (const e of this.events.values()) {
+      if (e.workspaceId !== query.workspaceId) continue;
+      const list = byTrace.get(e.traceId) ?? [];
+      list.push(e);
+      byTrace.set(e.traceId, list);
+      if (inWindow(e)) active.set(e.traceId, Math.max(active.get(e.traceId) ?? -Infinity, Date.parse(e.occurredAt)));
+    }
+    const after = query.after;
+    const ranked = [...active.entries()]
+      .map(([traceId, last]) => ({ traceId, last }))
+      .sort((a, b) => b.last - a.last || b.traceId.localeCompare(a.traceId))
+      .filter((r) => after === undefined || r.last < Date.parse(after.lastEventAt) || (r.last === Date.parse(after.lastEventAt) && r.traceId.localeCompare(after.traceId) < 0))
+      .slice(0, limit + 1);
+    const page = ranked.slice(0, limit);
+    const traces = page.map((r) => summarizeTrace(byTrace.get(r.traceId) ?? [])).filter((t): t is TraceSummary => t !== undefined);
+    // The cursor follows the window activity the list is ordered by, which can differ from the summary's lastEventAt.
+    const tail = page[page.length - 1];
+    return {
+      traces,
+      nextCursor: ranked.length > limit && tail ? { lastEventAt: new Date(tail.last).toISOString(), traceId: tail.traceId } : null,
+    };
+  }
+
+  async facets(query: AuditFacetsQuery): Promise<AuditFacets> {
+    const limit = Math.min(query.limit ?? AUDIT_FACET_DEFAULT_LIMIT, AUDIT_FACET_MAX_LIMIT);
+    const events = [...this.events.values()].filter((e) => matchesAuditFilter(e, { workspaceId: query.workspaceId, from: query.from, to: query.to }));
+    const facets = {} as Record<AuditFacetName, AuditFacetValue[]>;
+    const truncated: AuditFacetName[] = [];
+    for (const name of AUDIT_FACET_NAMES) {
+      const counts = new Map<string, number>();
+      for (const e of events) {
+        const v = facetValue(e, name);
+        if (v !== undefined) counts.set(v, (counts.get(v) ?? 0) + 1);
+      }
+      const ranked = [...counts.entries()].map(([value, count]) => ({ value, count })).sort((a, b) => b.count - a.count || a.value.localeCompare(b.value));
+      if (ranked.length > limit) truncated.push(name);
+      facets[name] = ranked.slice(0, limit);
+    }
+    return { facets, truncated };
   }
 
   async getTrace(

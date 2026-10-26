@@ -4,7 +4,9 @@
  */
 
 import type {
+  AccountRef,
   ChangedWindow,
+  MetricsFreshness,
   MetricAggregate,
   MetricObservation,
   MetricObservationFilter,
@@ -46,6 +48,12 @@ export interface MetricsStore {
    * rollup process which window to recompute.
    */
   changedSince(since?: string): Promise<ChangedWindow | null>;
+  /**
+   * How recent the data of the given accounts is: the last rollup computation and the last
+   * time an observation was fetched from the ad platform. Both null when there is no data.
+   * An empty account list sees nothing.
+   */
+  getFreshness(accounts: readonly AccountRef[]): Promise<MetricsFreshness>;
   /** Throws if the backing service is unreachable. */
   ping(): Promise<void>;
   close(): Promise<void>;
