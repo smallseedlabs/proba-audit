@@ -4,7 +4,7 @@
  * The per-platform analytics libraries (Meta, Google, Reddit, X, Microsoft) are
  * built separately. Until one is plugged in, the metrics ingester runs against
  * this connector, which implements the same PlatformConnector port and returns
- * deterministic, realistic-looking hourly and daily numbers for a few fake
+ * deterministic, realistic-looking hourly and daily numbers for a few synthetic
  * accounts, campaigns, ad sets and ads. Swapping in a real library is a config
  * change (PLATFORM_CONNECTORS=meta:meta-lib), not a code change.
  *

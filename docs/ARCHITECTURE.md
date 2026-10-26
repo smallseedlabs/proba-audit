@@ -241,7 +241,7 @@ or `ConnectorRequestError`. The cursor is opaque: with it the connector returns 
 
 ### The stub (`StubPlatformConnector`, adapter name `stub`)
 
-A development data source, not a mock of a real service: deterministic from `STUB_SEED` and the clock (the same seed, account, ad
+A development data source: deterministic from `STUB_SEED` and the clock (the same seed, account, ad
 and hour always give the same numbers), with a diurnal curve in each account's local time. Per platform it serves three accounts
 (Europe/London GBP, America/New_York USD, Australia/Sydney AUD) with several campaigns, adsets and ads, hourly and daily rows of
 impressions, clicks, spend, conversions, reach, video views and revenue.

@@ -78,7 +78,7 @@ describe('SyncEngine: incremental pulls', () => {
     }
     const restatedEvent = h.emitter.drafts.find((d) => d.action === 'metrics.restated')!;
     expect(restatedEvent.details).toMatchObject({ count: out.restated });
-    expect(restatedEvent.details.earliestPeriodStart).toBeTruthy();
+    expect(restatedEvent.details?.earliestPeriodStart).toBeTruthy();
   });
 
   it('after downtime the window reaches back to the last success, not only the restatement window', async () => {

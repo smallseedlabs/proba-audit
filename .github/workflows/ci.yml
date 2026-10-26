@@ -157,7 +157,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [audit-consumer, audit-api, metrics-ingester, rollup, migrate]
+        target: [audit-consumer, audit-api, metrics-ingester, metrics-report, rollup, migrate]
     steps:
       - uses: actions/checkout@v4
 
