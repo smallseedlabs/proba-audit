@@ -17,6 +17,12 @@
  * (`contentDigest`, covered by the hash). When content is disabled the text is dropped: nothing of
  * it is stored, not even a digest. A conflicting event never writes its text.
  *
+ * Anchors: after a batch is durable, the consumer records the new head of every workspace it wrote to
+ * (hash, event count, ingestedAt) in the AnchorStore, signed, outside the audit store. verifyChain compares the live chain
+ * with it, which is what makes deleting the NEWEST events detectable. The anchor only moves forward. If the anchor store is
+ * down, ingestion goes on (a lost audit event is worse than a late anchor): the anchor is logged as an error, kept pending
+ * and written with the next batch, or, after a restart, from the live chain.
+ *
  * Single writer: the cached chain heads assume that ONE consumer instance writes
  * to the store at a time (see docs/ARCHITECTURE.md). Run one replica.
  */
@@ -28,11 +34,13 @@ import {
   prepareForStorage,
   sameContent,
   validateAuditEvent,
+  type AnchorStore,
   type AuditContentStore,
   type AuditEmitter,
   type AuditEvent,
   type AuditStore,
   type BusMessage,
+  type ChainAnchorClaim,
   type ChainLink,
   type Clock,
   type EventBus,
@@ -69,6 +77,8 @@ export interface AuditConsumerDeps {
   store: AuditStore;
   /** Where the raw text of events goes when `options.contentEnabled` is true. */
   contentStore?: AuditContentStore;
+  /** Where the signed chain heads go. Omit to write no anchors. */
+  anchors?: AnchorStore;
   clock: Clock;
   ids: IdGenerator;
   logger: Logger;
@@ -126,6 +136,10 @@ function traceIdOf(payload: unknown): string | undefined {
 export class AuditConsumer {
   private readonly o: AuditConsumerOptions;
   private readonly heads = new Map<string, ChainLink | null>();
+  /** Events in each workspace's chain, in step with `heads`. Filled by one count the first time a workspace is written to. */
+  private readonly counts = new Map<string, number>();
+  /** Anchors that could not be stored yet (anchor store down), per workspace: the newest claim wins. */
+  private readonly pendingAnchors = new Map<string, ChainAnchorClaim>();
   private subscription: Subscription | null = null;
   private running = false;
   private loop: Promise<void> | null = null;
@@ -281,6 +295,7 @@ export class AuditConsumer {
     const batchId = ids.uuid();
     const logger = rootLogger.child({ batchId });
     const startedAt = clock.now().getTime();
+    if (this.pendingAnchors.size > 0) await this.flushAnchors(logger);
 
     const deadLetters: DeadLetterItem[] = [];
     const toAck: BusMessage[] = [];
@@ -406,10 +421,12 @@ export class AuditConsumer {
       const result = await store.appendBatch(chained);
       if (result.inserted === chained.length) {
         for (const [ws, head] of heads) this.heads.set(ws, head);
+        await this.anchorWrittenHeads(heads, chained, logger);
       } else {
         // Someone else wrote these events between our check and our write. That breaks the
         // single-writer assumption, so the chain may have a gap: forget cached heads and shout.
         this.heads.clear();
+        this.counts.clear();
         logger.error('chain integrity risk: store accepted fewer events than chained; another writer may be active', {
           chained: chained.length,
           inserted: result.inserted,
@@ -450,6 +467,52 @@ export class AuditConsumer {
     // 7. Self-audit. Never affects the outcome of the batch.
     await this.selfAudit(batchId, startedAt, candidates, written, duplicates, deadLetters);
     return result;
+  }
+
+  /**
+   * Record the new heads in the anchor store (step 5b, after the events are durable). Never throws: see "Anchors" above.
+   * The count is the chain length: counted once per workspace from the store (it includes this batch), then carried forward.
+   */
+  private async anchorWrittenHeads(heads: Map<string, ChainLink | null>, chained: StoredAuditEvent[], logger: Logger): Promise<void> {
+    const anchors = this.deps.anchors;
+    if (!anchors) return;
+    const added = new Map<string, number>();
+    for (const e of chained) added.set(e.workspaceId, (added.get(e.workspaceId) ?? 0) + 1);
+    for (const [workspaceId, head] of heads) {
+      if (!head) continue;
+      try {
+        const known = this.counts.get(workspaceId);
+        const count = known === undefined ? await this.deps.store.countEvents(workspaceId) : known + (added.get(workspaceId) ?? 0);
+        this.counts.set(workspaceId, count);
+        this.pendingAnchors.set(workspaceId, { workspaceId, headHash: head.hash, count, timestamp: head.ingestedAt });
+      } catch (err) {
+        this.counts.delete(workspaceId);
+        logger.error('chain anchor not updated: could not count the chain', { err: new Error(errorMessage(err)), workspaceId });
+      }
+    }
+    await this.flushAnchors(logger);
+  }
+
+  /** Store every pending anchor. A failure leaves it pending for the next batch. */
+  private async flushAnchors(logger: Logger): Promise<void> {
+    const anchors = this.deps.anchors;
+    if (!anchors) return;
+    for (const [workspaceId, claim] of [...this.pendingAnchors]) {
+      try {
+        const stored = await anchors.put(claim);
+        this.pendingAnchors.delete(workspaceId);
+        if (stored.count > claim.count) {
+          logger.error('chain integrity risk: the anchor is ahead of the chain; newest events may have been deleted from the audit store', {
+            workspaceId,
+            chainCount: claim.count,
+            anchorCount: stored.count,
+            anchorTimestamp: stored.timestamp,
+          });
+        }
+      } catch (err) {
+        logger.error('chain anchor not stored; will retry with the next batch', { err: new Error(errorMessage(err)), workspaceId });
+      }
+    }
   }
 
   private conflict(logger: Logger, c: Candidate, existingHash: string, where: string): DeadLetterItem {

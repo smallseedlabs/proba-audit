@@ -1,5 +1,6 @@
 import {
   AdapterRegistry,
+  type AnchorStore,
   type AppConfig,
   type AuditContentStore,
   type AuditStore,
@@ -25,6 +26,8 @@ import { ClickHouseCheckpointStore, ClickHouseQuarantineStore } from '../clickho
 import { InMemoryCheckpointStore } from '../memory/checkpoint-store.js';
 import { InMemoryQuarantineStore } from '../memory/quarantine-store.js';
 import { StubPlatformConnector, STUB_ADAPTER_NAME } from '../stub/stub-platform-connector.js';
+import { InMemoryAnchorStore } from '../memory/anchor-store.js';
+import { PostgresAnchorStore } from '../postgres/anchor-store.js';
 import { InMemoryAuditStore } from '../memory/audit-store.js';
 import { InMemoryEventBus } from '../memory/event-bus.js';
 import { InMemoryMetricsStore } from '../memory/metrics-store.js';
@@ -33,6 +36,7 @@ import { FirebaseTokenVerifier } from '../auth/firebase-token-verifier.js';
 import { StaticTokenVerifier } from '../auth/static-token-verifier.js';
 import { InMemoryRateLimiter } from '../ratelimit/memory-rate-limiter.js';
 import { RedisRateLimiter } from '../ratelimit/redis-rate-limiter.js';
+import { resolveAnchorHmacKey } from './anchor-key.js';
 import { assertInMemoryAdaptersAllowed } from './in-memory-guard.js';
 import { RandomIdGenerator, SystemClock } from './system.js';
 
@@ -56,6 +60,8 @@ export interface Registries {
   auditStore: AdapterRegistry<AuditStore, AdapterDeps>;
   /** Where the raw text of audit events goes: AUDIT_CONTENT_STORE. */
   auditContentStore: AdapterRegistry<AuditContentStore, AdapterDeps>;
+  /** Signed heads of the hash chains, kept outside the audit store: ANCHOR_STORE. */
+  anchorStore: AdapterRegistry<AnchorStore, AdapterDeps>;
   metricsStore: AdapterRegistry<MetricsStore, AdapterDeps>;
   checkpointStore: AdapterRegistry<CheckpointStore, AdapterDeps>;
   quarantineStore: AdapterRegistry<QuarantineStore, AdapterDeps>;
@@ -98,6 +104,14 @@ export function createDefaultRegistries(): Registries {
       new ClickHouseAuditContentStore({ client: createClickHouseClient(clickhouse), ownsClient: true })
     )
     .register('memory', () => new InMemoryAuditContentStore());
+
+  // Both adapters refuse to start in production without a real ANCHOR_HMAC_KEY (AnchorKeyRequiredError).
+  const anchorStore = new AdapterRegistry<AnchorStore, AdapterDeps>('AnchorStore')
+    .register('postgres', ({ config }) => {
+      if (config.anchors.databaseUrl === '') throw new Error('ANCHOR_STORE=postgres needs ANCHOR_DATABASE_URL');
+      return new PostgresAnchorStore({ connectionString: config.anchors.databaseUrl, hmacKey: resolveAnchorHmacKey(config) });
+    })
+    .register('memory', ({ config }) => new InMemoryAnchorStore({ hmacKey: resolveAnchorHmacKey(config) }));
 
   const metricsStore = new AdapterRegistry<MetricsStore, AdapterDeps>('MetricsStore')
     .register('clickhouse', ({ clickhouse, clock }) =>
@@ -143,7 +157,7 @@ export function createDefaultRegistries(): Registries {
     .register('memory', ({ clock }) => new InMemoryRateLimiter(clock))
     .register('redis', ({ config, logger }) => new RedisRateLimiter({ url: config.eventBus.redisUrl, logger }));
 
-  return { eventBus, auditStore, auditContentStore, metricsStore, checkpointStore, quarantineStore, platformConnector, tokenVerifier, rateLimiter };
+  return { eventBus, auditStore, auditContentStore, anchorStore, metricsStore, checkpointStore, quarantineStore, platformConnector, tokenVerifier, rateLimiter };
 }
 
 /**
@@ -189,6 +203,8 @@ export interface Runtime {
   auditStore: AuditStore;
   /** Raw text of audit events. Only used when config.content.enabled. */
   auditContentStore: AuditContentStore;
+  /** Signed chain heads. Only created with `usesAnchors` (audit-consumer, audit-api). */
+  anchorStore?: AnchorStore;
   metricsStore: MetricsStore;
   checkpointStore: CheckpointStore;
   quarantineStore: QuarantineStore;
@@ -205,6 +221,11 @@ export interface CreateRuntimeOptions {
   /** audit-api sets this: its rate limiter (AUDIT_API_RATE_LIMITER) counts for the in-memory production guard. */
   usesRateLimiter?: boolean;
   /**
+   * audit-consumer (writes anchors) and audit-api (verifies against them) set this: they create ANCHOR_STORE, need
+   * ANCHOR_HMAC_KEY in production, and refuse an in-memory anchor store in production. Other services skip all three.
+   */
+  usesAnchors?: boolean;
+  /**
    * The ClickHouse user this process connects as: `consumer` for the writers (audit-consumer, metrics-ingester, rollup),
    * `api` for the read-only audit-api. Omitted: the shared CLICKHOUSE_USER.
    */
@@ -216,7 +237,7 @@ export interface CreateRuntimeOptions {
  * adapters unless ALLOW_IN_MEMORY_ADAPTERS=true (InMemoryAdaptersNotAllowedError), before anything is created.
  */
 export async function createRuntime(config: AppConfig, options: CreateRuntimeOptions): Promise<Runtime> {
-  assertInMemoryAdaptersAllowed(config, { includeRateLimiter: options.usesRateLimiter });
+  assertInMemoryAdaptersAllowed(config, { includeRateLimiter: options.usesRateLimiter, includeAnchorStore: options.usesAnchors });
   const registries = options.registries ?? createDefaultRegistries();
   const deps: AdapterDeps = {
     config,
@@ -228,6 +249,7 @@ export async function createRuntime(config: AppConfig, options: CreateRuntimeOpt
   const eventBus = await registries.eventBus.create(config.adapters.eventBus, deps);
   const auditStore = await registries.auditStore.create(config.adapters.auditStore, deps);
   const auditContentStore = await registries.auditContentStore.create(config.adapters.auditContentStore, deps);
+  const anchorStore = options.usesAnchors ? await registries.anchorStore.create(config.adapters.anchorStore, deps) : undefined;
   const metricsStore = await registries.metricsStore.create(config.adapters.metricsStore, deps);
   const checkpointStore = await registries.checkpointStore.create(config.adapters.checkpointStore, deps);
   const quarantineStore = await registries.quarantineStore.create(config.adapters.quarantineStore, deps);
@@ -236,6 +258,7 @@ export async function createRuntime(config: AppConfig, options: CreateRuntimeOpt
     eventBus: config.adapters.eventBus,
     auditStore: config.adapters.auditStore,
     auditContentStore: config.adapters.auditContentStore,
+    ...(anchorStore ? { anchorStore: config.adapters.anchorStore } : {}),
     contentEnabled: config.content.enabled,
     metricsStore: config.adapters.metricsStore,
     checkpointStore: config.adapters.checkpointStore,
@@ -249,6 +272,7 @@ export async function createRuntime(config: AppConfig, options: CreateRuntimeOpt
     eventBus,
     auditStore,
     auditContentStore,
+    ...(anchorStore ? { anchorStore } : {}),
     metricsStore,
     checkpointStore,
     quarantineStore,
@@ -257,6 +281,7 @@ export async function createRuntime(config: AppConfig, options: CreateRuntimeOpt
         eventBus.close(),
         auditStore.close(),
         auditContentStore.close(),
+        anchorStore?.close(),
         metricsStore.close(),
         checkpointStore.close(),
         quarantineStore.close(),

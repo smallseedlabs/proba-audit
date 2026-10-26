@@ -2,7 +2,8 @@ import { randomUUID } from 'node:crypto';
 import pg from 'pg';
 import { afterAll, describe, expect, it } from 'vitest';
 import { buildAuditEvent } from '@smallseedlabs/proba-protocol/audit';
-import { runOutboxStoreContract } from '@smallseedlabs/proba-audit-core/testing';
+import { runAnchorStoreContract, runOutboxStoreContract } from '@smallseedlabs/proba-audit-core/testing';
+import { PostgresAnchorStore } from './anchor-store.js';
 import { PostgresOutboxStore } from './outbox-store.js';
 
 const url = process.env.OUTBOX_TEST_DATABASE_URL ?? 'postgresql://proba:proba@localhost:5432/proba_audit_outbox_test';
@@ -24,6 +25,34 @@ afterAll(async () => {
 // Each test gets its own table, so the contract's "starts empty" holds. The store
 // shares one pool, which the store never closes (it does not own it).
 runOutboxStoreContract('postgres', async () => ({ store: (await freshStore()).store }));
+
+const ANCHOR_KEY = 'postgres-anchor-key-0123456789-0123456789';
+async function freshAnchors(): Promise<{ store: PostgresAnchorStore; table: string }> {
+  const table = `audit_chain_anchors_${randomUUID().replaceAll('-', '').slice(0, 12)}`;
+  const store = new PostgresAnchorStore({ pool, table, hmacKey: ANCHOR_KEY });
+  await store.ensureSchema();
+  tables.push(table);
+  return { store, table };
+}
+runAnchorStoreContract('postgres', async () => ({ store: (await freshAnchors()).store, hmacKey: ANCHOR_KEY }));
+
+describe('PostgresAnchorStore specifics', () => {
+  const claim = (count: number) => ({ workspaceId: 'seedbed', headHash: `${count}`.padStart(64, 'a'), count, timestamp: `2026-10-25T10:00:${String(count).padStart(2, '0')}.000Z` });
+
+  it('detects a row changed behind the store (AnchorTamperedError)', async () => {
+    const { store, table } = await freshAnchors();
+    await store.put(claim(5));
+    await pool.query(`UPDATE ${table} SET count = 1 WHERE workspace_id = 'seedbed'`);
+    await expect(store.get('seedbed')).rejects.toThrow(/valid signature/);
+  });
+
+  it('two writers racing never move the anchor backwards', async () => {
+    const { store, table } = await freshAnchors();
+    const other = new PostgresAnchorStore({ pool, table, hmacKey: ANCHOR_KEY });
+    await Promise.all([store.put(claim(9)), other.put(claim(4)), store.put(claim(7)), other.put(claim(2))]);
+    expect((await store.get('seedbed'))?.count).toBe(9);
+  });
+});
 
 const event = () =>
   buildAuditEvent({

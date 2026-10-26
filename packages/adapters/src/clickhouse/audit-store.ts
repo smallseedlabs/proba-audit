@@ -542,6 +542,14 @@ export class ClickHouseAuditStore implements AuditStore {
     return rows[0] ? { eventId: rows[0].event_id, hash: rows[0].hash, ingestedAt: rows[0].ingested_at } : null;
   }
 
+  async countEvents(workspaceId: string): Promise<number> {
+    const rows = await this.rows<{ n: string | number }>(
+      'SELECT count() AS n FROM audit_events WHERE workspace_id = {workspaceId:String}',
+      { workspaceId }
+    );
+    return Number(rows[0]?.n ?? 0);
+  }
+
   async ping(): Promise<void> {
     const result = await this.client.ping();
     if (!result.success) throw result.error;

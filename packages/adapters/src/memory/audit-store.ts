@@ -280,6 +280,12 @@ export class InMemoryAuditStore implements AuditStore {
     return head ? { eventId: head.eventId, hash: head.hash, ingestedAt: head.ingestedAt } : null;
   }
 
+  async countEvents(workspaceId: string): Promise<number> {
+    let n = 0;
+    for (const e of this.events.values()) if (e.workspaceId === workspaceId) n += 1;
+    return n;
+  }
+
   async ping(): Promise<void> {
     // Always reachable.
   }

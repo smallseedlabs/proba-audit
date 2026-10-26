@@ -8,6 +8,7 @@ import {
   MemoryLogger,
   buildAuditEvent,
   createBusAuditEmitter,
+  type AnchorStore,
   type AuditEvent,
   type AuditContentStore,
   type AuditStore,
@@ -23,6 +24,7 @@ export interface HarnessOptions {
   bus: EventBus;
   store: AuditStore;
   contentStore?: AuditContentStore;
+  anchors?: AnchorStore;
   clock: Clock;
   ids: IdGenerator;
   topic: string;
@@ -72,6 +74,7 @@ export class ConsumerHarness {
       bus: h.bus,
       store: h.store,
       ...(h.contentStore ? { contentStore: h.contentStore } : {}),
+      ...(h.anchors ? { anchors: h.anchors } : {}),
       clock: h.clock,
       ids: h.ids,
       logger: this.logger,

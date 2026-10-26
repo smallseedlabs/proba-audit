@@ -30,6 +30,12 @@ export const envSchema = z.object({
   CHECKPOINT_STORE: nonEmpty('clickhouse'),
   QUARANTINE_STORE: nonEmpty('clickhouse'),
   AUDIT_CONTENT_STORE: nonEmpty('clickhouse'),
+  // Signed heads of the hash chains, kept OUTSIDE the audit store so deleting the newest events is detectable (`tail_truncated`).
+  // `postgres` needs ANCHOR_DATABASE_URL (a database the audit store's credentials cannot reach). Used by audit-consumer and audit-api.
+  ANCHOR_STORE: nonEmpty('memory'),
+  // HMAC key that signs the anchors. Required (at least 32 characters) in production; outside production an empty key falls back to a fixed development key.
+  ANCHOR_HMAC_KEY: z.string().default(''),
+  ANCHOR_DATABASE_URL: z.string().default(''),
   // The in-memory adapters lose everything on restart and are per process: they refuse to start in production
   // unless this is true (a deliberate, temporary opt-in, for example a smoke test of a production image).
   ALLOW_IN_MEMORY_ADAPTERS: z
@@ -231,7 +237,10 @@ export interface AppConfig {
     checkpointStore: string;
     quarantineStore: string;
     auditContentStore: string;
+    anchorStore: string;
   };
+  /** Chain anchors (ANCHOR_STORE): the key that signs them and the database of the `postgres` adapter. */
+  anchors: { hmacKey: string; databaseUrl: string };
   /** Explicit opt-in to run in-memory adapters when NODE_ENV=production (see InMemoryAdaptersNotAllowedError). */
   allowInMemoryAdapters: boolean;
   /** Raw text of audit events: stored by the consumer and served (to admins) by the API only when enabled. */
@@ -437,7 +446,9 @@ export function loadConfig(env: EnvSource = process.env, options: LoadConfigOpti
       checkpointStore: e.CHECKPOINT_STORE,
       quarantineStore: e.QUARANTINE_STORE,
       auditContentStore: e.AUDIT_CONTENT_STORE,
+      anchorStore: e.ANCHOR_STORE,
     },
+    anchors: { hmacKey: e.ANCHOR_HMAC_KEY, databaseUrl: e.ANCHOR_DATABASE_URL },
     allowInMemoryAdapters: e.ALLOW_IN_MEMORY_ADAPTERS,
     content: { enabled: e.AUDIT_CONTENT_ENABLED },
     eventBus: {
@@ -539,6 +550,7 @@ function redactUrl(url: string): string {
 export function redactConfig(config: AppConfig): Record<string, unknown> {
   return {
     ...config,
+    anchors: { hmacKey: config.anchors.hmacKey ? '[REDACTED]' : '', databaseUrl: config.anchors.databaseUrl ? redactUrl(config.anchors.databaseUrl) : '' },
     // Tokens are credentials: the log shows how many are configured, never the values.
     api: { ...config.api, staticTokens: config.api.staticTokens.map(() => '[REDACTED]') },
     eventBus: { ...config.eventBus, redisUrl: redactUrl(config.eventBus.redisUrl) },

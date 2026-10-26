@@ -9,6 +9,7 @@ import {
   type AccessContext,
   type AppConfig,
   type AuditEmitter,
+  type AnchorStore,
   type AuditContentStore,
   type AuditStore,
   type Clock,
@@ -61,6 +62,8 @@ export interface ServerDeps {
   auditStore: AuditStore;
   /** Raw text of events: served to administrators only, and only when config.content.enabled. */
   auditContentStore?: AuditContentStore;
+  /** Signed chain heads (ANCHOR_STORE): chain verification reports `tail_truncated` against them. */
+  anchorStore?: AnchorStore;
   metricsStore: MetricsStore;
   scope: ScopeResolver;
   /** Used for the reads themselves: if the audit event cannot be sent, the read is refused (fails closed). */
@@ -111,6 +114,7 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
     auditStore: deps.auditStore,
     ...(deps.auditContentStore ? { contentStore: deps.auditContentStore } : {}),
     contentEnabled: config.content.enabled,
+    ...(deps.anchorStore ? { anchorStore: deps.anchorStore } : {}),
     metricsStore: deps.metricsStore,
     reader,
     analytics,

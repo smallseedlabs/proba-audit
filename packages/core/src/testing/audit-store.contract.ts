@@ -321,6 +321,17 @@ export function runAuditStoreContract(name: string, factory: () => Promise<Audit
       });
     });
 
+    it('counts the events of one workspace', async () => {
+      const store = await create();
+      const workspaceId = uniqueName('ws');
+      expect(await store.countEvents(workspaceId)).toBe(0);
+      const first = makeStoredAuditEvent({ workspaceId, ingestedAt: '2026-10-25T10:00:01.000Z' });
+      const second = makeStoredAuditEvent({ workspaceId, ingestedAt: '2026-10-25T10:00:02.000Z', prevHash: first.hash });
+      await store.appendBatch([first, second, makeStoredAuditEvent({ workspaceId: uniqueName('other') })]);
+      await store.appendBatch([first]); // an identical redelivery is not counted twice
+      expect(await store.countEvents(workspaceId)).toBe(2);
+    });
+
     describe('read API', () => {
       const t = (min: number, sec = 0) => `2026-10-25T10:${String(min).padStart(2, '0')}:${String(sec).padStart(2, '0')}.000Z`;
 

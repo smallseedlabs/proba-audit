@@ -12,6 +12,7 @@ import {
   type ChainLink,
   type StoredAuditEvent,
 } from '@smallseedlabs/proba-audit-core';
+import { InMemoryAnchorStore } from './anchor-store.js';
 import { InMemoryAuditStore } from './audit-store.js';
 import { ManualClock, SequentialIdGenerator } from './clock-ids.js';
 import { InMemoryEventBus } from './event-bus.js';
@@ -243,6 +244,136 @@ describe('verifyChain', () => {
     const result = await verifyChain(store, 'ws-a', {}, { maxProblems: 2 });
     expect(result.problems).toHaveLength(2);
     expect(result.complete).toBe(false);
+  });
+});
+
+describe('verifyChain with chain anchors', () => {
+  const KEY = 'test-anchor-key-0123456789-0123456789';
+  /** An anchor store holding the head of `chain` as the consumer would have written it. */
+  async function anchored(chain: StoredAuditEvent[], upTo = chain.length) {
+    const anchors = new InMemoryAnchorStore({ hmacKey: KEY });
+    const head = chain[upTo - 1]!;
+    await anchors.put({ workspaceId: head.workspaceId, headHash: head.hash, count: upTo, timestamp: head.ingestedAt });
+    return anchors;
+  }
+  const types = (r: Awaited<ReturnType<typeof verifyChain>>) => r.problems.map((p) => p.type);
+
+  it('passes an intact chain and reports the anchor as checked', async () => {
+    const chain = buildChain('ws-a', 5);
+    const store = new InMemoryAuditStore();
+    await store.appendBatch(chain);
+    const result = await verifyChain(store, 'ws-a', {}, { anchorStore: await anchored(chain), pageSize: 2 });
+    expect(result).toMatchObject({ ok: true, checked: 5, anchor: { checked: true, count: 5, timestamp: chain[4]?.ingestedAt } });
+  });
+
+  it('accepts a live chain that is longer than the anchor (the anchor is written after the events)', async () => {
+    const chain = buildChain('ws-a', 6);
+    const store = new InMemoryAuditStore();
+    await store.appendBatch(chain);
+    const result = await verifyChain(store, 'ws-a', {}, { anchorStore: await anchored(chain, 4) });
+    expect(result).toMatchObject({ ok: true, checked: 6, anchor: { checked: true, count: 4 } });
+  });
+
+  it('is silent for a workspace without an anchor', async () => {
+    const store = new InMemoryAuditStore();
+    await store.appendBatch(buildChain('ws-a', 3));
+    const result = await verifyChain(store, 'ws-a', {}, { anchorStore: new InMemoryAnchorStore({ hmacKey: KEY }) });
+    expect(result.ok).toBe(true);
+    expect(result.anchor).toBeUndefined();
+  });
+
+  it('reports tail_truncated when the newest events were deleted (the shorter chain is still valid)', async () => {
+    const chain = buildChain('ws-a', 6);
+    const anchors = await anchored(chain);
+    const store = new InMemoryAuditStore();
+    await store.appendBatch(chain.slice(0, 4));
+    expect(await verifyChain(store, 'ws-a')).toMatchObject({ ok: true, checked: 4 }); // without the anchor nothing is wrong
+    const result = await verifyChain(store, 'ws-a', {}, { anchorStore: anchors });
+    expect(result.ok).toBe(false);
+    expect(types(result)).toEqual(['tail_truncated', 'tail_truncated']);
+    expect(result.problems.at(-1)?.detail).toContain('2 of the newest events are missing');
+  });
+
+  it('reports tail_truncated when every event of the workspace was deleted', async () => {
+    const chain = buildChain('ws-a', 3);
+    const result = await verifyChain(new InMemoryAuditStore(), 'ws-a', {}, { anchorStore: await anchored(chain) });
+    expect(types(result)).toContain('tail_truncated');
+    expect(result.ok).toBe(false);
+  });
+
+  it('reports tail_truncated when the newest events were deleted and others written in their place', async () => {
+    const chain = buildChain('ws-a', 5);
+    const anchors = await anchored(chain);
+    // Same length, but the last event is a different one: replaced, with a valid chain behind it.
+    const replacement = chainEvent(
+      { ...chain[4]!, version: 1, details: { forged: true } } as unknown as AuditEvent,
+      { hash: chain[3]!.hash, ingestedAt: chain[3]!.ingestedAt },
+      chain[4]!.ingestedAt
+    );
+    const store = new InMemoryAuditStore();
+    await store.appendBatch([...chain.slice(0, 4), replacement]);
+    const result = await verifyChain(store, 'ws-a', {}, { anchorStore: anchors });
+    expect(types(result)).toEqual(['tail_truncated']);
+    expect(result.problems[0]?.detail).toContain('replaced');
+  });
+
+  it('still reports an edited event with its own problem type (hash_mismatch), with or without anchors', async () => {
+    const chain = buildChain('ws-a', 4);
+    const anchors = await anchored(chain);
+    const store = new InMemoryAuditStore();
+    await store.appendBatch(chain.map((e, i) => (i === 2 ? { ...e, outcome: 'denied' as const } : e)));
+    const result = await verifyChain(store, 'ws-a', {}, { anchorStore: anchors });
+    expect(types(result)).toEqual(['hash_mismatch']);
+  });
+
+  it('still reports a deleted middle event as broken_link, and the missing count as tail_truncated', async () => {
+    const chain = buildChain('ws-a', 5);
+    const anchors = await anchored(chain);
+    const store = new InMemoryAuditStore();
+    await store.appendBatch([chain[0]!, chain[1]!, chain[3]!, chain[4]!]);
+    const result = await verifyChain(store, 'ws-a', {}, { anchorStore: anchors });
+    expect(types(result)).toEqual(['broken_link', 'tail_truncated']);
+    expect(result.problems[1]?.detail).toContain('1 of the newest events are missing');
+  });
+
+  it('reports anchor_invalid when the anchor was changed', async () => {
+    const chain = buildChain('ws-a', 4);
+    const anchors = await anchored(chain);
+    anchors.tamper('ws-a', { count: 1 }); // an attacker lowers the count to hide a deletion
+    const store = new InMemoryAuditStore();
+    await store.appendBatch(chain.slice(0, 2));
+    const result = await verifyChain(store, 'ws-a', {}, { anchorStore: anchors });
+    expect(result.ok).toBe(false);
+    expect(types(result)).toEqual(['anchor_invalid']);
+    expect(result.anchor).toBeUndefined();
+  });
+
+  it('reports anchor_invalid when the anchor was signed with another key', async () => {
+    const chain = buildChain('ws-a', 2);
+    const foreign = new InMemoryAnchorStore({ hmacKey: 'another-key-another-key-another-key-00' });
+    const forged = await foreign.put({ workspaceId: 'ws-a', headHash: chain[1]!.hash, count: 2, timestamp: chain[1]!.ingestedAt });
+    const anchors = await anchored(chain);
+    anchors.tamper('ws-a', { signature: forged.signature });
+    const store = new InMemoryAuditStore();
+    await store.appendBatch(chain);
+    expect(types(await verifyChain(store, 'ws-a', {}, { anchorStore: anchors }))).toEqual(['anchor_invalid']);
+  });
+
+  it('does not compare the anchor when its head lies outside the range', async () => {
+    const chain = buildChain('ws-a', 6);
+    const store = new InMemoryAuditStore();
+    await store.appendBatch(chain);
+    const range = { from: chain[1]!.ingestedAt, to: chain[3]!.ingestedAt };
+    const result = await verifyChain(store, 'ws-a', range, { anchorStore: await anchored(chain) });
+    expect(result).toMatchObject({ ok: true, anchor: { checked: false, count: 6 } });
+  });
+
+  it('does not compare the anchor when verification stopped early', async () => {
+    const chain = buildChain('ws-a', 6);
+    const store = new InMemoryAuditStore();
+    await store.appendBatch(chain);
+    const result = await verifyChain(store, 'ws-a', {}, { anchorStore: await anchored(chain), maxEvents: 3 });
+    expect(result).toMatchObject({ ok: true, truncated: true, anchor: { checked: false } });
   });
 });
 

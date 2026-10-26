@@ -13,6 +13,7 @@ describe('loadConfig', () => {
       checkpointStore: 'clickhouse',
       quarantineStore: 'clickhouse',
       auditContentStore: 'clickhouse',
+      anchorStore: 'memory',
     });
     expect(c.content.enabled).toBe(false);
     expect(c.connectors.pairs).toEqual([]);
@@ -95,6 +96,21 @@ describe('loadConfig', () => {
     expect(text).not.toContain('hunter2');
     expect(text).not.toContain('secretpw');
     expect(text).toContain('REDACTED');
+  });
+});
+
+describe('anchor config', () => {
+  it('defaults to the memory store with no key', () => {
+    const c = loadConfig({});
+    expect(c.adapters.anchorStore).toBe('memory');
+    expect(c.anchors).toEqual({ hmacKey: '', databaseUrl: '' });
+  });
+
+  it('redacts the key and the database credentials for logging', () => {
+    const c = loadConfig({ ANCHOR_HMAC_KEY: 'anchor-key-secret', ANCHOR_DATABASE_URL: 'postgresql://u:dbpass@db:5432/anchors' });
+    const text = JSON.stringify(redactConfig(c));
+    expect(text).not.toContain('anchor-key-secret');
+    expect(text).not.toContain('dbpass');
   });
 });
 

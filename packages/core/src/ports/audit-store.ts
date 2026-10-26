@@ -57,6 +57,8 @@ export interface AuditStore {
   aggregate(query: AuditAggregateQuery): Promise<AuditAggregateRow[]>;
   /** Most recently ingested event of a workspace, to continue its hash chain; null if none. */
   getChainHead(workspaceId: string): Promise<ChainHead | null>;
+  /** How many events the workspace's chain holds (anchors record it). */
+  countEvents(workspaceId: string): Promise<number>;
   /** One workspace's events in chain order (ingestedAt, eventId), for chain verification. */
   readChain(workspaceId: string, options?: ReadChainOptions): Promise<StoredAuditEvent[]>;
   /** Throws if the backing service is unreachable. */

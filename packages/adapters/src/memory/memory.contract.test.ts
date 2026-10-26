@@ -1,5 +1,6 @@
 import {
   runAuditStoreContract,
+  runAnchorStoreContract,
   runAuditContentStoreContract,
   runClockContract,
   runEventBusContract,
@@ -11,6 +12,7 @@ import {
   runPlatformConnectorContract,
   makeObservation,
 } from '@smallseedlabs/proba-audit-core/testing';
+import { InMemoryAnchorStore } from './anchor-store.js';
 import { InMemoryAuditStore } from './audit-store.js';
 import { InMemoryAuditContentStore } from './audit-content-store.js';
 import { ManualClock, SequentialIdGenerator } from './clock-ids.js';
@@ -24,6 +26,8 @@ import { RandomIdGenerator, SystemClock } from '../runtime/system.js';
 
 runEventBusContract('memory', async () => ({ bus: new InMemoryEventBus() }));
 runAuditStoreContract('memory', async () => ({ store: new InMemoryAuditStore() }));
+const ANCHOR_TEST_KEY = 'contract-anchor-key-0123456789-0123456789';
+runAnchorStoreContract('memory', async () => ({ store: new InMemoryAnchorStore({ hmacKey: ANCHOR_TEST_KEY }), hmacKey: ANCHOR_TEST_KEY }));
 runAuditContentStoreContract('memory', async () => ({ store: new InMemoryAuditContentStore() }));
 runOutboxStoreContract('memory', async () => ({ store: new InMemoryOutboxStore() }));
 runMetricsStoreContract('memory', async () => ({ store: new InMemoryMetricsStore() }));

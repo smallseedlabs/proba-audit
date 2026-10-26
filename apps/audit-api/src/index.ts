@@ -31,7 +31,7 @@ async function main(): Promise<void> {
     });
   }
 
-  const runtime = await createRuntime(config, { logger, usesRateLimiter: true, clickhouseRole: 'api' });
+  const runtime = await createRuntime(config, { logger, usesRateLimiter: true, usesAnchors: true, clickhouseRole: 'api' });
   const registries = createDefaultRegistries();
   const deps = { config, logger, clock: runtime.clock, ids: runtime.ids, clickhouse: clickHouseOptionsFor(config, 'api') };
   const verifier = await registries.tokenVerifier.create(config.api.adapters.tokenVerifier, deps);
@@ -68,6 +68,7 @@ async function main(): Promise<void> {
     limiter,
     auditStore: runtime.auditStore,
     auditContentStore: runtime.auditContentStore,
+    ...(runtime.anchorStore ? { anchorStore: runtime.anchorStore } : {}),
     metricsStore: runtime.metricsStore,
     scope: scope.resolve,
     emitter: emitterFor('throw'),

@@ -6,6 +6,7 @@ import {
   type StoredAuditEvent,
 } from '@smallseedlabs/proba-audit-core';
 import {
+  InMemoryAnchorStore,
   InMemoryAuditStore,
   InMemoryEventBus,
   ManualClock,
@@ -383,6 +384,114 @@ describe('AuditConsumer: self-audit', () => {
     expect(result.written).toBeGreaterThan(0);
     expect(await store.readChain('seedbed')).not.toHaveLength(0);
     expect(h.errors().some((r) => r.msg === 'audit event not emitted')).toBe(true);
+  });
+});
+
+describe('AuditConsumer: chain anchors', () => {
+  const KEY = 'consumer-anchor-key-0123456789-0123456789';
+  const anchorStore = () => new InMemoryAnchorStore({ hmacKey: KEY });
+
+  it('anchors the new head and the chain length of every workspace after a durable write', async () => {
+    const anchors = anchorStore();
+    const { h, store } = setup({ anchors });
+    await h.publish(makeEvent(), makeEvent(), makeEvent({ workspaceId: 'other' }));
+    await h.pump();
+    const [a, b] = await stored(store, 'seedbed');
+    expect(await anchors.get('seedbed')).toMatchObject({ headHash: b?.hash, count: 2, timestamp: b?.ingestedAt });
+    expect(await anchors.get('other')).toMatchObject({ count: 1 });
+    expect(a).toBeDefined();
+    expect(await verifyChain(store, 'seedbed', {}, { anchorStore: anchors })).toMatchObject({ ok: true, anchor: { checked: true, count: 2 } });
+  });
+
+  it('moves the anchor forward with every batch, counting the store once', async () => {
+    const anchors = anchorStore();
+    const { h, store, clock } = setup({ anchors });
+    const countEvents = store.countEvents.bind(store);
+    let counted = 0;
+    store.countEvents = (ws) => {
+      counted += 1;
+      return countEvents(ws);
+    };
+    await h.publish(makeEvent(), makeEvent());
+    await h.pump();
+    clock.advance(1000);
+    await h.publish(makeEvent(), makeEvent(), makeEvent());
+    await h.pump();
+    const last = (await stored(store, 'seedbed')).at(-1);
+    expect(await anchors.get('seedbed')).toMatchObject({ count: 5, headHash: last?.hash });
+    expect(counted).toBe(1);
+  });
+
+  it('a restarted consumer anchors from the live chain', async () => {
+    const anchors = anchorStore();
+    const first = setup({ anchors });
+    await first.h.publish(makeEvent(), makeEvent());
+    await first.h.pump();
+    const second = setup({ anchors, store: first.store, bus: first.bus, overrides: { consumerName: 'consumer-2' } });
+    await second.h.publish(makeEvent());
+    await second.h.pump();
+    expect(await anchors.get('seedbed')).toMatchObject({ count: 3 });
+  });
+
+  it('makes deleting the newest events detectable', async () => {
+    const anchors = anchorStore();
+    const { h, store } = setup({ anchors });
+    await h.publish(makeEvent(), makeEvent(), makeEvent(), makeEvent());
+    await h.pump();
+    const shorter = new InMemoryAuditStore();
+    await shorter.appendBatch((await stored(store, 'seedbed')).slice(0, 2));
+    expect(await verifyChain(shorter, 'seedbed')).toMatchObject({ ok: true }); // a valid, shorter chain
+    const result = await verifyChain(shorter, 'seedbed', {}, { anchorStore: anchors });
+    expect(result.ok).toBe(false);
+    expect(result.problems.map((p) => p.type)).toContain('tail_truncated');
+  });
+
+  it('does not touch the anchor for a redelivered duplicate', async () => {
+    const anchors = anchorStore();
+    const { h } = setup({ anchors });
+    const e = makeEvent();
+    await h.publish(e);
+    await h.pump();
+    const before = await anchors.get('seedbed');
+    await h.publish(e);
+    await h.pump();
+    expect(await anchors.get('seedbed')).toEqual(before);
+  });
+
+  it('keeps ingesting when the anchor store is down, and anchors the newest head with the next batch', async () => {
+    const anchors = anchorStore();
+    const { h, store, clock } = setup({ anchors });
+    const put = anchors.put.bind(anchors);
+    anchors.put = () => Promise.reject(new Error('anchor store down'));
+    await h.publish(makeEvent(), makeEvent());
+    const { result } = await h.pump();
+    expect(result.written).toBe(2);
+    expect(await h.pending()).toBe(0);
+    expect(h.errors().some((r) => r.msg === 'chain anchor not stored; will retry with the next batch')).toBe(true);
+    expect(await anchors.get('seedbed')).toBeNull();
+
+    anchors.put = put;
+    clock.advance(1000);
+    await h.publish(makeEvent());
+    await h.pump();
+    const last = (await stored(store, 'seedbed')).at(-1);
+    expect(await anchors.get('seedbed')).toMatchObject({ count: 3, headHash: last?.hash });
+  });
+
+  it('logs an integrity error when the anchor is ahead of the chain', async () => {
+    const anchors = anchorStore();
+    await anchors.put({ workspaceId: 'seedbed', headHash: 'f'.repeat(64), count: 50, timestamp: '2026-10-25T09:00:00.000Z' });
+    const { h } = setup({ anchors });
+    await h.publish(makeEvent());
+    await h.pump();
+    expect(h.errors().some((r) => r.msg.startsWith('chain integrity risk: the anchor is ahead of the chain'))).toBe(true);
+    expect((await anchors.get('seedbed'))?.count).toBe(50); // never goes backwards
+  });
+
+  it('works without an anchor store', async () => {
+    const { h } = setup();
+    await h.publish(makeEvent());
+    expect((await h.pump()).result.written).toBe(1);
   });
 });
 

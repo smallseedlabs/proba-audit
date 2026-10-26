@@ -1,5 +1,8 @@
 import type { StoredAuditEvent } from '../domain/audit.js';
 import { computeEventHash, digestAuditContent } from '../domain/chain.js';
+import type { AnchorStore } from '../ports/anchor-store.js';
+import { AnchorTamperedError } from '../ports/anchor-store.js';
+import type { ChainAnchor } from '../domain/anchor.js';
 import type { AuditContentStore } from '../ports/audit-content-store.js';
 import type { AuditStore } from '../ports/audit-store.js';
 import { validateStoredAuditEvent } from './protocol.js';
@@ -17,7 +20,9 @@ export type ChainProblemType =
   | 'broken_link' // prevHash != hash of the previous event: an event is missing, reordered or replaced
   | 'bad_genesis' // first event of a chain has a prevHash, or the first event of a range does not follow its predecessor
   | 'non_monotonic_ingested_at' // ingestedAt does not strictly increase
-  | 'content_mismatch'; // the stored raw text does not match the event's contentDigest (only checked with a content store)
+  | 'content_mismatch' // the stored raw text does not match the event's contentDigest (only checked with a content store)
+  | 'tail_truncated' // the newest events are gone: the chain is shorter than, or does not contain, the signed head in the anchor (only checked with an anchor store)
+  | 'anchor_invalid'; // the anchor of the workspace does not carry a valid signature: it was changed, or signed with another key (only checked with an anchor store)
 
 export interface ChainProblem {
   type: ChainProblemType;
@@ -48,6 +53,11 @@ export interface ChainVerification {
    * the digest in the chain still proves what it was), mismatched ones are reported as `content_mismatch` problems.
    */
   content?: { checked: number; missing: number };
+  /**
+   * Present when an anchor store was given and the workspace has an anchor. `checked` is false when this verification could
+   * not compare with it: the anchored head lies outside the range, or verification stopped early (`maxEvents`, `maxProblems`).
+   */
+  anchor?: { checked: boolean; count: number; timestamp: string };
 }
 
 export interface VerifyChainOptions {
@@ -59,6 +69,13 @@ export interface VerifyChainOptions {
   maxEvents?: number;
   /** Also compare the stored raw text of events that have a contentDigest with that digest. */
   contentStore?: AuditContentStore;
+  /**
+   * Compare the chain with the latest signed anchor of the workspace (written by the audit consumer, kept outside the audit store).
+   * An anchor is written after the events it covers, so a live chain LONGER than the anchor is normal; the events the anchor
+   * covers must still be there, unchanged: the anchored head must be in the chain (`tail_truncated` when it is not), and a
+   * whole-chain verification must find at least `anchor.count` events.
+   */
+  anchorStore?: AnchorStore;
 }
 
 /**
@@ -72,6 +89,11 @@ export interface VerifyChainOptions {
  * is verified too.
  *
 
+ * With `options.anchorStore` it also catches what a hash chain alone cannot, the deletion of the NEWEST events
+ * (the shorter chain is still valid): see VerifyChainOptions.anchorStore. An anchor is only compared when the whole
+ * stretch it covers was walked: no `maxEvents` stop, no early stop after `maxProblems`, and its head inside `range`
+ * (with `range.from` the count is not compared, as the chain before the range is not walked).
+ *
  * With `options.contentStore`, the raw text of every event that has a `contentDigest` is read back and its
  * digest compared (`content_mismatch`): the chain covers the digest, this proves the text still matches it.
  *
@@ -106,6 +128,23 @@ export async function verifyChain(
       previousIngestedAt = predecessor.ingestedAt;
     }
   }
+
+  // The anchor: the signed head (hash, count, ingestedAt) the audit consumer last recorded outside the store.
+  let anchor: ChainAnchor | null = null;
+  if (options.anchorStore) {
+    try {
+      anchor = await options.anchorStore.get(workspaceId);
+    } catch (err) {
+      if (!(err instanceof AnchorTamperedError)) throw err;
+      problems.push({ type: 'anchor_invalid', eventId: '', detail: err.message });
+    }
+  }
+  const anchorAt = anchor ? Date.parse(anchor.timestamp) : NaN;
+  const anchorInRange =
+    anchor !== null &&
+    (range.from === undefined || anchorAt >= Date.parse(range.from)) &&
+    (range.to === undefined || anchorAt < Date.parse(range.to));
+  let anchoredEvent: StoredAuditEvent | undefined; // the event of the chain that sits at the anchor's timestamp
 
   let checked = 0;
   let first: StoredAuditEvent | null = null;
@@ -167,6 +206,8 @@ export async function verifyChain(
         }
       }
 
+      if (anchorInRange && Date.parse(e.ingestedAt) === anchorAt) anchoredEvent = e;
+
       // Continue from what is stored, so one tampered event is reported once, not for every successor.
       expectedPrev = e.hash;
       previousIngestedAt = e.ingestedAt;
@@ -175,6 +216,24 @@ export async function verifyChain(
     if (truncated || page.length < pageSize) break;
     const tail = page[page.length - 1] as StoredAuditEvent;
     cursor = { ingestedAt: tail.ingestedAt, eventId: tail.eventId };
+  }
+
+  // Only a walk that read everything up to the end of the range can say that something is missing at its end.
+  const walkedToEnd = !truncated && problems.length < maxProblems;
+  const anchorChecked = anchor !== null && anchorInRange && walkedToEnd;
+  if (anchor && anchorChecked) {
+    const lastEventId = (last as StoredAuditEvent | null)?.eventId ?? '';
+    const tail = (detail: string): void => {
+      if (problems.length < maxProblems) problems.push({ type: 'tail_truncated', eventId: lastEventId, detail });
+    };
+    if (!anchoredEvent) {
+      tail(`the anchored head ${anchor.headHash} (event ${anchor.count} of the chain, ingested ${anchor.timestamp}) is not in the chain: the newest events were removed or replaced`);
+    } else if (anchoredEvent.hash !== anchor.headHash) {
+      tail(`the event ingested at ${anchor.timestamp} has hash ${anchoredEvent.hash}, but the anchor signed head ${anchor.headHash}: the newest events were replaced`);
+    }
+    if (range.from === undefined && range.to === undefined && checked < anchor.count) {
+      tail(`the chain has ${checked} events but the anchor recorded ${anchor.count}: ${anchor.count - checked} of the newest events are missing`);
+    }
   }
 
   return {
@@ -189,5 +248,6 @@ export async function verifyChain(
     complete: problems.length < maxProblems,
     ...(truncated ? { truncated: true } : {}),
     ...(options.contentStore ? { content: { checked: contentChecked, missing: contentMissing } } : {}),
+    ...(anchor ? { anchor: { checked: anchorChecked, count: anchor.count, timestamp: anchor.timestamp } } : {}),
   };
 }

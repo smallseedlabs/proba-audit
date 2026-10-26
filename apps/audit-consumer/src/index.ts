@@ -18,9 +18,10 @@ runService({
   name: 'audit-consumer',
   defaultPort: 3101,
   async onStart({ config, logger }) {
-    runtime = await createRuntime(config, { logger, clickhouseRole: 'consumer' });
+    runtime = await createRuntime(config, { logger, clickhouseRole: 'consumer', usesAnchors: true });
     await runtime.auditStore.ping();
     if (config.content.enabled) await runtime.auditContentStore.ping();
+    await runtime.anchorStore?.ping();
     await runtime.eventBus.ping();
 
     // The consumer audits itself through the same emitter and bus as every service.
@@ -42,6 +43,7 @@ runService({
       bus: runtime.eventBus,
       store: runtime.auditStore,
       contentStore: runtime.auditContentStore,
+      anchors: runtime.anchorStore,
       clock: runtime.clock,
       ids: runtime.ids,
       logger,

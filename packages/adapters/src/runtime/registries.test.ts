@@ -2,8 +2,10 @@ import { describe, expect, it } from 'vitest';
 import {
   ConfigError,
   UnknownAdapterError,
+  DEV_ANCHOR_HMAC_KEY,
   loadConfig,
   MemoryLogger,
+  verifyAnchorSignature,
   type EventBus,
   type PlatformConnector,
 } from '@smallseedlabs/proba-audit-core';
@@ -12,8 +14,10 @@ import { InMemoryQuarantineStore } from '../memory/quarantine-store.js';
 import { StaticPlatformConnector } from '../memory/platform-connector.js';
 import { StubConnectorNotAllowedError, StubPlatformConnector } from '../stub/stub-platform-connector.js';
 import { InMemoryEventBus } from '../memory/event-bus.js';
+import { InMemoryAnchorStore } from '../memory/anchor-store.js';
 import { InMemoryAuditStore } from '../memory/audit-store.js';
 import { InMemoryMetricsStore } from '../memory/metrics-store.js';
+import { AnchorKeyRequiredError } from './anchor-key.js';
 import { InMemoryAdaptersNotAllowedError } from './in-memory-guard.js';
 import { createConnectors, createDefaultRegistries, createRuntime } from './registries.js';
 
@@ -63,6 +67,7 @@ describe('createRuntime', () => {
     expect(r.metricsStore.names()).toEqual(['clickhouse', 'memory']);
     expect(r.checkpointStore.names()).toEqual(['clickhouse', 'memory']);
     expect(r.quarantineStore.names()).toEqual(['clickhouse', 'memory']);
+    expect(r.anchorStore.names()).toEqual(['memory', 'postgres']);
     expect(r.platformConnector.names()).toEqual(['stub']);
   });
 });
@@ -133,6 +138,64 @@ describe('in-memory adapters in production (ALLOW_IN_MEMORY_ADAPTERS)', () => {
     expect(loadConfig({}).allowInMemoryAdapters).toBe(false);
     expect(loadConfig({ ALLOW_IN_MEMORY_ADAPTERS: 'true' }).allowInMemoryAdapters).toBe(true);
     expect(() => loadConfig({ ALLOW_IN_MEMORY_ADAPTERS: 'yes' })).toThrow(ConfigError);
+  });
+});
+
+describe('chain anchors (ANCHOR_STORE, ANCHOR_HMAC_KEY)', () => {
+  const REAL_KEY = 'k'.repeat(48);
+  const prod = (extra: Record<string, string> = {}) => loadConfig({ ...memoryEnv, AUDIT_CONTENT_STORE: 'memory', NODE_ENV: 'production', ALLOW_IN_MEMORY_ADAPTERS: 'true', ...extra });
+  const failure = async (config: ReturnType<typeof loadConfig>, usesAnchors = true) =>
+    createRuntime(config, { logger: new MemoryLogger(), usesAnchors }).catch((e: unknown) => e);
+
+  it('creates the anchor store only for services that use it', async () => {
+    const config = loadConfig({ ...memoryEnv, NODE_ENV: 'development' });
+    const without = await createRuntime(config, { logger: new MemoryLogger() });
+    expect(without.anchorStore).toBeUndefined();
+    await without.close();
+    const withAnchors = await createRuntime(config, { logger: new MemoryLogger(), usesAnchors: true });
+    expect(withAnchors.anchorStore).toBeInstanceOf(InMemoryAnchorStore);
+    await withAnchors.close();
+  });
+
+  it('outside production an empty key falls back to the development key', async () => {
+    const rt = await createRuntime(loadConfig({ ...memoryEnv, NODE_ENV: 'development' }), { logger: new MemoryLogger(), usesAnchors: true });
+    const anchor = await rt.anchorStore!.put({ workspaceId: 'w', headHash: 'h', count: 1, timestamp: '2026-10-25T10:00:00.000Z' });
+    expect(verifyAnchorSignature(DEV_ANCHOR_HMAC_KEY, anchor)).toBe(true);
+    await rt.close();
+  });
+
+  it('production needs ANCHOR_HMAC_KEY (empty, too short and the public development key are refused)', async () => {
+    for (const key of ['', 'short', DEV_ANCHOR_HMAC_KEY]) {
+      const err = await failure(prod({ ANCHOR_HMAC_KEY: key }));
+      expect(err).toBeInstanceOf(AnchorKeyRequiredError);
+      expect((err as Error).message).toContain('ANCHOR_HMAC_KEY');
+    }
+  });
+
+  it('production starts with a real key, which signs the anchors', async () => {
+    const rt = await createRuntime(prod({ ANCHOR_HMAC_KEY: REAL_KEY }), { logger: new MemoryLogger(), usesAnchors: true });
+    const anchor = await rt.anchorStore!.put({ workspaceId: 'w', headHash: 'h', count: 1, timestamp: '2026-10-25T10:00:00.000Z' });
+    expect(verifyAnchorSignature(REAL_KEY, anchor)).toBe(true);
+    expect(verifyAnchorSignature(DEV_ANCHOR_HMAC_KEY, anchor)).toBe(false);
+    await rt.close();
+  });
+
+  it('services that do not use anchors do not need the key', async () => {
+    const rt = await createRuntime(prod(), { logger: new MemoryLogger() });
+    await rt.close();
+  });
+
+  it('an in-memory anchor store counts for the production guard only with usesAnchors', async () => {
+    const config = prod({ ALLOW_IN_MEMORY_ADAPTERS: 'false', ANCHOR_HMAC_KEY: REAL_KEY });
+    const refused = async (usesAnchors: boolean) =>
+      ((await failure(config, usesAnchors)) as InMemoryAdaptersNotAllowedError).adapters;
+    expect(await refused(true)).toContain('ANCHOR_STORE');
+    expect(await refused(false)).not.toContain('ANCHOR_STORE');
+  });
+
+  it('ANCHOR_STORE=postgres needs ANCHOR_DATABASE_URL', async () => {
+    const err = await failure(loadConfig({ ...memoryEnv, NODE_ENV: 'development', ANCHOR_STORE: 'postgres' }));
+    expect((err as Error).message).toContain('ANCHOR_DATABASE_URL');
   });
 });
 

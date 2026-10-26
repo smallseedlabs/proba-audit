@@ -345,6 +345,38 @@ describe('GET /v1/chain/verify', () => {
     expect(res.body.problems).toEqual([expect.objectContaining({ type: 'hash_mismatch', eventId: chained[1].eventId })]);
   });
 
+  it('reports tail_truncated when the newest events were deleted from the audit store (the anchored head is missing from the range)', async () => {
+    const chained = chainAll(Array.from({ length: 5 }, () => makeEvent()));
+    const head = chained[4]!;
+    await h.anchors.put({ workspaceId: WORKSPACE, headHash: head.hash, count: 5, timestamp: head.ingestedAt });
+    await h.store.appendBatch(chained.slice(0, 3)); // the newest two are gone: a valid, shorter chain
+    const res = await h.get(`/v1/chain/verify?${range}`, TOKENS.admin);
+    expect(res.status).toBe(200);
+    expect(res.body.ok).toBe(false);
+    expect(res.body.problems.map((p: any) => p.type)).toEqual(['tail_truncated']);
+    expect(res.body.anchor).toMatchObject({ checked: true, count: 5 });
+  });
+
+  it('passes an anchored, intact chain and reports the anchor', async () => {
+    const chained = chainAll(Array.from({ length: 3 }, () => makeEvent()));
+    await h.store.appendBatch(chained);
+    const head = chained[2]!;
+    await h.anchors.put({ workspaceId: WORKSPACE, headHash: head.hash, count: 3, timestamp: head.ingestedAt });
+    const res = await h.get(`/v1/chain/verify?${range}`, TOKENS.admin);
+    expect(res.body).toMatchObject({ ok: true, checked: 3, anchor: { checked: true, count: 3 } });
+  });
+
+  it('reports anchor_invalid for an anchor that was changed', async () => {
+    const chained = chainAll(Array.from({ length: 3 }, () => makeEvent()));
+    await h.store.appendBatch(chained);
+    const head = chained[2]!;
+    await h.anchors.put({ workspaceId: WORKSPACE, headHash: head.hash, count: 3, timestamp: head.ingestedAt });
+    h.anchors.tamper(WORKSPACE, { count: 1 });
+    const res = await h.get(`/v1/chain/verify?${range}`, TOKENS.admin);
+    expect(res.body.ok).toBe(false);
+    expect(res.body.problems.map((p: any) => p.type)).toEqual(['anchor_invalid']);
+  });
+
   it('bounds the range and the number of events checked', async () => {
     expect((await h.get('/v1/chain/verify', TOKENS.admin)).status).toBe(400);
     expect((await h.get('/v1/chain/verify?from=2026-10-25T10:00:00Z', TOKENS.admin)).status).toBe(400);

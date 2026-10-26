@@ -4,6 +4,7 @@ import {
   digestAuditContent,
   verifyChain,
   type AccessContext,
+  type AnchorStore,
   type AuditContent,
   type AuditContentStore,
   type AuditedAnalyticsReader,
@@ -44,6 +45,8 @@ export interface ReadServiceDeps {
   contentStore?: AuditContentStore;
   /** AUDIT_CONTENT_ENABLED: the content routes answer 404 and events never say `hasContent` when false. */
   contentEnabled?: boolean;
+  /** Signed chain heads: chain verification compares the live chain with them (`tail_truncated`). */
+  anchorStore?: AnchorStore;
   metricsStore: MetricsStore;
   reader: AuditedReader;
   analytics: AuditedAnalyticsReader;
@@ -337,7 +340,11 @@ export class ReadService {
           this.d.auditStore,
           ctx.workspaceId,
           { from: q.from, to: q.to },
-          { maxEvents: this.d.chain.maxEvents, ...(this.d.contentEnabled && this.d.contentStore ? { contentStore: this.d.contentStore } : {}) }
+          {
+            maxEvents: this.d.chain.maxEvents,
+            ...(this.d.contentEnabled && this.d.contentStore ? { contentStore: this.d.contentStore } : {}),
+            ...(this.d.anchorStore ? { anchorStore: this.d.anchorStore } : {}),
+          }
         ),
       meta
     );

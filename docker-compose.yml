@@ -89,10 +89,33 @@ services:
       METRICS_STORE: ${METRICS_STORE:-clickhouse}
       CHECKPOINT_STORE: ${CHECKPOINT_STORE:-clickhouse}
       QUARANTINE_STORE: ${QUARANTINE_STORE:-clickhouse}
+      # Signed heads of the hash chains (audit-consumer and audit-api): kept in their own Postgres (anchor-db), outside ClickHouse.
+      # ANCHOR_HMAC_KEY has no default: with NODE_ENV=production audit-consumer and audit-api refuse to start without one (>= 32 characters).
+      ANCHOR_STORE: ${ANCHOR_STORE:-postgres}
+      ANCHOR_HMAC_KEY: ${ANCHOR_HMAC_KEY:-}
+      ANCHOR_DATABASE_URL: ${ANCHOR_DATABASE_URL:-postgresql://anchors:${ANCHOR_DB_PASSWORD:-anchors}@anchor-db:5432/proba_audit_anchors}
       # Which analytics library serves which ad platform. Empty: the ingester idles.
       # The development data source is meta:stub (see the metrics-e2e profile).
       PLATFORM_CONNECTORS: ${PLATFORM_CONNECTORS:-}
       INGEST_WORKSPACE_ID: ${INGEST_WORKSPACE_ID:-seedbed}
+
+  # The anchor store: NOT the ClickHouse that holds the audit events, and with its own credentials, so that whoever can delete
+  # audit events cannot also rewrite the signed chain heads. For anything real, use a managed Postgres and set ANCHOR_DATABASE_URL.
+  anchor-db:
+    profiles: ["apps"]
+    image: postgres:16-alpine
+    container_name: proba-audit-anchor-db
+    environment:
+      POSTGRES_USER: anchors
+      POSTGRES_PASSWORD: ${ANCHOR_DB_PASSWORD:-anchors}
+      POSTGRES_DB: proba_audit_anchors
+    volumes:
+      - anchor_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U anchors -d proba_audit_anchors"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
   audit-consumer:
     profiles: ["apps"]
@@ -104,6 +127,8 @@ services:
       clickhouse:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      anchor-db:
         condition: service_healthy
     environment:
       <<: *app-env
@@ -193,6 +218,8 @@ services:
     environment: &e2e-env
       <<: *app-env
       NODE_ENV: development
+      # Development run: anchors in memory with the development key (no anchor-db in this profile).
+      ANCHOR_STORE: memory
       LOG_LEVEL: ${LOG_LEVEL:-info}
       PLATFORM_CONNECTORS: meta:stub,google:stub
       ALLOW_STUB_CONNECTOR: "true"
@@ -248,3 +275,4 @@ services:
 volumes:
   clickhouse_data:
   redis_data:
+  anchor_data:

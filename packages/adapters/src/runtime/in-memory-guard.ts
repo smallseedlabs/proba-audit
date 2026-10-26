@@ -16,6 +16,8 @@ export class InMemoryAdaptersNotAllowedError extends Error {
 export interface InMemoryGuardOptions {
   /** The read API's rate limiter is created outside createRuntime; only audit-api checks it. */
   includeRateLimiter?: boolean;
+  /** Only audit-consumer and audit-api use the anchor store; the other services do not need ANCHOR_STORE to be durable. */
+  includeAnchorStore?: boolean;
 }
 
 /** The config keys (for example `AUDIT_STORE`) whose selected adapter is the in-memory one. */
@@ -29,6 +31,7 @@ export function selectedInMemoryAdapters(config: AppConfig, options: InMemoryGua
     ['AUDIT_CONTENT_STORE', config.adapters.auditContentStore],
   ];
   if (options.includeRateLimiter) candidates.push(['AUDIT_API_RATE_LIMITER', config.api.adapters.rateLimiter]);
+  if (options.includeAnchorStore) candidates.push(['ANCHOR_STORE', config.adapters.anchorStore]);
   return candidates.filter(([, adapter]) => adapter === IN_MEMORY_ADAPTER_NAME).map(([key]) => key);
 }
 

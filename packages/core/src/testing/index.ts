@@ -14,3 +14,4 @@ export * from './logger.contract.js';
 export * from './platform-connector.contract.js';
 export * from './outbox-store.contract.js';
 export * from './ingest-state.contract.js';
+export * from './anchor-store.contract.js';
