@@ -1,5 +1,6 @@
 import type { StoredAuditEvent } from '../domain/audit.js';
-import { computeEventHash } from '../domain/chain.js';
+import { computeEventHash, digestAuditContent } from '../domain/chain.js';
+import type { AuditContentStore } from '../ports/audit-content-store.js';
 import type { AuditStore } from '../ports/audit-store.js';
 import { validateStoredAuditEvent } from './protocol.js';
 
@@ -15,7 +16,8 @@ export type ChainProblemType =
   | 'hash_mismatch' // stored hash != recomputed hash: the event was altered
   | 'broken_link' // prevHash != hash of the previous event: an event is missing, reordered or replaced
   | 'bad_genesis' // first event of a chain has a prevHash, or the first event of a range does not follow its predecessor
-  | 'non_monotonic_ingested_at'; // ingestedAt does not strictly increase
+  | 'non_monotonic_ingested_at' // ingestedAt does not strictly increase
+  | 'content_mismatch'; // the stored raw text does not match the event's contentDigest (only checked with a content store)
 
 export interface ChainProblem {
   type: ChainProblemType;
@@ -40,6 +42,12 @@ export interface ChainVerification {
   complete: boolean;
   /** Present (true) only when the `maxEvents` bound stopped verification before the range was exhausted. */
   truncated?: boolean;
+  /**
+   * Present when a content store was given. `checked`: events with a contentDigest whose text was compared,
+   * `missing`: events whose text is not in the store (never stored, or removed by retention: not a problem,
+   * the digest in the chain still proves what it was), mismatched ones are reported as `content_mismatch` problems.
+   */
+  content?: { checked: number; missing: number };
 }
 
 export interface VerifyChainOptions {
@@ -49,6 +57,8 @@ export interface VerifyChainOptions {
   maxProblems?: number;
   /** Stop after checking this many events (a bound for requests served on demand). Default: no bound. */
   maxEvents?: number;
+  /** Also compare the stored raw text of events that have a contentDigest with that digest. */
+  contentStore?: AuditContentStore;
 }
 
 /**
@@ -60,6 +70,10 @@ export interface VerifyChainOptions {
  * `range.from` it must be the genesis (prevHash null); with `range.from` it must
  * follow the real predecessor event (the last event before `from`), whose own hash
  * is verified too.
+ *
+
+ * With `options.contentStore`, the raw text of every event that has a `contentDigest` is read back and its
+ * digest compared (`content_mismatch`): the chain covers the digest, this proves the text still matches it.
  *
  * Reads the workspace in pages, so it is safe on large chains, but ClickHouse has
  * no index on ingestedAt: run it as a maintenance job, not per request.
@@ -98,6 +112,8 @@ export async function verifyChain(
   let last: StoredAuditEvent | null = null;
   let cursor: { ingestedAt: string; eventId: string } | undefined;
   let isFirst = true;
+  let contentChecked = 0;
+  let contentMissing = 0;
 
   while (problems.length < maxProblems) {
     const page = await store.readChain(workspaceId, {
@@ -108,6 +124,16 @@ export async function verifyChain(
       limit: pageSize,
     });
     if (page.length === 0) break;
+
+    const contents = new Map<string, { contentDigest: string; digest: string }>();
+    if (options.contentStore) {
+      const withDigest = page.filter((e) => e.contentDigest !== undefined).map((e) => e.eventId);
+      if (withDigest.length > 0) {
+        for (const row of await options.contentStore.getMany(workspaceId, withDigest)) {
+          contents.set(row.eventId, { contentDigest: row.contentDigest, digest: digestAuditContent(row.content) });
+        }
+      }
+    }
 
     for (const e of page) {
       if (checked >= maxEvents) {
@@ -127,6 +153,18 @@ export async function verifyChain(
       }
       if (previousIngestedAt !== undefined && Date.parse(e.ingestedAt) <= Date.parse(previousIngestedAt)) {
         report('non_monotonic_ingested_at', e, `ingestedAt ${e.ingestedAt} is not after ${previousIngestedAt}`);
+      }
+
+      if (options.contentStore && e.contentDigest !== undefined) {
+        const stored = contents.get(e.eventId);
+        if (!stored) {
+          contentMissing += 1;
+        } else {
+          contentChecked += 1;
+          if (stored.digest !== e.contentDigest || stored.contentDigest !== e.contentDigest) {
+            report('content_mismatch', e, 'the stored raw text does not match the digest in the chain');
+          }
+        }
       }
 
       // Continue from what is stored, so one tampered event is reported once, not for every successor.
@@ -150,5 +188,6 @@ export async function verifyChain(
     problems,
     complete: problems.length < maxProblems,
     ...(truncated ? { truncated: true } : {}),
+    ...(options.contentStore ? { content: { checked: contentChecked, missing: contentMissing } } : {}),
   };
 }

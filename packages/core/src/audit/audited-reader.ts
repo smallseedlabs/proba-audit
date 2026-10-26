@@ -77,13 +77,33 @@ export class AuditedReader {
     return this.audited(ctx, 'data_access.read', filters, size, run, { operation, ...details });
   }
 
+  /**
+   * A read that returns raw text (AuditEvent.content), recorded with the specific action for what was
+   * read (`audit.event_viewed` for one event, `audit.trace_viewed` for a trace) and `contentIncluded: true`,
+   * so who read which text is always answerable. `target` is the record read. Never carries the text itself.
+   * If the audit event cannot be sent the read fails (the emitter is the API's fail-closed one).
+   */
+  readContent<T>(
+    ctx: AccessContext,
+    action: 'audit.event_viewed' | 'audit.trace_viewed',
+    operation: string,
+    filters: object,
+    size: (result: T) => number,
+    run: () => Promise<T>,
+    target: { type: string; id: string },
+    details: Record<string, unknown> = {}
+  ): Promise<T> {
+    return this.audited(ctx, action, filters, size, run, { operation, ...details, contentIncluded: true }, target);
+  }
+
   private async audited<T>(
     ctx: AccessContext,
     action: string,
     filters: object,
     size: (result: T) => number,
     run: () => Promise<T>,
-    context: Record<string, unknown> = {}
+    context: Record<string, unknown> = {},
+    target: { type: string; id: string } = { type: 'audit_events', id: ctx.workspaceId }
   ): Promise<T> {
     const started = this.clock.now().getTime();
     const emitter = ctx.traceId ? this.emitter.forTrace(ctx.traceId, ctx.parentSpanId) : this.emitter;
@@ -95,7 +115,7 @@ export class AuditedReader {
         action,
         category: 'data_access',
         outcome,
-        target: { type: 'audit_events', id: ctx.workspaceId },
+        target,
         durationMs: this.clock.now().getTime() - started,
         errorMessage: error?.message.slice(0, 500),
         details: {

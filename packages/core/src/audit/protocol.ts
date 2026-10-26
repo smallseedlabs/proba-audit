@@ -5,7 +5,10 @@
  */
 export {
   AUDIT_ACTIONS,
+  AUDIT_CONTENT_MAX_CHARS,
+  buildAuditContent,
   buildAuditEvent,
+  canonicalizeAuditContent,
   canonicalizeAuditEvent,
   generateSpanId,
   isValidTimeZone,
@@ -13,4 +16,4 @@ export {
   validateAuditEvent,
   validateStoredAuditEvent,
 } from '@smallseedlabs/proba-protocol/audit';
-export type { AuditActor, AuditEventDraft, AuditTarget } from '@smallseedlabs/proba-protocol/audit';
+export type { AuditActor, AuditContent, AuditEventDraft, AuditTarget } from '@smallseedlabs/proba-protocol/audit';

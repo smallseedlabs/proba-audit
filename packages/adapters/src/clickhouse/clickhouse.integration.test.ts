@@ -5,12 +5,14 @@ import {
   makeObservation,
   makeStoredAuditEvent,
   runAuditStoreContract,
+  runAuditContentStoreContract,
   runMetricsStoreContract,
   runCheckpointStoreContract,
   runQuarantineStoreContract,
 } from '@smallseedlabs/proba-audit-core/testing';
 import { createClickHouseClient, ensureDatabase, type ClickHouseOptions } from './client.js';
 import { ClickHouseAuditStore } from './audit-store.js';
+import { ClickHouseAuditContentStore } from './audit-content-store.js';
 import { ClickHouseMetricsStore } from './metrics-store.js';
 import { ClickHouseCheckpointStore, ClickHouseQuarantineStore } from './ingest-state-stores.js';
 import { clickHouseMigrationDb } from './migrate-db.js';
@@ -32,6 +34,10 @@ beforeAll(async () => {
 
 runAuditStoreContract('clickhouse', async () => ({
   store: new ClickHouseAuditStore({ client: createClickHouseClient(options(TEST_DB)), ownsClient: true }),
+}));
+
+runAuditContentStoreContract('clickhouse', async () => ({
+  store: new ClickHouseAuditContentStore({ client: createClickHouseClient(options(TEST_DB)), ownsClient: true }),
 }));
 
 runMetricsStoreContract('clickhouse', async () => ({
@@ -69,15 +75,15 @@ describe('ClickHouse migrations', () => {
       const migrations = loadMigrations(migrationsDir);
 
       const first = await runMigrations(db, migrations);
-      expect(first.applied).toHaveLength(7);
+      expect(first.applied).toHaveLength(8);
       const second = await runMigrations(db, migrations);
       expect(second.applied).toEqual([]);
-      expect(second.skipped).toHaveLength(7);
+      expect(second.skipped).toHaveLength(8);
 
       const rows = await (
         await client.query({ query: 'SELECT version, name FROM schema_migrations ORDER BY version', format: 'JSONEachRow' })
       ).json<{ version: number; name: string }>();
-      expect(rows.map((r) => r.version)).toEqual([1, 2, 3, 4, 5, 6, 7]);
+      expect(rows.map((r) => r.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
 
       const tables = await (
         await client.query({
@@ -95,6 +101,7 @@ describe('ClickHouse migrations', () => {
       ).json<{ name: string; default_expression: string }>();
       expect(daily.map((c) => c.name)).toEqual(['bucket_date', 'timezone']);
       expect(Object.fromEntries(tables.map((t) => [t.name, t.engine]))).toEqual({
+        audit_event_content: 'ReplacingMergeTree',
         audit_events: 'MergeTree',
         ingest_checkpoints: 'ReplacingMergeTree',
         metric_observation_quarantine: 'MergeTree',

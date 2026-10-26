@@ -1,6 +1,7 @@
 import {
   AdapterRegistry,
   type AppConfig,
+  type AuditContentStore,
   type AuditStore,
   type CheckpointStore,
   type Clock,
@@ -16,6 +17,8 @@ import {
 } from '@smallseedlabs/proba-audit-core';
 import { createClickHouseClient } from '../clickhouse/client.js';
 import { ClickHouseAuditStore } from '../clickhouse/audit-store.js';
+import { ClickHouseAuditContentStore } from '../clickhouse/audit-content-store.js';
+import { InMemoryAuditContentStore } from '../memory/audit-content-store.js';
 import { ClickHouseMetricsStore } from '../clickhouse/metrics-store.js';
 import { ClickHouseCheckpointStore, ClickHouseQuarantineStore } from '../clickhouse/ingest-state-stores.js';
 import { InMemoryCheckpointStore } from '../memory/checkpoint-store.js';
@@ -47,6 +50,8 @@ export interface ConnectorDeps extends AdapterDeps {
 export interface Registries {
   eventBus: AdapterRegistry<EventBus, AdapterDeps>;
   auditStore: AdapterRegistry<AuditStore, AdapterDeps>;
+  /** Where the raw text of audit events goes: AUDIT_CONTENT_STORE. */
+  auditContentStore: AdapterRegistry<AuditContentStore, AdapterDeps>;
   metricsStore: AdapterRegistry<MetricsStore, AdapterDeps>;
   checkpointStore: AdapterRegistry<CheckpointStore, AdapterDeps>;
   quarantineStore: AdapterRegistry<QuarantineStore, AdapterDeps>;
@@ -83,6 +88,12 @@ export function createDefaultRegistries(): Registries {
       new ClickHouseAuditStore({ client: createClickHouseClient(config.clickhouse), ownsClient: true })
     )
     .register('memory', () => new InMemoryAuditStore());
+
+  const auditContentStore = new AdapterRegistry<AuditContentStore, AdapterDeps>('AuditContentStore')
+    .register('clickhouse', ({ config }) =>
+      new ClickHouseAuditContentStore({ client: createClickHouseClient(config.clickhouse), ownsClient: true })
+    )
+    .register('memory', () => new InMemoryAuditContentStore());
 
   const metricsStore = new AdapterRegistry<MetricsStore, AdapterDeps>('MetricsStore')
     .register('clickhouse', ({ config, clock }) =>
@@ -128,7 +139,7 @@ export function createDefaultRegistries(): Registries {
     .register('memory', ({ clock }) => new InMemoryRateLimiter(clock))
     .register('redis', ({ config, logger }) => new RedisRateLimiter({ url: config.eventBus.redisUrl, logger }));
 
-  return { eventBus, auditStore, metricsStore, checkpointStore, quarantineStore, platformConnector, tokenVerifier, rateLimiter };
+  return { eventBus, auditStore, auditContentStore, metricsStore, checkpointStore, quarantineStore, platformConnector, tokenVerifier, rateLimiter };
 }
 
 /**
@@ -171,6 +182,8 @@ export interface Runtime {
   ids: IdGenerator;
   eventBus: EventBus;
   auditStore: AuditStore;
+  /** Raw text of audit events. Only used when config.content.enabled. */
+  auditContentStore: AuditContentStore;
   metricsStore: MetricsStore;
   checkpointStore: CheckpointStore;
   quarantineStore: QuarantineStore;
@@ -197,6 +210,7 @@ export async function createRuntime(config: AppConfig, options: CreateRuntimeOpt
   };
   const eventBus = await registries.eventBus.create(config.adapters.eventBus, deps);
   const auditStore = await registries.auditStore.create(config.adapters.auditStore, deps);
+  const auditContentStore = await registries.auditContentStore.create(config.adapters.auditContentStore, deps);
   const metricsStore = await registries.metricsStore.create(config.adapters.metricsStore, deps);
   const checkpointStore = await registries.checkpointStore.create(config.adapters.checkpointStore, deps);
   const quarantineStore = await registries.quarantineStore.create(config.adapters.quarantineStore, deps);
@@ -204,6 +218,8 @@ export async function createRuntime(config: AppConfig, options: CreateRuntimeOpt
     lifecycle: 'adapters_created',
     eventBus: config.adapters.eventBus,
     auditStore: config.adapters.auditStore,
+    auditContentStore: config.adapters.auditContentStore,
+    contentEnabled: config.content.enabled,
     metricsStore: config.adapters.metricsStore,
     checkpointStore: config.adapters.checkpointStore,
     quarantineStore: config.adapters.quarantineStore,
@@ -215,6 +231,7 @@ export async function createRuntime(config: AppConfig, options: CreateRuntimeOpt
     ids: deps.ids,
     eventBus,
     auditStore,
+    auditContentStore,
     metricsStore,
     checkpointStore,
     quarantineStore,
@@ -222,6 +239,7 @@ export async function createRuntime(config: AppConfig, options: CreateRuntimeOpt
       await Promise.allSettled([
         eventBus.close(),
         auditStore.close(),
+        auditContentStore.close(),
         metricsStore.close(),
         checkpointStore.close(),
         quarantineStore.close(),

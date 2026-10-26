@@ -15,11 +15,16 @@
  * "Content" (used to tell an identical redelivery from a conflicting event with
  * the same eventId) is the same canonical string *without* the four chain fields
  * prevHash, hash, ingestedAt and schemaVersion, after normalizeForStorage.
+ *
+ * Raw text (AuditEvent.content) is NOT part of a stored event. prepareForStorage takes it out and
+ * puts its SHA-256 digest in `contentDigest`, which is a stored field like any other and therefore
+ * covered by the hash. The text lives in the AuditContentStore; changing or swapping it no longer
+ * matches the digest, and deleting it (retention) leaves the chain intact.
  */
 
 import { createHash } from 'node:crypto';
 import type { AuditEvent, StoredAuditEvent } from './audit.js';
-import { canonicalizeAuditEvent } from '../audit/protocol.js';
+import { canonicalizeAuditContent, canonicalizeAuditEvent, type AuditContent } from '../audit/protocol.js';
 
 export const STORED_AUDIT_SCHEMA_VERSION = 1;
 
@@ -30,6 +35,24 @@ export interface ChainLink {
 }
 
 const sha256 = (text: string): string => createHash('sha256').update(text, 'utf8').digest('hex');
+
+/** SHA-256 (lower-case hex) of the canonical form of an event's raw text: the `contentDigest` of the stored event. */
+export function digestAuditContent(content: AuditContent): string {
+  return sha256(canonicalizeAuditContent(content));
+}
+
+/** An event as stored: without its raw text, with the digest of it. */
+export type PreparedAuditEvent = AuditEvent & { contentDigest?: string };
+
+/**
+ * Take the raw text out of an event: the event without `content`, with `contentDigest` set when it had
+ * some. Events without content are returned unchanged. The text itself is returned for the content store.
+ */
+export function splitContent(event: AuditEvent | PreparedAuditEvent): { event: PreparedAuditEvent; content?: AuditContent } {
+  const { content, ...rest } = event as PreparedAuditEvent;
+  if (content === undefined) return { event: rest };
+  return { event: { ...rest, contentDigest: digestAuditContent(content) }, content };
+}
 
 /** Tags derived from the event itself: category, outcome, service and (when set) risk. */
 export function deriveTags(event: AuditEvent): string[] {
@@ -52,16 +75,18 @@ export function normalizeForStorage<T extends AuditEvent>(event: T): T {
 }
 
 /** The event as it will be stored (before chain fields): normalised, producer tags first, then derived tags, no duplicates. */
-export function prepareForStorage(event: AuditEvent): AuditEvent {
-  const normalized = normalizeForStorage(event);
+export function prepareForStorage(event: AuditEvent): PreparedAuditEvent {
+  const normalized = normalizeForStorage(splitContent(event).event);
   const tags = [...new Set([...(normalized.tags ?? []), ...deriveTags(normalized)])];
   return { ...normalized, tags };
 }
 
 /** Canonical content string: the event without its chain fields. */
 export function canonicalContent(event: AuditEvent | StoredAuditEvent): string {
+  // An incoming event (with its text) and the stored one (with the digest) must compare equal.
+  const comparable = splitContent(event).event;
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  const { prevHash, hash, ingestedAt, schemaVersion, ...content } = event as Partial<StoredAuditEvent> & AuditEvent;
+  const { prevHash, hash, ingestedAt, schemaVersion, ...content } = comparable as Partial<StoredAuditEvent> & AuditEvent;
   return canonicalizeAuditEvent(content);
 }
 
