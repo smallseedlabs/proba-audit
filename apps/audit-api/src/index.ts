@@ -6,7 +6,7 @@ import {
   redactConfig,
   type AuditEmitter,
 } from '@smallseedlabs/proba-audit-core';
-import { createDefaultRegistries, createRuntime } from '@smallseedlabs/proba-audit-adapters';
+import { clickHouseOptionsFor, createDefaultRegistries, createRuntime } from '@smallseedlabs/proba-audit-adapters';
 import { buildServer } from './server.js';
 import { createScopeRegistry } from './scope.js';
 
@@ -31,9 +31,9 @@ async function main(): Promise<void> {
     });
   }
 
-  const runtime = await createRuntime(config, { logger });
+  const runtime = await createRuntime(config, { logger, usesRateLimiter: true, usesAnchors: true, clickhouseRole: 'api' });
   const registries = createDefaultRegistries();
-  const deps = { config, logger, clock: runtime.clock, ids: runtime.ids };
+  const deps = { config, logger, clock: runtime.clock, ids: runtime.ids, clickhouse: clickHouseOptionsFor(config, 'api') };
   const verifier = await registries.tokenVerifier.create(config.api.adapters.tokenVerifier, deps);
   const limiter = await registries.rateLimiter.create(config.api.adapters.rateLimiter, deps);
   const scope = await createScopeRegistry().create(config.api.adapters.scopeSource, deps);
@@ -68,6 +68,7 @@ async function main(): Promise<void> {
     limiter,
     auditStore: runtime.auditStore,
     auditContentStore: runtime.auditContentStore,
+    ...(runtime.anchorStore ? { anchorStore: runtime.anchorStore } : {}),
     metricsStore: runtime.metricsStore,
     scope: scope.resolve,
     emitter: emitterFor('throw'),

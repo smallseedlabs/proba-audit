@@ -15,6 +15,8 @@ export type {
 } from '@smallseedlabs/proba-protocol/audit';
 
 export interface MetricObservationFilter {
+  /** Required: observations of one workspace only. Always injected by trusted code, never from a request. */
+  workspaceId: string;
   platform?: MetricPlatform;
   accountId?: string;
   campaignId?: string;
@@ -43,6 +45,8 @@ export type RollupBucket = 'hour' | 'day';
 
 /** Window of observations (by periodStart) to roll up. Aligned outwards to whole buckets. */
 export interface RollupRequest {
+  /** Rolls up the observations of this workspace only. */
+  workspaceId: string;
   bucket: RollupBucket;
   from: string;
   to: string;
@@ -82,6 +86,7 @@ export interface MetricRollup {
 }
 
 export interface RollupFilter {
+  workspaceId: string;
   bucket: RollupBucket;
   platform?: MetricPlatform;
   accountId?: string;
@@ -111,6 +116,7 @@ export interface AccountRef {
  * always part of the group.
  */
 export interface RollupAggregateFilter {
+  workspaceId: string;
   bucket: RollupBucket;
   from: string;
   to: string;

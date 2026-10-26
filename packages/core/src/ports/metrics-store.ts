@@ -1,6 +1,10 @@
 /**
  * MetricsStore port: normalised ad-platform observations with revisions, and
  * rollups derived from them.
+ *
+ * Every method is scoped to one workspace (`workspaceId`, required, injected by trusted code):
+ * the same platform account in two workspaces is two independent series, and nothing a caller
+ * passes can read or replace another workspace's rows.
  */
 
 import type {
@@ -19,12 +23,12 @@ import type {
 
 export interface MetricsStore {
   /**
-   * Upsert by key (platform, accountId, campaignId, adsetId, adId, granularity,
+   * Upsert into `workspaceId` by key (platform, accountId, campaignId, adsetId, adId, granularity,
    * periodStart). An observation replaces the stored one when its revision is
    * greater than or equal to it; a lower revision is skipped as stale. If a
    * batch repeats a key, the highest revision wins.
    */
-  upsertObservations(observations: MetricObservation[]): Promise<UpsertResult>;
+  upsertObservations(workspaceId: string, observations: MetricObservation[]): Promise<UpsertResult>;
   /** Latest revision per key, ordered by periodStart ascending. */
   queryObservations(filter: MetricObservationFilter): Promise<MetricObservation[]>;
   /**
@@ -43,17 +47,17 @@ export interface MetricsStore {
    */
   aggregateRollups(filter: RollupAggregateFilter): Promise<MetricAggregate[]>;
   /**
-   * The span of observations written (or rewritten) after `since` (an earlier
+   * The span of observations of `workspaceId` written (or rewritten) after `since` (an earlier
    * `watermark`; omit for everything), or null when there are none. Tells the
    * rollup process which window to recompute.
    */
-  changedSince(since?: string): Promise<ChangedWindow | null>;
+  changedSince(workspaceId: string, since?: string): Promise<ChangedWindow | null>;
   /**
    * How recent the data of the given accounts is: the last rollup computation and the last
    * time an observation was fetched from the ad platform. Both null when there is no data.
    * An empty account list sees nothing.
    */
-  getFreshness(accounts: readonly AccountRef[]): Promise<MetricsFreshness>;
+  getFreshness(workspaceId: string, accounts: readonly AccountRef[]): Promise<MetricsFreshness>;
   /** Throws if the backing service is unreachable. */
   ping(): Promise<void>;
   close(): Promise<void>;

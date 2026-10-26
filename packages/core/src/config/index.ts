@@ -30,6 +30,21 @@ export const envSchema = z.object({
   CHECKPOINT_STORE: nonEmpty('clickhouse'),
   QUARANTINE_STORE: nonEmpty('clickhouse'),
   AUDIT_CONTENT_STORE: nonEmpty('clickhouse'),
+  // Signed heads of the hash chains, kept OUTSIDE the audit store so deleting the newest events is detectable (`tail_truncated`).
+  // `postgres` needs ANCHOR_DATABASE_URL (a database the audit store's credentials cannot reach). Used by audit-consumer and audit-api.
+  ANCHOR_STORE: nonEmpty('memory'),
+  // HMAC key that signs the anchors. Required (at least 32 characters) in production; outside production an empty key falls back to a fixed development key.
+  ANCHOR_HMAC_KEY: z.string().default(''),
+  ANCHOR_DATABASE_URL: z.string().default(''),
+  // Exclusive claims (leases) that keep replicas from doing the same work at once: one sync per ad account (metrics-ingester), one rollup run
+  // per workspace (rollup), one writer per workspace chain (audit-consumer). `redis` (uses REDIS_URL) is shared by every replica; `memory` is per process.
+  LEASE_STORE: nonEmpty('memory'),
+  // The in-memory adapters lose everything on restart and are per process: they refuse to start in production
+  // unless this is true (a deliberate, temporary opt-in, for example a smoke test of a production image).
+  ALLOW_IN_MEMORY_ADAPTERS: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((v) => v === 'true'),
 
   // Raw text of audit events (AuditEvent.content). Off by default: the consumer then drops it (never stored, no
   // digest) and the read API never returns it. On: the consumer stores it in AUDIT_CONTENT_STORE and the API serves it to admins.
@@ -51,6 +66,8 @@ export const envSchema = z.object({
 
   // Audit consumer
   CONSUMER_RECLAIM_INTERVAL_MS: positiveInt(30000),
+  // How long the audit-consumer's per-workspace write lease (LEASE_STORE) lives without being renewed; one batch is written well within it.
+  CONSUMER_LEASE_TTL_MS: positiveInt(30000),
   CONSUMER_RETRY_BASE_MS: positiveInt(500),
   CONSUMER_RETRY_MAX_MS: positiveInt(30000),
   SELF_AUDIT_ENABLED: z
@@ -134,6 +151,14 @@ export const envSchema = z.object({
   CLICKHOUSE_PASSWORD: z.string().default(''),
   CLICKHOUSE_DATABASE: z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/).default('proba_audit'),
   CLICKHOUSE_MIGRATIONS_DIR: nonEmpty('migrations/clickhouse'),
+  // Least-privilege ClickHouse users (scripts/clickhouse-roles.sql). Each role falls back to CLICKHOUSE_USER /
+  // CLICKHOUSE_PASSWORD when its own user is not set, so a single-user local stack keeps working.
+  CLICKHOUSE_CONSUMER_USER: z.string().min(1).optional(),
+  CLICKHOUSE_CONSUMER_PASSWORD: z.string().min(1).optional(),
+  CLICKHOUSE_API_USER: z.string().min(1).optional(),
+  CLICKHOUSE_API_PASSWORD: z.string().min(1).optional(),
+  CLICKHOUSE_MIGRATOR_USER: z.string().min(1).optional(),
+  CLICKHOUSE_MIGRATOR_PASSWORD: z.string().min(1).optional(),
 });
 
 export type Env = z.infer<typeof envSchema>;
@@ -191,6 +216,17 @@ export function parseCorsOrigins(value: string): string[] {
   return origins;
 }
 
+/**
+ * The ClickHouse users a process connects as: `consumer` writes (audit-consumer, metrics-ingester, rollup: INSERT and SELECT),
+ * `api` only reads (audit-api: SELECT), `migrator` changes the schema (`npm run migrate`: DDL).
+ */
+export type ClickHouseRole = 'consumer' | 'api' | 'migrator';
+
+export interface ClickHouseCredentials {
+  username: string;
+  password: string;
+}
+
 export interface AppConfig {
   env: Env['NODE_ENV'];
   isDevelopment: boolean;
@@ -206,7 +242,13 @@ export interface AppConfig {
     checkpointStore: string;
     quarantineStore: string;
     auditContentStore: string;
+    anchorStore: string;
+    leaseStore: string;
   };
+  /** Chain anchors (ANCHOR_STORE): the key that signs them and the database of the `postgres` adapter. */
+  anchors: { hmacKey: string; databaseUrl: string };
+  /** Explicit opt-in to run in-memory adapters when NODE_ENV=production (see InMemoryAdaptersNotAllowedError). */
+  allowInMemoryAdapters: boolean;
   /** Raw text of audit events: stored by the consumer and served (to admins) by the API only when enabled. */
   content: { enabled: boolean };
   eventBus: {
@@ -223,6 +265,8 @@ export interface AppConfig {
   consumer: {
     /** How often the consumer reclaims pending messages of crashed consumers. */
     reclaimIntervalMs: number;
+    /** TTL of the per-workspace write lease (LEASE_STORE). */
+    leaseTtlMs: number;
     /** Backoff between retries of a batch the store rejected (doubles up to the max). */
     retryBaseMs: number;
     retryMaxMs: number;
@@ -276,6 +320,8 @@ export interface AppConfig {
     password: string;
     database: string;
     migrationsDir: string;
+    /** Credentials per role; each equals username/password above when the role has no user of its own. */
+    roles: Record<ClickHouseRole, ClickHouseCredentials>;
   };
 }
 
@@ -375,6 +421,19 @@ export function loadConfig(env: EnvSource = process.env, options: LoadConfigOpti
   } catch (err) {
     issues.push(`AUDIT_API_CORS_ORIGINS: ${(err as Error).message}`);
   }
+  const roleCredentials = (role: string, user: string | undefined, password: string | undefined): ClickHouseCredentials => {
+    if (user === undefined) {
+      if (password !== undefined) issues.push(`CLICKHOUSE_${role}_PASSWORD: set without CLICKHOUSE_${role}_USER`);
+      return { username: e.CLICKHOUSE_USER, password: e.CLICKHOUSE_PASSWORD };
+    }
+    if (password === undefined) issues.push(`CLICKHOUSE_${role}_PASSWORD: required when CLICKHOUSE_${role}_USER is set`);
+    return { username: user, password: password ?? '' };
+  };
+  const clickhouseRoles: Record<ClickHouseRole, ClickHouseCredentials> = {
+    consumer: roleCredentials('CONSUMER', e.CLICKHOUSE_CONSUMER_USER, e.CLICKHOUSE_CONSUMER_PASSWORD),
+    api: roleCredentials('API', e.CLICKHOUSE_API_USER, e.CLICKHOUSE_API_PASSWORD),
+    migrator: roleCredentials('MIGRATOR', e.CLICKHOUSE_MIGRATOR_USER, e.CLICKHOUSE_MIGRATOR_PASSWORD),
+  };
   if (issues.length > 0) throw new ConfigError(issues);
 
   return {
@@ -395,7 +454,11 @@ export function loadConfig(env: EnvSource = process.env, options: LoadConfigOpti
       checkpointStore: e.CHECKPOINT_STORE,
       quarantineStore: e.QUARANTINE_STORE,
       auditContentStore: e.AUDIT_CONTENT_STORE,
+      anchorStore: e.ANCHOR_STORE,
+      leaseStore: e.LEASE_STORE,
     },
+    anchors: { hmacKey: e.ANCHOR_HMAC_KEY, databaseUrl: e.ANCHOR_DATABASE_URL },
+    allowInMemoryAdapters: e.ALLOW_IN_MEMORY_ADAPTERS,
     content: { enabled: e.AUDIT_CONTENT_ENABLED },
     eventBus: {
       redisUrl: e.REDIS_URL,
@@ -414,6 +477,7 @@ export function loadConfig(env: EnvSource = process.env, options: LoadConfigOpti
       retryMaxMs: e.CONSUMER_RETRY_MAX_MS,
       selfAudit: e.SELF_AUDIT_ENABLED,
       selfAuditWorkspaceId: e.SELF_AUDIT_WORKSPACE_ID,
+      leaseTtlMs: e.CONSUMER_LEASE_TTL_MS,
     },
     connectors: {
       pairs,
@@ -470,6 +534,7 @@ export function loadConfig(env: EnvSource = process.env, options: LoadConfigOpti
       password: e.CLICKHOUSE_PASSWORD,
       database: e.CLICKHOUSE_DATABASE,
       migrationsDir: e.CLICKHOUSE_MIGRATIONS_DIR,
+      roles: clickhouseRoles,
     },
   };
 }
@@ -495,6 +560,7 @@ function redactUrl(url: string): string {
 export function redactConfig(config: AppConfig): Record<string, unknown> {
   return {
     ...config,
+    anchors: { hmacKey: config.anchors.hmacKey ? '[REDACTED]' : '', databaseUrl: config.anchors.databaseUrl ? redactUrl(config.anchors.databaseUrl) : '' },
     // Tokens are credentials: the log shows how many are configured, never the values.
     api: { ...config.api, staticTokens: config.api.staticTokens.map(() => '[REDACTED]') },
     eventBus: { ...config.eventBus, redisUrl: redactUrl(config.eventBus.redisUrl) },
@@ -502,6 +568,9 @@ export function redactConfig(config: AppConfig): Record<string, unknown> {
       ...config.clickhouse,
       url: redactUrl(config.clickhouse.url),
       password: config.clickhouse.password ? '[REDACTED]' : '',
+      roles: Object.fromEntries(
+        Object.entries(config.clickhouse.roles).map(([role, c]) => [role, { username: c.username, password: c.password ? '[REDACTED]' : '' }])
+      ),
     },
   };
 }

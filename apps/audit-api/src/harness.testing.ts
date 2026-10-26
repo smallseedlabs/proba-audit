@@ -20,6 +20,7 @@ import {
   type Subscription,
 } from '@smallseedlabs/proba-audit-core';
 import {
+  InMemoryAnchorStore,
   InMemoryAuditContentStore,
   InMemoryAuditStore,
   InMemoryEventBus,
@@ -87,6 +88,7 @@ export interface Harness {
   config: AppConfig;
   store: InMemoryAuditStore;
   contentStore: InMemoryAuditContentStore;
+  anchors: InMemoryAnchorStore;
   metrics: InMemoryMetricsStore;
   bus: InMemoryEventBus;
   logger: MemoryLogger;
@@ -104,6 +106,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
   const logger = new MemoryLogger();
   const store = new InMemoryAuditStore();
   const contentStore = new InMemoryAuditContentStore();
+  const anchors = new InMemoryAnchorStore({ hmacKey: 'api-harness-anchor-key-0123456789-0123456789' });
   const metrics = new InMemoryMetricsStore(clock);
   const bus = new InMemoryEventBus(clock);
   const limiter = options.limiter ?? new InMemoryRateLimiter(clock);
@@ -117,6 +120,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
     limiter,
     auditStore: store,
     auditContentStore: contentStore,
+    anchorStore: anchors,
     metricsStore: metrics,
     scope: createStaticScope(WORKSPACE, config.api.analyticsAccounts).resolve,
     emitter: options.emitter ? options.emitter(bus, strict) : strict,
@@ -130,6 +134,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
     config,
     store,
     contentStore,
+    anchors,
     metrics,
     bus,
     logger,

@@ -236,11 +236,8 @@ export class InMemoryAuditStore implements AuditStore {
     return { facets, truncated };
   }
 
-  async getTrace(
-    traceId: string,
-    options: { workspaceId?: string; limit?: number } = {}
-  ): Promise<StoredAuditEvent[]> {
-    return this.query({ traceId, workspaceId: options.workspaceId, order: 'asc', limit: options.limit });
+  async getTrace(workspaceId: string, traceId: string, options: { limit?: number } = {}): Promise<StoredAuditEvent[]> {
+    return this.query({ traceId, workspaceId, order: 'asc', limit: options.limit });
   }
 
   async aggregate(query: AuditAggregateQuery): Promise<AuditAggregateRow[]> {
@@ -281,6 +278,12 @@ export class InMemoryAuditStore implements AuditStore {
       }
     }
     return head ? { eventId: head.eventId, hash: head.hash, ingestedAt: head.ingestedAt } : null;
+  }
+
+  async countEvents(workspaceId: string): Promise<number> {
+    let n = 0;
+    for (const e of this.events.values()) if (e.workspaceId === workspaceId) n += 1;
+    return n;
   }
 
   async ping(): Promise<void> {

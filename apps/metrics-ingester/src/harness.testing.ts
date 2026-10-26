@@ -4,11 +4,13 @@ import {
   type AuditEmitter,
   type AuditEvent,
   type CheckpointStore,
+  type LeaseStore,
   type MetricsStore,
   type QuarantineStore,
 } from '@smallseedlabs/proba-audit-core';
 import {
   InMemoryCheckpointStore,
+  InMemoryLeaseStore,
   InMemoryMetricsStore,
   InMemoryQuarantineStore,
   ManualClock,
@@ -43,6 +45,9 @@ export interface HarnessOptions {
   metricsStore?: MetricsStore;
   checkpoints?: CheckpointStore;
   quarantine?: QuarantineStore;
+  /** Share one LeaseStore between two harnesses to test two replicas. */
+  leases?: LeaseStore;
+  ownerId?: string;
   engine?: Partial<SyncEngineOptions>;
   scheduler?: Partial<SchedulerOptions>;
   stub?: Partial<ConstructorParameters<typeof StubPlatformConnector>[0]>;
@@ -89,10 +94,13 @@ export function makeHarness(options: HarnessOptions = {}) {
       ...options.engine,
     },
   });
+  const leases = options.leases ?? new InMemoryLeaseStore(clock);
   const connectors = new Map([['meta' as const, connector]]);
   const scheduler = new IngestScheduler({
     connectors,
     engine,
+    leases,
+    ownerId: options.ownerId ?? 'ingester-1',
     clock,
     logger,
     random: () => 0.5,
@@ -106,7 +114,7 @@ export function makeHarness(options: HarnessOptions = {}) {
       ...options.scheduler,
     },
   });
-  return { clock, ids, logger, emitter, metricsStore, checkpoints, quarantine, sleeps, connector, engine, scheduler, connectors };
+  return { clock, ids, logger, emitter, metricsStore, checkpoints, quarantine, leases, sleeps, connector, engine, scheduler, connectors };
 }
 
 export type Harness = ReturnType<typeof makeHarness>;

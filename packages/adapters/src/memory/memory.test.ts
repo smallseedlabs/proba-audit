@@ -62,9 +62,9 @@ describe('InMemory stores copy data', () => {
   it('metrics store stamps rollups with the injected clock', async () => {
     const clock = new ManualClock('2026-11-01T00:00:00.000Z');
     const store = new InMemoryMetricsStore(clock);
-    await store.upsertObservations([makeObservation({ accountId: 'a' })]);
-    await store.computeRollups({ bucket: 'hour', from: '2026-10-25T10:00:00.000Z', to: '2026-10-25T11:00:00.000Z' });
-    const [r] = await store.queryRollups({ bucket: 'hour', accountId: 'a' });
+    await store.upsertObservations('ws_1', [makeObservation({ accountId: 'a' })]);
+    await store.computeRollups({ workspaceId: 'ws_1', bucket: 'hour', from: '2026-10-25T10:00:00.000Z', to: '2026-10-25T11:00:00.000Z' });
+    const [r] = await store.queryRollups({ workspaceId: 'ws_1', bucket: 'hour', accountId: 'a' });
     expect(r.computedAt).toBe('2026-11-01T00:00:00.000Z');
   });
 });

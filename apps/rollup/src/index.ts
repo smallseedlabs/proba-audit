@@ -7,14 +7,14 @@ let worker: RollupWorker | undefined;
 
 /**
  * rollup: recomputes the hourly and daily rollups for whatever changed in the
- * observations (new periods and restatements). Run ONE replica.
+ * observations (new periods and restatements). One run at a time across replicas (LEASE_STORE); with the memory lease store run ONE replica.
  */
 runService({
   name: 'rollup',
   defaultPort: 3103,
   async onStart({ config, logger }) {
-    runtime = await createRuntime(config, { logger });
-    await Promise.all([runtime.metricsStore.ping(), runtime.checkpointStore.ping(), runtime.eventBus.ping()]);
+    runtime = await createRuntime(config, { logger, clickhouseRole: 'consumer', usesLeases: true });
+    await Promise.all([runtime.metricsStore.ping(), runtime.checkpointStore.ping(), runtime.eventBus.ping(), runtime.leaseStore!.ping()]);
     const emitter = createBusAuditEmitter({
       bus: runtime.eventBus,
       topic: config.eventBus.auditTopic,
@@ -28,6 +28,8 @@ runService({
     worker = new RollupWorker({
       metricsStore: runtime.metricsStore,
       checkpoints: runtime.checkpointStore,
+      leases: runtime.leaseStore!,
+      ownerId: runtime.instanceId,
       emitter,
       clock: runtime.clock,
       ids: runtime.ids,

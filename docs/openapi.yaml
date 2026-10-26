@@ -686,11 +686,21 @@ components:
             properties:
               type:
                 type: string
-                enum: [invalid_event, workspace_mismatch, hash_mismatch, broken_link, bad_genesis, non_monotonic_ingested_at, content_mismatch]
+                enum: [invalid_event, workspace_mismatch, hash_mismatch, broken_link, bad_genesis, non_monotonic_ingested_at, content_mismatch, tail_truncated, anchor_invalid]
               eventId: { type: string }
               detail: { type: string }
         complete: { type: boolean }
         truncated: { type: boolean, description: Present (true) when the event bound stopped verification early. }
+        anchor:
+          type: object
+          description: >-
+            Present when the workspace has a signed chain anchor. `checked` is false when this request could not compare with it
+            (its head is outside the range, or verification stopped early). A chain shorter than the anchor, or without the anchored head, is reported as `tail_truncated`.
+          required: [checked, count, timestamp]
+          properties:
+            checked: { type: boolean }
+            count: { type: integer, description: Events the chain had when the anchor was written. }
+            timestamp: { type: string, format: date-time, description: ingestedAt of the anchored head. }
         content:
           type: object
           description: Present when raw text is enabled. Text removed by retention counts as `missing`, not as a problem.

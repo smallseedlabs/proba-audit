@@ -73,6 +73,8 @@ The adapter for each port is chosen by an environment variable and created throu
 | `AuditStore` | `ClickHouseAuditStore` (`clickhouse`) | `InMemoryAuditStore` (`memory`) | `AUDIT_STORE` | `runAuditStoreContract` |
 | `AuditEmitter` | `createBusAuditEmitter` (publishes to the bus), `createOutboxAuditEmitter` (writes to an outbox) | any `AuditSender` via `createAuditEmitter` | code | unit tests in `audit-pipeline.test.ts` |
 | `OutboxStore` | `PostgresOutboxStore` (lives in the emitting service's database) | `InMemoryOutboxStore` | code (the service owns its DB) | `runOutboxStoreContract` |
+| `AnchorStore` | `PostgresAnchorStore` (`postgres`, a database the audit store's credentials cannot reach) | `InMemoryAnchorStore` (`memory`, the default outside production) | `ANCHOR_STORE`, `ANCHOR_HMAC_KEY`, `ANCHOR_DATABASE_URL` | `runAnchorStoreContract` |
+| `LeaseStore` | `RedisLeaseStore` (`redis`, shared by every replica) | `InMemoryLeaseStore` (`memory`, per process) | `LEASE_STORE`, `CONSUMER_LEASE_TTL_MS` | `runLeaseStoreContract` |
 | `MetricsStore` | `ClickHouseMetricsStore` (`clickhouse`) | `InMemoryMetricsStore` (`memory`) | `METRICS_STORE` | `runMetricsStoreContract` |
 | `Clock` | `SystemClock` | `ManualClock` | code (`createRuntime` option) | `runClockContract` |
 | `IdGenerator` | `RandomIdGenerator` | `SequentialIdGenerator` | code (`createRuntime` option) | `runIdGeneratorContract` |
@@ -94,6 +96,31 @@ The adapter for each port is chosen by an environment variable and created throu
 
 No config schema change is needed: adapter names are plain strings, checked against the registry at startup
 (an unknown name fails with the list of available adapters). No app code changes either, because apps only see ports.
+
+### In-memory adapters in production
+
+Every port has a `memory` adapter for tests and local runs. It keeps data in the process: gone on restart, invisible to other replicas.
+Like the stub connector, it is refused in production: when `NODE_ENV=production` and any of `EVENT_BUS`, `AUDIT_STORE`, `METRICS_STORE`,
+`CHECKPOINT_STORE`, `QUARANTINE_STORE`, `AUDIT_CONTENT_STORE` (and, for `audit-api`, `AUDIT_API_RATE_LIMITER`; for `audit-consumer` and `audit-api`, `ANCHOR_STORE`; for `audit-consumer`, `metrics-ingester` and `rollup`, `LEASE_STORE`) is `memory`, `createRuntime`
+throws `InMemoryAdaptersNotAllowedError` (listing the offending variables) before creating anything, and the process exits. `ALLOW_IN_MEMORY_ADAPTERS=true`
+is the deliberate opt-in (default `false`). Outside production nothing changes. The guard is keyed on the registry name `memory`; an adapter you register
+under another name is your responsibility.
+
+### ClickHouse privileges
+
+One ClickHouse user for everything would let the read API (internet-facing) rewrite or drop the audit trail. Three roles, each with the least it needs
+(`scripts/clickhouse-roles.sql` creates them; run it once per environment as an admin, after `npm run migrate`):
+
+| Role | Used by | Grants |
+|------|---------|--------|
+| `consumer` (`CLICKHOUSE_CONSUMER_USER` / `_PASSWORD`) | audit-consumer, metrics-ingester, rollup | `INSERT` + `SELECT` on the audit and metrics tables (`CheckpointStore.delete` is not granted: only tests and tools use it). No `UPDATE`, `DELETE`, `DROP`, `TRUNCATE` or DDL. |
+| `api` (`CLICKHOUSE_API_USER` / `_PASSWORD`) | audit-api, `metrics-report` | `SELECT` only. |
+| `migrator` (`CLICKHOUSE_MIGRATOR_USER` / `_PASSWORD`) | `npm run migrate` | DDL on the database. Nothing else uses it. |
+
+Each process picks its role through `createRuntime(config, { clickhouseRole })`; `clickHouseOptionsFor(config, role)` resolves the credentials. A role without its own
+user **falls back to `CLICKHOUSE_USER` / `CLICKHOUSE_PASSWORD`**, so the single-user local docker stack works without applying the SQL. A role user without a password (or the reverse) is a
+configuration error. Role passwords are redacted from the logged config. A migration that adds a table needs a matching `GRANT` in the roles script. This limits what a compromised
+process can do to the audit trail, but the consumer can still insert rows: the hash chain and the anchor (below) are what make tampering visible.
 
 ### EventBus delivery model
 
@@ -156,14 +183,41 @@ redelivered event is recognised as an identical duplicate. ClickHouse `audit_eve
 - **Storage precision:** before hashing, `occurredAt` is rounded to milliseconds and `cost.amount` to 8 decimals (the ClickHouse column types), so a stored event hashes the same after it is read back.
 - **Head cache:** the consumer keeps `{ hash, ingestedAt }` per workspace in memory, filled from `AuditStore.getChainHead` the first time a workspace is seen after a start, and only advanced after a successful write.
 - **Raw text (`content`, protocol 0.3.3):** the text is never part of `audit_events`. With `AUDIT_CONTENT_ENABLED=true` the consumer writes it to a separate `AuditContentStore` (ClickHouse table `audit_event_content`, keyed by workspace + event, migration 0008, memory adapter for tests) *before* the event row, and the event keeps only `contentDigest` = sha256 of the canonical text (`kind`, `text`, `truncated`, `originalLength`, `redactions`). The digest is a stored field, so it is covered by `hash`: changing the digest breaks the hash, changing the text no longer matches the digest (`content_mismatch`). Because the chain holds only the digest, the text table can have its own TTL / partition drops and its own grants without invalidating the chain; text missing for an event with a digest counts as "missing" (retention), not as a failure. With the flag off the text is dropped on ingest (logged as a warning with a count, never the text). A redelivery rewrites the text row idempotently, which also heals a crash between the two writes.
-- **Verification:** `verifyChain(store, workspaceId, range?, options?)` (`packages/core/src/audit/verify-chain.ts`) pages through `AuditStore.readChain` and checks, per event: protocol schema, workspace, recomputed hash, `prevHash` link, and strictly increasing `ingestedAt`. With no `range.from` the first event must be the genesis; with one it must follow the real predecessor. It returns `{ ok, checked, problems[], lastHash, ... }` with problem types `hash_mismatch`, `broken_link`, `bad_genesis`, `non_monotonic_ingested_at`, `invalid_event`, `workspace_mismatch`, and, when a content store is given, `content_mismatch` plus `content: { checked, missing }`. ClickHouse has no index on `ingested_at`, so run it as a maintenance job, not per request.
+- **Verification:** `verifyChain(store, workspaceId, range?, options?)` (`packages/core/src/audit/verify-chain.ts`) pages through `AuditStore.readChain` and checks, per event: protocol schema, workspace, recomputed hash, `prevHash` link, and strictly increasing `ingestedAt`. With no `range.from` the first event must be the genesis; with one it must follow the real predecessor. It returns `{ ok, checked, problems[], lastHash, ... }` with problem types `hash_mismatch`, `broken_link`, `bad_genesis`, `non_monotonic_ingested_at`, `invalid_event`, `workspace_mismatch`, and, when a content store is given, `content_mismatch` plus `content: { checked, missing }`, and, when an anchor store is given, `tail_truncated` and `anchor_invalid` plus `anchor: { checked, count, timestamp }` (see Chain anchors). ClickHouse has no index on `ingested_at`, so run it as a maintenance job, not per request.
 
-### Single writer
+### Chain anchors
 
-The cached heads are only correct while **one consumer instance writes** to the store. Run **one `audit-consumer` replica** (scale the
-work with bigger batches, not more replicas). The consumer detects one symptom of a second writer (the store accepted fewer events
-than it chained), logs `chain integrity risk`, and drops its cached heads; `verifyChain` finds any gap. Making several consumers
-safe (partitioning streams by workspace, or a lease per workspace) is a separate design.
+A hash chain proves that no event was edited and that none was removed from the middle (`hash_mismatch`, `broken_link`). It cannot prove that the **newest** events were not deleted: the shorter chain is still a valid chain. The anchor closes that gap.
+
+- **What it is:** per workspace, the latest chain head `{ workspaceId, headHash, count, timestamp }` (`timestamp` = `ingestedAt` of the head event) plus an HMAC-SHA256 `signature` over `proba.anchor.v1\n<workspaceId>\n<headHash>\n<count>\n<timestamp>` (`packages/core/src/domain/anchor.ts`).
+- **Where it lives:** the `AnchorStore` port, outside the audit store, with a different credential (`ANCHOR_STORE=postgres` + `ANCHOR_DATABASE_URL`; table `audit_chain_anchors`, `migrations/postgres/0002_audit_chain_anchors.sql`, also created on first use). The adapter holds the signing key (`ANCHOR_HMAC_KEY`), signs on `put` and verifies on `get` (`AnchorTamperedError`). An anchor never goes backwards: a `put` with a lower `count` than the stored one changes nothing.
+- **Who writes it:** `audit-consumer`, after `appendBatch` made a batch durable: one anchor per workspace written to, with the chain length (counted once per workspace with `AuditStore.countEvents`, then carried forward). If the anchor store is down, ingestion goes on (losing an audit event is worse than a late anchor); the failure is logged at error level, the anchor stays pending and is written with the next batch. If a stored anchor is *ahead* of the chain (`chain integrity risk: the anchor is ahead of the chain`), the consumer logs it: events were deleted.
+- **Who checks it:** `verifyChain` with `options.anchorStore` (`audit-api`'s `GET /v1/chain/verify` passes it). An anchor is written after the events it covers, so a live chain **longer** than the anchor is normal; the anchored head must still be in the chain with the same hash, and a whole-chain verification (no range) must find at least `count` events. Otherwise: `tail_truncated`. A signature that does not verify (changed, or another key) is `anchor_invalid`. The anchor is compared only when verification walked up to the end of the range, the anchored head lies inside the range, and nothing stopped it early (`maxEvents`, `maxProblems`); otherwise `anchor.checked` is `false`. The count is compared only without a range, so the API (which always has a range) detects a missing or replaced head, and a maintenance run of `verifyChain` over the whole chain also detects a shorter chain.
+- **Key handling:** with `NODE_ENV=production`, `audit-consumer` and `audit-api` refuse to start without `ANCHOR_HMAC_KEY` of at least 32 characters (and not the development key), and refuse `ANCHOR_STORE=memory` (unless `ALLOW_IN_MEMORY_ADAPTERS=true`). Outside production an empty key uses a fixed development key. Whoever holds the key and can write the anchor store can forge anchors: keep the key out of the audit store's environment, give the anchor database its own user, and rotate by re-anchoring.
+- **Limits:** an attacker who deletes events *and* can rewrite the anchor store with the key defeats it; anchors written before the feature existed are absent, so the first batch after upgrade creates the first anchor from the live chain (deletions before that are not detectable).
+
+### Single writer, and several consumers with leases
+
+The consumer caches the chain head of each workspace, which is only correct while **one instance writes** to a workspace. There are two modes:
+
+- **One replica, memory `LEASE_STORE`** (the local default): run **one `audit-consumer`** (scale with bigger batches, not more replicas). The consumer detects one symptom of a second
+  writer (the store accepted fewer events than it chained), logs `chain integrity risk` and drops its cached heads; `verifyChain` finds any gap. In production the memory lease store is refused
+  (`InMemoryAdaptersNotAllowedError`, `LEASE_STORE`) unless `ALLOW_IN_MEMORY_ADAPTERS=true`, because it cannot keep replicas apart.
+- **Several replicas, shared `LEASE_STORE=redis`:** before processing a batch every instance takes one lease per workspace the batch names (`audit-consumer:workspace:<workspaceId>`, TTL
+  `CONSUMER_LEASE_TTL_MS`, default 30 s, all-or-none, in sorted order), and gives them back afterwards, also when the batch fails. Only one instance chains and writes a workspace at a time.
+  Under a lease the cache is not trusted: heads and chain counts are read from the store again for each batch, because another instance may have written since. A lease held by another
+  instance fails the batch with `LeaseHeldError`: nothing is acknowledged, the batch is retried with backoff (no delivery-count growth), so contention costs latency, never events. Just before the write
+  the leases are renewed; a lease that was lost (batch slower than the TTL, taken over) fails the batch with `LeaseLostError` and writes nothing. If the lease store is down the batch fails the same way
+  (fails closed). The consumer group already hands each message to one instance; the lease is what serialises the chain.
+
+### Leases (`LeaseStore`)
+
+`tryAcquire(key, ownerId, ttlMs)` (never waits, **not re-entrant**: the owner is refused too while its lease is live), `release(key, ownerId)` (only the owner), optional `renew(key, ownerId, ttlMs)`, `ping`, `close`.
+A lease expires by itself after its TTL, so a crashed or hung owner cannot block a key for ever. Each process owns its leases under `Runtime.instanceId` (service, host, pid and a random part), so a restarted
+process never inherits those of its predecessor. Adapters: `memory` (per object; tests and one local process) and `redis` (`SET key owner NX PX ttl`, compare-and-delete and compare-and-expire scripts; keys
+`proba:audit:lease:<key>`, uses `REDIS_URL`). The Redis adapter fails **closed**: if Redis cannot be reached the call throws and the work that needs exclusivity is not started. A single Redis is not a consensus system:
+after a failover that loses the write, two owners could briefly hold a key. What the leases protect is idempotent or re-verifiable (metrics are revision-ordered, a chain is checked by `verifyChain`
+and anchors), so they are an efficiency and consistency aid, not the only defence. Users: `metrics-ingester` (`ingest:<platform>:<accountId>`), `rollup` (`rollup:<workspaceId>`), `audit-consumer` (above).
 
 ### Self-audit
 
@@ -202,6 +256,10 @@ Everything is structured JSON through the `Logger` port. Batch lines carry `batc
 | Same `eventId`, different content | not written, dead-lettered with reason, error log, `system.audit_event_dead_lettered` event |
 | Invalid event | dead-lettered with reason |
 | Bus failure in the relay | rows marked failed, retried after the lease |
+| Lease store down | audit-consumer: batch retried with backoff, nothing acked; metrics-ingester and rollup: the run is skipped and tried again at the next interval |
+| Another instance holds a workspace lease | audit-consumer: `LeaseHeldError`, batch retried with backoff, nothing acked |
+| Anchor store down | ingestion continues, `chain anchor not stored; will retry with the next batch` at error level, anchor written with the next batch |
+| Newest events deleted from ClickHouse | `verifyChain` reports `tail_truncated`; the consumer logs `the anchor is ahead of the chain` on its next write |
 
 ## Metrics flow
 
@@ -268,10 +326,11 @@ every `INGEST_INTERVAL_MS` (60 s by default; `INGEST_INTERVAL_OVERRIDES=meta:300
 `INGEST_JITTER_RATIO` jitter. After failures the delay doubles up to `INGEST_FAILURE_BACKOFF_MAX_MS`, and never goes below a platform's
 rate-limit hint. Accounts are re-listed every `INGEST_ACCOUNT_REFRESH_MS`.
 
-**Overlap protection and the single-instance assumption.** A lease per (platform, account) prevents two runs of one account at the same
-time; a lease expires after a few intervals so a hung run cannot block the account. The lease lives in the process: **run one
-`metrics-ingester` replica** (and one `rollup`). A second replica would not corrupt anything (runs are idempotent and revision-ordered)
-but would pull every window twice and waste platform quota. Scaling out later needs a shared lease (Redis) behind the same `LeaseTable` shape.
+**Overlap protection.** A lease per (platform, account) (`ingest:<platform>:<accountId>`, `LeaseStore`) prevents two runs of one account at the same
+time; it expires after a few intervals (`max(5 x interval, 5 min)`) so a hung run cannot block the account. With `LEASE_STORE=redis` that holds across replicas: several `metrics-ingester` replicas
+can run, each schedules every account, and a sync only runs on the replica that wins the lease at that moment (the others log `sync_skipped_overlap` and wait for their next interval), so platform
+quota is not spent twice. With the memory lease store (local default, refused in production) run one replica. If the lease store is unreachable the run is skipped (`sync_skipped_lease_unavailable`), never run without it.
+Two replicas without a shared lease would not corrupt anything (runs are idempotent and revision-ordered) but would pull every window twice.
 
 `SyncEngine.syncAccount` is one run, with its own `traceId` (also on every log line):
 
@@ -304,7 +363,7 @@ Hourly buckets are UTC hours. **Daily buckets are local days in each observation
 is the UTC instant of local midnight, `timezone` and `bucket_date` (the local calendar date) are stored, and a daily bucket is always
 summed whole (a 23- or 25-hour DST day included). `reach` is never summed (unique reach is not additive). Windows larger than
 `ROLLUP_MAX_WINDOW_DAYS` are split. The watermark (in `ingest_checkpoints`, source `rollup`) moves only after a run succeeds; each run emits `metrics.rollup_run`
-(period, rows, `durationMs`, own `traceId`). ClickHouse needs constant time zones, so daily rollups run once per zone present (zone names are validated before use).
+(period, rows, `durationMs`, own `traceId`). Runs are exclusive per workspace through the lease `rollup:<workspaceId>` (`LeaseStore`): with `LEASE_STORE=redis` a second replica reports idle while another runs; a lease held by a replica that died expires (default `max(5 x interval, 10 min)`). ClickHouse needs constant time zones, so daily rollups run once per zone present (zone names are validated before use).
 
 ### Read side (library level)
 
@@ -345,6 +404,7 @@ serves one workspace's connectors (`INGEST_WORKSPACE_ID`) until the tables get a
 | `PLATFORM_CONNECTORS` | empty | `platform:adapter` pairs, for example `meta:stub,google:stub`; empty means the ingester idles |
 | `ALLOW_STUB_CONNECTOR` | `false` | Allow the stub when `NODE_ENV=production` |
 | `CHECKPOINT_STORE`, `QUARANTINE_STORE` | `clickhouse` | `clickhouse` or `memory` (adapter registry keys) |
+| `LEASE_STORE` | `memory` | `redis` shares leases between replicas (metrics-ingester, rollup, audit-consumer); `memory` is per process and refused in production |
 | `INGEST_WORKSPACE_ID` | `seedbed` | Workspace the ingester and rollup act for |
 | `INGEST_INTERVAL_MS` / `INGEST_INTERVAL_OVERRIDES` | `60000` / empty | Interval per account; per platform overrides `meta:30000,...` |
 | `INGEST_JITTER_RATIO`, `INGEST_GRANULARITY` | `0.1`, `hour` | Spread of each delay; `hour` or `day` |

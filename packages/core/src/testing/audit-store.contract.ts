@@ -151,7 +151,7 @@ export function runAuditStoreContract(name: string, factory: () => Promise<Audit
         makeStoredAuditEvent({ workspaceId, traceId, occurredAt: t(2), action: 'brain.llm_call', category: 'brain' }),
         makeStoredAuditEvent({ workspaceId, occurredAt: t(2) }), // other trace
       ]);
-      const trace = await store.getTrace(traceId, { workspaceId });
+      const trace = await store.getTrace(workspaceId, traceId);
       expect(trace.map((e) => e.action)).toEqual(['command.received', 'brain.llm_call', 'command.processed']);
       expect(trace.every((e) => e.traceId === traceId)).toBe(true);
     });
@@ -186,6 +186,71 @@ export function runAuditStoreContract(name: string, factory: () => Promise<Audit
       await store.appendBatch([makeStoredAuditEvent({ workspaceId: a }), makeStoredAuditEvent({ workspaceId: b })]);
       expect(await store.query({ workspaceId: a })).toHaveLength(1);
       expect(await store.query({ workspaceId: b })).toHaveLength(1);
+    });
+
+    // The same trace id exists in two workspaces. Every read must return the workspace it was asked for, and an
+    // event of one workspace must be unreachable from another by id, trace, time, search, facet or chain.
+    describe('workspace isolation', () => {
+      const t = (min: number) => `2026-10-25T10:${String(min).padStart(2, '0')}:00.000Z`;
+
+      async function twoWorkspaces() {
+        const store = await create();
+        const a = uniqueName('wsa');
+        const b = uniqueName('wsb');
+        const traceId = randomUUID();
+        const ea = [1, 2].map((i) => makeStoredAuditEvent({ workspaceId: a, traceId, occurredAt: t(i), ingestedAt: t(i), service: 'svc-a', campaignId: 'cmp_a', action: 'goal.created' }));
+        const eb = [3, 4, 5].map((i) => makeStoredAuditEvent({ workspaceId: b, traceId, occurredAt: t(i), ingestedAt: t(i), service: 'svc-b', campaignId: 'cmp_b', action: 'goal.updated' }));
+        await store.appendBatch([...ea, ...eb]);
+        return { store, a, b, traceId, ea, eb };
+      }
+      const ids = (events: { eventId: string }[]) => events.map((e) => e.eventId).sort();
+
+      it('getTrace returns the trace of the workspace asked for, never the same trace id of another', async () => {
+        const { store, a, b, traceId, ea, eb } = await twoWorkspaces();
+        expect(ids(await store.getTrace(a, traceId))).toEqual(ids(ea));
+        expect(ids(await store.getTrace(b, traceId))).toEqual(ids(eb));
+        expect(await store.getTrace(uniqueName('wsc'), traceId)).toEqual([]);
+      });
+
+      it('query and aggregate stay inside the workspace in the filter, and a trace id filter does not widen it', async () => {
+        const { store, a, b, traceId, ea, eb } = await twoWorkspaces();
+        expect(ids(await store.query({ workspaceId: a, traceId }))).toEqual(ids(ea));
+        expect(ids(await store.query({ workspaceId: b, service: 'svc-a' }))).toEqual([]);
+        expect(ids(await store.query({ workspaceId: b, campaignId: 'cmp_a' }))).toEqual([]);
+        expect((await store.aggregate({ filter: { workspaceId: a, traceId }, groupBy: [] }))[0]?.count).toBe(2);
+        expect((await store.aggregate({ filter: { workspaceId: b }, groupBy: ['service'] })).map((r) => [r.keys.service, r.count])).toEqual([['svc-b', 3]]);
+        expect(ids(await store.query({ workspaceId: b }))).toEqual(ids(eb));
+      });
+
+      it('search, getEvent and findExisting do not return another workspace\'s events', async () => {
+        const { store, a, b, traceId, ea, eb } = await twoWorkspaces();
+        expect(ids((await store.search({ workspaceId: a, traceId })).events)).toEqual(ids(ea));
+        expect(ids((await store.search({ workspaceId: b, text: 'goal.created' })).events)).toEqual([]);
+        expect(await store.getEvent(a, eb[0]!.eventId)).toBeNull();
+        expect(await store.getEvent(b, ea[0]!.eventId)).toBeNull();
+        const ref = (e: (typeof ea)[number], workspaceId: string) => ({ eventId: e.eventId, workspaceId, occurredAt: e.occurredAt });
+        expect(await store.findExisting([ref(ea[0]!, b), ref(eb[0]!, a)])).toEqual([]);
+        expect(ids(await store.findExisting([ref(ea[0]!, a), ref(eb[0]!, b)]))).toEqual(ids([ea[0]!, eb[0]!]));
+      });
+
+      it('listTraces and facets summarise the workspace asked for only', async () => {
+        const { store, a, b, traceId } = await twoWorkspaces();
+        const listed = await store.listTraces({ workspaceId: a });
+        expect(listed.traces.map((x) => [x.traceId, x.eventCount])).toEqual([[traceId, 2]]);
+        expect((await store.listTraces({ workspaceId: b })).traces.map((x) => x.eventCount)).toEqual([3]);
+        const facets = await store.facets({ workspaceId: a });
+        expect(facets.facets.service).toEqual([{ value: 'svc-a', count: 2 }]);
+        expect(facets.facets.campaignId).toEqual([{ value: 'cmp_a', count: 2 }]);
+      });
+
+      it('readChain and getChainHead follow one workspace only', async () => {
+        const { store, a, b, ea, eb } = await twoWorkspaces();
+        expect(ids(await store.readChain(a))).toEqual(ids(ea));
+        expect(ids(await store.readChain(b))).toEqual(ids(eb));
+        expect((await store.getChainHead(a))?.eventId).toBe(ea[1]!.eventId);
+        expect((await store.getChainHead(b))?.eventId).toBe(eb[2]!.eventId);
+        expect(await store.getChainHead(uniqueName('wsc'))).toBeNull();
+      });
     });
 
     it('orders, limits and offsets', async () => {
@@ -254,6 +319,17 @@ export function runAuditStoreContract(name: string, factory: () => Promise<Audit
         hash: second.hash,
         ingestedAt: second.ingestedAt,
       });
+    });
+
+    it('counts the events of one workspace', async () => {
+      const store = await create();
+      const workspaceId = uniqueName('ws');
+      expect(await store.countEvents(workspaceId)).toBe(0);
+      const first = makeStoredAuditEvent({ workspaceId, ingestedAt: '2026-10-25T10:00:01.000Z' });
+      const second = makeStoredAuditEvent({ workspaceId, ingestedAt: '2026-10-25T10:00:02.000Z', prevHash: first.hash });
+      await store.appendBatch([first, second, makeStoredAuditEvent({ workspaceId: uniqueName('other') })]);
+      await store.appendBatch([first]); // an identical redelivery is not counted twice
+      expect(await store.countEvents(workspaceId)).toBe(2);
     });
 
     describe('read API', () => {

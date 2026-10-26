@@ -22,6 +22,7 @@ import { SystemClock } from '../runtime/system.js';
 const TS = (name: string) => `parseDateTime64BestEffort({${name}:String}, 3, 'UTC')`;
 
 interface ObservationRow {
+  workspace_id: string;
   platform: MetricObservation['platform'];
   account_id: string;
   campaign_id: string;
@@ -44,8 +45,9 @@ interface ObservationRow {
   source_ref: string | null;
 }
 
-export function toObservationRow(o: MetricObservation): ObservationRow {
+export function toObservationRow(workspaceId: string, o: MetricObservation): ObservationRow {
   return {
+    workspace_id: workspaceId,
     platform: o.platform,
     account_id: o.accountId,
     campaign_id: o.campaignId,
@@ -98,6 +100,7 @@ export function fromObservationRow(r: ObservationRow): MetricObservation {
 }
 
 interface RollupRow {
+  workspace_id: string;
   platform: MetricRollup['platform'];
   account_id: string;
   campaign_id: string;
@@ -152,6 +155,7 @@ interface Where {
 
 function buildWhere(
   f: {
+    workspaceId: string;
     platform?: string;
     accountId?: string;
     campaignId?: string;
@@ -164,8 +168,9 @@ function buildWhere(
   granularity: string | undefined,
   timeColumn: string
 ): Where {
-  const clauses: string[] = [];
-  const params: Record<string, unknown> = {};
+  // The workspace is not optional: every read is scoped to it.
+  const clauses: string[] = ['workspace_id = {workspaceId:String}'];
+  const params: Record<string, unknown> = { workspaceId: f.workspaceId };
   const eq = (column: string, name: string, value: string | undefined): void => {
     if (value === undefined) return;
     clauses.push(`${column} = {${name}:String}`);
@@ -185,7 +190,7 @@ function buildWhere(
     clauses.push(`${timeColumn} < ${TS('to')}`);
     params.to = f.to;
   }
-  return { sql: clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '', params };
+  return { sql: `WHERE ${clauses.join(' AND ')}`, params };
 }
 
 export interface ClickHouseMetricsStoreOptions {
@@ -226,7 +231,7 @@ export class ClickHouseMetricsStore implements MetricsStore {
     this.ownsClient = options.ownsClient ?? false;
   }
 
-  async upsertObservations(observations: MetricObservation[]): Promise<UpsertResult> {
+  async upsertObservations(workspaceId: string, observations: MetricObservation[]): Promise<UpsertResult> {
     if (observations.length === 0) return { written: 0, skippedStale: 0 };
 
     // Highest revision per key within the batch wins.
@@ -243,9 +248,11 @@ export class ClickHouseMetricsStore implements MetricsStore {
     const triples = new Map(candidates.map((o) => [`${o.platform}|${o.accountId}|${o.campaignId}`, o]));
     const stored = await this.rows<{ platform: string; account_id: string; campaign_id: string; adset_id: string; ad_id: string; granularity: string; period_start: string; revision: number }>(
       `SELECT ${KEY_COLUMNS}, revision FROM metric_observations FINAL
-       WHERE has(arrayZip({p:Array(String)}, {a:Array(String)}, {c:Array(String)}), (toString(platform), account_id, campaign_id))
+       WHERE workspace_id = {w:String}
+         AND has(arrayZip({p:Array(String)}, {a:Array(String)}, {c:Array(String)}), (toString(platform), account_id, campaign_id))
          AND period_start >= ${TS('min')} AND period_start <= ${TS('max')}`,
       {
+        w: workspaceId,
         p: [...triples.values()].map((o) => o.platform),
         a: [...triples.values()].map((o) => o.accountId),
         c: [...triples.values()].map((o) => o.campaignId),
@@ -265,7 +272,7 @@ export class ClickHouseMetricsStore implements MetricsStore {
       return current === undefined || current <= o.revision;
     });
     if (toWrite.length > 0) {
-      await this.client.insert({ table: 'metric_observations', values: toWrite.map(toObservationRow), format: 'JSONEachRow' });
+      await this.client.insert({ table: 'metric_observations', values: toWrite.map((o) => toObservationRow(workspaceId, o)), format: 'JSONEachRow' });
     }
     return { written: toWrite.length, skippedStale: candidates.length - toWrite.length };
   }
@@ -285,26 +292,27 @@ export class ClickHouseMetricsStore implements MetricsStore {
   async computeRollups(request: RollupRequest): Promise<number> {
     const { from, to } = alignWindow(request.from, request.to, request.bucket);
     const computedAt = this.clock.isoNow();
-    if (request.bucket === 'hour') return this.rollupHours(from, to, computedAt);
+    const { workspaceId } = request;
+    if (request.bucket === 'hour') return this.rollupHours(workspaceId, from, to, computedAt);
 
     // Daily buckets are local days in each observation's timezone. A ClickHouse
     // timezone argument must be a constant, so cut the days one timezone at a time.
     const zones = await this.rows<{ tz: string }>(
       `SELECT DISTINCT ifNull(timezone, 'UTC') AS tz FROM metric_observations FINAL
-       WHERE period_start >= ${TS('from')} AND period_start < ${TS('to')}`,
-      { from, to }
+       WHERE workspace_id = {workspaceId:String} AND period_start >= ${TS('from')} AND period_start < ${TS('to')}`,
+      { workspaceId, from, to }
     );
     let written = 0;
     for (const { tz } of zones) {
-      written += await this.rollupDays(isSafeTimeZone(tz) ? tz : 'UTC', from, to, computedAt);
+      written += await this.rollupDays(workspaceId, isSafeTimeZone(tz) ? tz : 'UTC', from, to, computedAt);
     }
     return written;
   }
 
-  private async rollupHours(from: string, to: string, computedAt: string): Promise<number> {
-    const params = { from, to, computedAt };
+  private async rollupHours(workspaceId: string, from: string, to: string, computedAt: string): Promise<number> {
+    const params = { workspaceId, from, to, computedAt };
     const select = `
-      SELECT platform, account_id, campaign_id, adset_id, ad_id,
+      SELECT workspace_id, platform, account_id, campaign_id, adset_id, ad_id,
              granularity AS source_granularity,
              toDateTime64(toStartOfHour(period_start, 'UTC'), 3, 'UTC') AS bucket_start,
              currency,
@@ -318,13 +326,13 @@ export class ClickHouseMetricsStore implements MetricsStore {
              ${TS('computedAt')} AS computed_at
       FROM metric_observations FINAL
       -- an hourly rollup only summarises hourly observations
-      WHERE period_start >= ${TS('from')} AND period_start < ${TS('to')} AND granularity = 'hour'
-      GROUP BY platform, account_id, campaign_id, adset_id, ad_id, source_granularity, bucket_start, currency`;
+      WHERE workspace_id = {workspaceId:String} AND period_start >= ${TS('from')} AND period_start < ${TS('to')} AND granularity = 'hour'
+      GROUP BY workspace_id, platform, account_id, campaign_id, adset_id, ad_id, source_granularity, bucket_start, currency`;
     const [{ n }] = await this.rows<{ n: number }>(`SELECT count() AS n FROM (${select})`, params);
     if (Number(n) > 0) {
       await this.client.command({
         query: `INSERT INTO metric_rollups_hourly
-                (platform, account_id, campaign_id, adset_id, ad_id, source_granularity, bucket_start, currency,
+                (workspace_id, platform, account_id, campaign_id, adset_id, ad_id, source_granularity, bucket_start, currency,
                  impressions, clicks, spend, conversions, video_views, revenue, observation_count, computed_at)
                 ${select}`,
         query_params: params,
@@ -340,20 +348,20 @@ export class ClickHouseMetricsStore implements MetricsStore {
    * names of observation columns: ClickHouse would resolve `timezone` in the WHERE
    * clause to the constant alias instead of the column.
    */
-  private async rollupDays(tz: string, from: string, to: string, computedAt: string): Promise<number> {
+  private async rollupDays(workspaceId: string, tz: string, from: string, to: string, computedAt: string): Promise<number> {
     const inZone = tz === 'UTC' ? "ifNull(timezone, 'UTC') = 'UTC'" : `timezone = '${tz}'`;
     const dayStart = `toStartOfDay(period_start, '${tz}')`;
     const [range] = await this.rows<{ lo: string; hi: string; n: number }>(
       `SELECT toDateTime64(min(${dayStart}), 3, 'UTC') AS lo, toDateTime64(max(${dayStart}), 3, 'UTC') AS hi, count() AS n
        FROM metric_observations FINAL
-       WHERE period_start >= ${TS('from')} AND period_start < ${TS('to')} AND ${inZone}`,
-      { from, to }
+       WHERE workspace_id = {workspaceId:String} AND period_start >= ${TS('from')} AND period_start < ${TS('to')} AND ${inZone}`,
+      { workspaceId, from, to }
     );
     if (!range || Number(range.n) === 0) return 0;
 
-    const params = { lo: range.lo, hi: range.hi, computedAt };
+    const params = { workspaceId, lo: range.lo, hi: range.hi, computedAt };
     const select = `
-      SELECT platform, account_id, campaign_id, adset_id, ad_id,
+      SELECT workspace_id, platform, account_id, campaign_id, adset_id, ad_id,
              granularity AS source_granularity,
              toDateTime64(${dayStart}, 3, 'UTC') AS bucket_start,
              currency,
@@ -368,16 +376,17 @@ export class ClickHouseMetricsStore implements MetricsStore {
              '${tz}' AS zone_name,
              toDate(period_start, '${tz}') AS bucket_day
       FROM metric_observations FINAL
-      WHERE ${inZone}
+      WHERE workspace_id = {workspaceId:String}
+        AND ${inZone}
         AND period_start >= ${TS('lo')}
         AND period_start < ${TS('hi')} + INTERVAL 2 DAY
-      GROUP BY platform, account_id, campaign_id, adset_id, ad_id, source_granularity, bucket_start, currency, zone_name, bucket_day
+      GROUP BY workspace_id, platform, account_id, campaign_id, adset_id, ad_id, source_granularity, bucket_start, currency, zone_name, bucket_day
       HAVING bucket_start <= ${TS('hi')}`;
     const [{ n }] = await this.rows<{ n: number }>(`SELECT count() AS n FROM (${select})`, params);
     if (Number(n) > 0) {
       await this.client.command({
         query: `INSERT INTO metric_rollups_daily
-                (platform, account_id, campaign_id, adset_id, ad_id, source_granularity, bucket_start, currency,
+                (workspace_id, platform, account_id, campaign_id, adset_id, ad_id, source_granularity, bucket_start, currency,
                  impressions, clicks, spend, conversions, video_views, revenue, observation_count, computed_at,
                  timezone, bucket_date)
                 ${select}`,
@@ -405,14 +414,17 @@ export class ClickHouseMetricsStore implements MetricsStore {
     const table = filter.bucket === 'hour' ? 'metric_rollups_hourly' : 'metric_rollups_daily';
     const dims = new Set(filter.groupBy);
     const params: Record<string, unknown> = {
+      workspaceId: filter.workspaceId,
       from: filter.from,
       to: filter.to,
       limit: Math.min(filter.limit ?? METRIC_QUERY_DEFAULT_LIMIT, METRIC_QUERY_MAX_LIMIT),
     };
-    const clauses =
-      filter.bucket === 'day'
+    const clauses = [
+      'workspace_id = {workspaceId:String}',
+      ...(filter.bucket === 'day'
         ? [`bucket_date >= toDate(${TS('from')}, 'UTC')`, `bucket_date < toDate(${TS('to')}, 'UTC')`]
-        : [`bucket_start >= ${TS('from')}`, `bucket_start < ${TS('to')}`];
+        : [`bucket_start >= ${TS('from')}`, `bucket_start < ${TS('to')}`]),
+    ];
     if (filter.accounts !== undefined) {
       clauses.push('has(arrayZip({ap:Array(String)}, {aa:Array(String)}), (toString(platform), account_id))');
       params.ap = filter.accounts.map((a) => a.platform);
@@ -490,10 +502,10 @@ export class ClickHouseMetricsStore implements MetricsStore {
    * max() of a timestamp is the same with or without FINAL: a superseded row never has a later
    * computed_at / fetched_at than the row that replaced it, so no collapsing is needed here.
    */
-  async getFreshness(accounts: readonly AccountRef[]): Promise<MetricsFreshness> {
+  async getFreshness(workspaceId: string, accounts: readonly AccountRef[]): Promise<MetricsFreshness> {
     if (accounts.length === 0) return { rollupsComputedAt: null, observationsFetchedAt: null };
-    const params = { ap: accounts.map((a) => a.platform), aa: accounts.map((a) => a.accountId) };
-    const scope = 'has(arrayZip({ap:Array(String)}, {aa:Array(String)}), (toString(platform), account_id))';
+    const params = { workspaceId, ap: accounts.map((a) => a.platform), aa: accounts.map((a) => a.accountId) };
+    const scope = 'workspace_id = {workspaceId:String} AND has(arrayZip({ap:Array(String)}, {aa:Array(String)}), (toString(platform), account_id))';
     const [hourly, daily, observed] = await Promise.all([
       this.rows<{ t: string | null }>(`SELECT maxOrNull(computed_at) AS t FROM metric_rollups_hourly WHERE ${scope}`, params),
       this.rows<{ t: string | null }>(`SELECT maxOrNull(computed_at) AS t FROM metric_rollups_daily WHERE ${scope}`, params),
@@ -509,13 +521,13 @@ export class ClickHouseMetricsStore implements MetricsStore {
     };
   }
 
-  async changedSince(since?: string): Promise<ChangedWindow | null> {
+  async changedSince(workspaceId: string, since?: string): Promise<ChangedWindow | null> {
     const [r] = await this.rows<{ from_ts: string; to_ts: string; n: number; max_ins: string; server_now: string }>(
       `SELECT min(period_start) AS from_ts, max(period_end) AS to_ts, count() AS n,
               max(inserted_at) AS max_ins, now64(3, 'UTC') AS server_now
        FROM metric_observations
-       ${since === undefined ? '' : `WHERE inserted_at > ${TS('since')}`}`,
-      since === undefined ? {} : { since }
+       WHERE workspace_id = {workspaceId:String}${since === undefined ? '' : ` AND inserted_at > ${TS('since')}`}`,
+      since === undefined ? { workspaceId } : { workspaceId, since }
     );
     if (!r || Number(r.n) === 0) return null;
     // Never move the watermark into the last WATERMARK_SAFETY_MS: rows inserted in the

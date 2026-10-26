@@ -23,6 +23,7 @@ import {
   ClickHouseCheckpointStore,
   ClickHouseMetricsStore,
   ClickHouseQuarantineStore,
+  InMemoryLeaseStore,
   ManualClock,
   RandomIdGenerator,
   RedisStreamsEventBus,
@@ -99,8 +100,8 @@ async function physicalRows(w: World): Promise<number> {
   const client = createClickHouseClient(chOptions);
   try {
     const rs = await client.query({
-      query: 'SELECT count() AS n FROM metric_observations WHERE account_id = {a:String}',
-      query_params: { a: w.accountId },
+      query: 'SELECT count() AS n FROM metric_observations WHERE workspace_id = {w:String} AND account_id = {a:String}',
+      query_params: { w: w.workspaceId, a: w.accountId },
       format: 'JSONEachRow',
     });
     const [row] = await rs.json<{ n: string }>();
@@ -151,12 +152,14 @@ async function world(options: { timezone?: string; restateRevisions?: number; em
       },
     });
   // Start rollups from "now": rows other tests left in the shared database are not ours to recompute.
-  const baseline = await s.metrics.changedSince();
+  const baseline = await s.metrics.changedSince(workspaceId);
   if (baseline) await s.checkpoints.set({ workspaceId, source: 'rollup', accountId: '*', stream: 'changed_since' }, { cursor: baseline.watermark, runId: 'baseline' });
   const rollup = () =>
     new RollupWorker({
       metricsStore: s.metrics,
       checkpoints: s.checkpoints,
+      leases: new InMemoryLeaseStore(clock),
+      ownerId: 'rollup-test',
       clock,
       ids,
       logger,
@@ -186,10 +189,11 @@ const total = (rows: MetricObservation[]) => ({
   conversions: rows.reduce((a, o) => a + o.metrics.conversions, 0),
 });
 
-const stored = (w: World) => w.s.metrics.queryObservations({ platform: 'meta', accountId: w.accountId, granularity: 'hour', limit: 10_000 });
+const stored = (w: World) => w.s.metrics.queryObservations({ workspaceId: w.workspaceId, platform: 'meta', accountId: w.accountId, granularity: 'hour', limit: 10_000 });
 
 async function rolledUpTotals(w: World, bucket: 'hour' | 'day') {
   const [agg] = await w.s.metrics.aggregateRollups({
+    workspaceId: w.workspaceId,
     bucket,
     from: '2026-10-20T00:00:00.000Z',
     to: '2026-11-05T00:00:00.000Z',
@@ -280,6 +284,7 @@ describe('metrics flow on ClickHouse: stub -> ingest -> rollup -> read', () => {
     const expected = new Map<string, number>();
     for (const o of rows) expected.set(localDate(o.periodStart), (expected.get(localDate(o.periodStart)) ?? 0) + o.metrics.impressions);
     const days = await w.s.metrics.aggregateRollups({
+    workspaceId: w.workspaceId,
       bucket: 'day',
       from: '2026-10-20T00:00:00.000Z',
       to: '2026-11-05T00:00:00.000Z',
@@ -288,7 +293,7 @@ describe('metrics flow on ClickHouse: stub -> ingest -> rollup -> read', () => {
     });
     expect(new Map(days.map((d) => [d.bucket as string, d.metrics.impressions]))).toEqual(expected);
     expect(expected.size).toBeGreaterThanOrEqual(2);
-    const dailyRows = await w.s.metrics.queryRollups({ bucket: 'day', accountId: w.accountId });
+    const dailyRows = await w.s.metrics.queryRollups({ workspaceId: w.workspaceId, bucket: 'day', accountId: w.accountId });
     expect(dailyRows.every((r) => r.timezone === 'Australia/Sydney')).toBe(true);
     // Local midnight in Sydney is not a UTC midnight.
     expect(dailyRows.some((r) => !r.bucketStart.endsWith('T00:00:00.000Z'))).toBe(true);
@@ -345,10 +350,10 @@ describe('metrics flow on ClickHouse: stub -> ingest -> rollup -> read', () => {
     let calls = 0;
     const dying: MetricsStore = Object.create(doomedStores.metrics, {
       upsertObservations: {
-        value: async (obs: MetricObservation[]) => {
+        value: async (ws: string, obs: MetricObservation[]) => {
           calls += 1;
           if (calls === 2) throw new Error('process killed');
-          return doomedStores.metrics.upsertObservations(obs);
+          return doomedStores.metrics.upsertObservations(ws, obs);
         },
       },
     });
@@ -399,11 +404,11 @@ describe('metrics flow on ClickHouse: stub -> ingest -> rollup -> read', () => {
     for (let received = 1; received > 0; ) received = (await consumer.pump()).result.received;
     expect(logger.records.filter((r) => r.level === 'error')).toEqual([]);
 
-    const trace = async (id: string) => (await auditStore.getTrace(id, { workspaceId: w.workspaceId })).map((e) => [e.action, e.outcome]);
+    const trace = async (id: string) => (await auditStore.getTrace(w.workspaceId, id)).map((e) => [e.action, e.outcome]);
     expect(await trace(failed.runId)).toEqual([['metrics.fetch_started', 'success'], ['metrics.fetch_failed', 'failure']]);
     expect(await trace(ok.runId)).toEqual([['metrics.fetch_started', 'success'], ['metrics.ingested', 'success'], ['metrics.fetch_completed', 'success']]);
     expect((await trace(later.runId)).map(([a]) => a)).toEqual(['metrics.fetch_started', 'metrics.ingested', 'metrics.restated', 'metrics.fetch_completed']);
-    const completed = (await auditStore.getTrace(ok.runId, { workspaceId: w.workspaceId })).find((e) => e.action === 'metrics.fetch_completed')!;
+    const completed = (await auditStore.getTrace(w.workspaceId, ok.runId)).find((e) => e.action === 'metrics.fetch_completed')!;
     expect(completed.details).toMatchObject({ ingested: ok.ingested, pages: ok.pages, window: ok.window });
     expect(completed.durationMs).toBeGreaterThanOrEqual(0);
     expect(JSON.stringify(completed)).not.toMatch(/token|secret|password/i);

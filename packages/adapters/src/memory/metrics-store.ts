@@ -20,12 +20,25 @@ import {
 } from '@smallseedlabs/proba-audit-core';
 import { SystemClock } from '../runtime/system.js';
 
-export function observationKey(o: MetricObservation): string {
-  return [o.platform, o.accountId, o.campaignId, o.adsetId ?? '', o.adId ?? '', o.granularity, o.periodStart].join('|');
+export function observationKey(workspaceId: string, o: MetricObservation): string {
+  return [workspaceId, o.platform, o.accountId, o.campaignId, o.adsetId ?? '', o.adId ?? '', o.granularity, o.periodStart].join('|');
 }
 
-function matches(o: MetricObservation, f: MetricObservationFilter): boolean {
+/** A stored observation with the workspace it belongs to (the protocol type does not carry one). */
+interface StoredObservation {
+  workspaceId: string;
+  observation: MetricObservation;
+}
+
+interface StoredRollup {
+  workspaceId: string;
+  rollup: MetricRollup;
+}
+
+function matches(w: StoredObservation, f: MetricObservationFilter): boolean {
+  const o = w.observation;
   return (
+    w.workspaceId === f.workspaceId &&
     (f.platform === undefined || o.platform === f.platform) &&
     (f.accountId === undefined || o.accountId === f.accountId) &&
     (f.campaignId === undefined || o.campaignId === f.campaignId) &&
@@ -39,19 +52,19 @@ function matches(o: MetricObservation, f: MetricObservationFilter): boolean {
 
 /** In-process MetricsStore following the port's semantics. For tests and local runs. */
 export class InMemoryMetricsStore implements MetricsStore {
-  private readonly observations = new Map<string, MetricObservation>();
-  private readonly rollups = new Map<string, MetricRollup>();
+  private readonly observations = new Map<string, StoredObservation>();
+  private readonly rollups = new Map<string, StoredRollup>();
   /** Insertion sequence per key: lets changedSince work without a wall clock. */
   private readonly inserted = new Map<string, number>();
   private seq = 0;
 
   constructor(private readonly clock: Clock = new SystemClock()) {}
 
-  async upsertObservations(observations: MetricObservation[]): Promise<UpsertResult> {
+  async upsertObservations(workspaceId: string, observations: MetricObservation[]): Promise<UpsertResult> {
     // Highest revision per key within the batch wins.
     const batch = new Map<string, MetricObservation>();
     for (const o of observations) {
-      const k = observationKey(o);
+      const k = observationKey(workspaceId, o);
       const prev = batch.get(k);
       if (!prev || o.revision >= prev.revision) batch.set(k, o);
     }
@@ -59,10 +72,10 @@ export class InMemoryMetricsStore implements MetricsStore {
     let skippedStale = 0;
     for (const [k, o] of batch) {
       const stored = this.observations.get(k);
-      if (stored && stored.revision > o.revision) {
+      if (stored && stored.observation.revision > o.revision) {
         skippedStale += 1;
       } else {
-        this.observations.set(k, structuredClone(o));
+        this.observations.set(k, { workspaceId, observation: structuredClone(o) });
         this.seq += 1;
         this.inserted.set(k, this.seq);
         written += 1;
@@ -74,10 +87,10 @@ export class InMemoryMetricsStore implements MetricsStore {
   async queryObservations(filter: MetricObservationFilter): Promise<MetricObservation[]> {
     const limit = Math.min(filter.limit ?? METRIC_QUERY_DEFAULT_LIMIT, METRIC_QUERY_MAX_LIMIT);
     return [...this.observations.entries()]
-      .filter(([, o]) => matches(o, filter))
-      .sort(([ka, a], [kb, b]) => a.periodStart.localeCompare(b.periodStart) || ka.localeCompare(kb))
+      .filter(([, w]) => matches(w, filter))
+      .sort(([ka, a], [kb, b]) => a.observation.periodStart.localeCompare(b.observation.periodStart) || ka.localeCompare(kb))
       .slice(0, limit)
-      .map(([, o]) => structuredClone(o));
+      .map(([, w]) => structuredClone(w.observation));
   }
 
   async computeRollups(request: RollupRequest): Promise<number> {
@@ -97,14 +110,16 @@ export class InMemoryMetricsStore implements MetricsStore {
     // Buckets touched by the window. A daily bucket is always summed whole, from every
     // observation in it, even those outside the window (a local day can straddle it).
     const touched = new Set<string>();
-    for (const o of this.observations.values()) {
-      if (!inWindow(o) || !eligible(o)) continue;
+    for (const w of this.observations.values()) {
+      const o = w.observation;
+      if (w.workspaceId !== request.workspaceId || !inWindow(o) || !eligible(o)) continue;
       touched.add(`${bucketOf(o).tz ?? ''}|${bucketOf(o).start}`);
     }
 
     const groups = new Map<string, MetricRollup>();
-    for (const o of this.observations.values()) {
-      if (!eligible(o)) continue;
+    for (const w of this.observations.values()) {
+      const o = w.observation;
+      if (w.workspaceId !== request.workspaceId || !eligible(o)) continue;
       const b = bucketOf(o);
       if (!touched.has(`${b.tz ?? ''}|${b.start}`)) continue;
       const id = [o.platform, o.accountId, o.campaignId, o.adsetId ?? '', o.adId ?? '', o.granularity, b.start, o.currency].join('|');
@@ -138,7 +153,7 @@ export class InMemoryMetricsStore implements MetricsStore {
     for (const [id, r] of groups) {
       r.metrics.spend = Math.round(r.metrics.spend * 1e6) / 1e6;
       if (r.metrics.revenue !== undefined) r.metrics.revenue = Math.round(r.metrics.revenue * 1e6) / 1e6;
-      this.rollups.set(`${request.bucket}|${id}`, r);
+      this.rollups.set(`${request.workspaceId}|${request.bucket}|${id}`, { workspaceId: request.workspaceId, rollup: r });
     }
     return groups.size;
   }
@@ -147,7 +162,8 @@ export class InMemoryMetricsStore implements MetricsStore {
     const limit = Math.min(filter.limit ?? METRIC_QUERY_DEFAULT_LIMIT, METRIC_QUERY_MAX_LIMIT);
     return [...this.rollups.entries()]
       .filter(
-        ([, r]) =>
+        ([, { workspaceId, rollup: r }]) =>
+          workspaceId === filter.workspaceId &&
           r.bucket === filter.bucket &&
           (filter.platform === undefined || r.platform === filter.platform) &&
           (filter.accountId === undefined || r.accountId === filter.accountId) &&
@@ -158,9 +174,9 @@ export class InMemoryMetricsStore implements MetricsStore {
           (filter.from === undefined || Date.parse(r.bucketStart) >= Date.parse(filter.from)) &&
           (filter.to === undefined || Date.parse(r.bucketStart) < Date.parse(filter.to))
       )
-      .sort(([ka, a], [kb, b]) => a.bucketStart.localeCompare(b.bucketStart) || ka.localeCompare(kb))
+      .sort(([ka, a], [kb, b]) => a.rollup.bucketStart.localeCompare(b.rollup.bucketStart) || ka.localeCompare(kb))
       .slice(0, limit)
-      .map(([, r]) => structuredClone(r));
+      .map(([, w]) => structuredClone(w.rollup));
   }
 
   async aggregateRollups(filter: RollupAggregateFilter): Promise<MetricAggregate[]> {
@@ -168,8 +184,8 @@ export class InMemoryMetricsStore implements MetricsStore {
     const accounts = filter.accounts === undefined ? undefined : new Set(filter.accounts.map((a) => `${a.platform}|${a.accountId}`));
     const dims = new Set(filter.groupBy);
     const groups = new Map<string, MetricAggregate & { hasVideo: boolean; hasRevenue: boolean }>();
-    for (const r of this.rollups.values()) {
-      if (r.bucket !== filter.bucket) continue;
+    for (const { workspaceId, rollup: r } of this.rollups.values()) {
+      if (workspaceId !== filter.workspaceId || r.bucket !== filter.bucket) continue;
       if (filter.bucket === 'day') {
         const date = r.bucketDate ?? r.bucketStart.slice(0, 10);
         if (date < filter.from.slice(0, 10) || date >= filter.to.slice(0, 10)) continue;
@@ -229,16 +245,16 @@ export class InMemoryMetricsStore implements MetricsStore {
       });
   }
 
-  async getFreshness(accounts: readonly AccountRef[]): Promise<MetricsFreshness> {
+  async getFreshness(workspaceId: string, accounts: readonly AccountRef[]): Promise<MetricsFreshness> {
     const allowed = new Set(accounts.map((a) => `${a.platform}|${a.accountId}`));
     let rollupsComputedAt: number | null = null;
     let observationsFetchedAt: number | null = null;
-    for (const r of this.rollups.values()) {
-      if (!allowed.has(`${r.platform}|${r.accountId}`)) continue;
+    for (const { workspaceId: ws, rollup: r } of this.rollups.values()) {
+      if (ws !== workspaceId || !allowed.has(`${r.platform}|${r.accountId}`)) continue;
       rollupsComputedAt = Math.max(rollupsComputedAt ?? -Infinity, Date.parse(r.computedAt));
     }
-    for (const o of this.observations.values()) {
-      if (!allowed.has(`${o.platform}|${o.accountId}`)) continue;
+    for (const { workspaceId: ws, observation: o } of this.observations.values()) {
+      if (ws !== workspaceId || !allowed.has(`${o.platform}|${o.accountId}`)) continue;
       observationsFetchedAt = Math.max(observationsFetchedAt ?? -Infinity, Date.parse(o.fetchedAt));
     }
     return {
@@ -247,15 +263,16 @@ export class InMemoryMetricsStore implements MetricsStore {
     };
   }
 
-  async changedSince(since?: string): Promise<ChangedWindow | null> {
+  async changedSince(workspaceId: string, since?: string): Promise<ChangedWindow | null> {
     const after = since === undefined ? 0 : Number(since);
     let from: string | undefined;
     let to: string | undefined;
     let count = 0;
     for (const [k, seq] of this.inserted) {
       if (seq <= after) continue;
-      const o = this.observations.get(k);
-      if (!o) continue;
+      const w = this.observations.get(k);
+      if (!w || w.workspaceId !== workspaceId) continue;
+      const o = w.observation;
       count += 1;
       if (from === undefined || o.periodStart < from) from = o.periodStart;
       if (to === undefined || o.periodEnd > to) to = o.periodEnd;

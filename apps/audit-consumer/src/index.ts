@@ -11,16 +11,18 @@ let consumer: AuditConsumer | undefined;
 
 /**
  * audit-consumer: reads the audit topic with a consumer group, validates, dedupes,
- * chains per workspace and writes to the AuditStore. Run ONE replica (see
- * docs/ARCHITECTURE.md, "Single writer").
+ * chains per workspace and writes to the AuditStore. With LEASE_STORE=redis several replicas can run: they take a lease per
+ * workspace around each write. With the memory lease store run ONE replica (see docs/ARCHITECTURE.md, "Single writer").
  */
 runService({
   name: 'audit-consumer',
   defaultPort: 3101,
   async onStart({ config, logger }) {
-    runtime = await createRuntime(config, { logger });
+    runtime = await createRuntime(config, { logger, clickhouseRole: 'consumer', usesAnchors: true, usesLeases: true });
     await runtime.auditStore.ping();
     if (config.content.enabled) await runtime.auditContentStore.ping();
+    await runtime.anchorStore?.ping();
+    await runtime.leaseStore?.ping();
     await runtime.eventBus.ping();
 
     // The consumer audits itself through the same emitter and bus as every service.
@@ -42,6 +44,9 @@ runService({
       bus: runtime.eventBus,
       store: runtime.auditStore,
       contentStore: runtime.auditContentStore,
+      anchors: runtime.anchorStore,
+      leases: runtime.leaseStore,
+      leaseOwnerId: runtime.instanceId,
       clock: runtime.clock,
       ids: runtime.ids,
       logger,
@@ -60,6 +65,7 @@ runService({
         serviceName: config.service.name,
         selfAuditWorkspaceId: config.consumer.selfAuditWorkspaceId,
         contentEnabled: config.content.enabled,
+        leaseTtlMs: config.consumer.leaseTtlMs,
       },
     });
     await consumer.start();

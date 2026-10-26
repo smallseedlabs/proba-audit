@@ -20,7 +20,7 @@ import {
   summaryQuerySchema,
   tracesQuerySchema,
 } from './http/schemas.js';
-import { TOKENS, chainAll, createHarness, makeEvent, makeObservation, seedWithContent, type Harness } from './harness.testing.js';
+import { TOKENS, WORKSPACE, chainAll, createHarness, makeEvent, makeObservation, seedWithContent, type Harness } from './harness.testing.js';
 
 // Both packages are CommonJS: load them the way Node does, whatever the test runner's interop.
 const nodeRequire = createRequire(import.meta.url);
@@ -165,9 +165,9 @@ describe('what the server returns conforms to the document', () => {
         makeEvent({}),
       ])
     );
-    await h.metrics.upsertObservations([makeObservation(), makeObservation({ campaignId: 'cmp_2', metrics: { impressions: 10, clicks: 1, spend: 1, conversions: 0 } })]);
-    await h.metrics.computeRollups({ bucket: 'hour', from: '2026-10-24T00:00:00.000Z', to: '2026-10-26T00:00:00.000Z' });
-    await h.metrics.computeRollups({ bucket: 'day', from: '2026-10-24T00:00:00.000Z', to: '2026-10-26T00:00:00.000Z' });
+    await h.metrics.upsertObservations(WORKSPACE, [makeObservation(), makeObservation({ campaignId: 'cmp_2', metrics: { impressions: 10, clicks: 1, spend: 1, conversions: 0 } })]);
+    await h.metrics.computeRollups({ workspaceId: WORKSPACE, bucket: 'hour', from: '2026-10-24T00:00:00.000Z', to: '2026-10-26T00:00:00.000Z' });
+    await h.metrics.computeRollups({ workspaceId: WORKSPACE, bucket: 'day', from: '2026-10-24T00:00:00.000Z', to: '2026-10-26T00:00:00.000Z' });
   });
   afterAll(async () => {
     await h.close();

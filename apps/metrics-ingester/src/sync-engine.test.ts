@@ -4,9 +4,10 @@ import { HOUR, makeHarness, type Harness } from './harness.testing.js';
 import { redactSecrets } from './retry.js';
 
 const ACCOUNT = { accountId: 'stub_meta_acct_1' };
-const key = { workspaceId: 'ws_test', source: 'meta', accountId: ACCOUNT.accountId, stream: 'hour' };
+const WS_ID = 'ws_test';
+const key = { workspaceId: WS_ID, source: 'meta', accountId: ACCOUNT.accountId, stream: 'hour' };
 
-const stored = (h: Harness) => h.metricsStore.queryObservations({ platform: 'meta', accountId: ACCOUNT.accountId, granularity: 'hour', limit: 10_000 });
+const stored = (h: Harness) => h.metricsStore.queryObservations({ workspaceId: WS_ID, platform: 'meta', accountId: ACCOUNT.accountId, granularity: 'hour', limit: 10_000 });
 const sum = (rows: MetricObservation[], f: (o: MetricObservation) => number) => rows.reduce((a, o) => a + f(o), 0);
 
 describe('SyncEngine: first run', () => {
@@ -185,9 +186,9 @@ describe('SyncEngine: failures', () => {
     let failures = 1;
     const flaky: MetricsStore = Object.create(real, {
       upsertObservations: {
-        value: async (obs: MetricObservation[]) => {
+        value: async (ws: string, obs: MetricObservation[]) => {
           if (failures-- > 0) throw new Error('clickhouse unavailable');
-          return real.upsertObservations(obs);
+          return real.upsertObservations(ws, obs);
         },
       },
     });
@@ -212,10 +213,10 @@ describe('SyncEngine: crash recovery', () => {
     let calls = 0;
     const dying: MetricsStore = Object.create(real, {
       upsertObservations: {
-        value: async (obs: MetricObservation[]) => {
+        value: async (ws: string, obs: MetricObservation[]) => {
           calls += 1;
           if (calls === 2) throw new Error('process killed');
-          return real.upsertObservations(obs);
+          return real.upsertObservations(ws, obs);
         },
       },
     });
@@ -290,7 +291,7 @@ describe('SyncEngine: windows', () => {
     const h = makeHarness({ engine: { granularity: 'day', initialLookbackHours: 24 * 4 } });
     const out = await h.engine.syncAccount(h.connector, ACCOUNT);
     expect(out.status).toBe('completed');
-    const rows = await h.metricsStore.queryObservations({ platform: 'meta', accountId: ACCOUNT.accountId, granularity: 'day', limit: 10_000 });
+    const rows = await h.metricsStore.queryObservations({ workspaceId: WS_ID, platform: 'meta', accountId: ACCOUNT.accountId, granularity: 'day', limit: 10_000 });
     expect(rows.length).toBeGreaterThan(0);
     expect(new Set(rows.map((o) => o.periodStart)).size).toBeGreaterThanOrEqual(3);
   });

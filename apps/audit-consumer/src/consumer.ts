@@ -17,26 +17,41 @@
  * (`contentDigest`, covered by the hash). When content is disabled the text is dropped: nothing of
  * it is stored, not even a digest. A conflicting event never writes its text.
  *
+ * Anchors: after a batch is durable, the consumer records the new head of every workspace it wrote to
+ * (hash, event count, ingestedAt) in the AnchorStore, signed, outside the audit store. verifyChain compares the live chain
+ * with it, which is what makes deleting the NEWEST events detectable. The anchor only moves forward. If the anchor store is
+ * down, ingestion goes on (a lost audit event is worse than a late anchor): the anchor is logged as an error, kept pending
+ * and written with the next batch, or, after a restart, from the live chain.
+ *
  * Single writer: the cached chain heads assume that ONE consumer instance writes
- * to the store at a time (see docs/ARCHITECTURE.md). Run one replica.
+ * to the store at a time (see docs/ARCHITECTURE.md). Run one replica, or give every replica the same LeaseStore
+ * (`deps.leases`): a batch then takes a lease per workspace it touches, so only one instance chains and writes a
+ * given workspace at a time, and heads and counts are re-read from the store under the lease instead of trusted
+ * from the cache (another instance may have written since). A lease that is held elsewhere makes the batch fail
+ * with LeaseHeldError: nothing is acknowledged and the batch is retried with backoff.
  */
 
 import {
+  LeaseHeldError,
+  LeaseLostError,
   chainEvent,
   contentHash,
   digestAuditContent,
   prepareForStorage,
   sameContent,
   validateAuditEvent,
+  type AnchorStore,
   type AuditContentStore,
   type AuditEmitter,
   type AuditEvent,
   type AuditStore,
   type BusMessage,
+  type ChainAnchorClaim,
   type ChainLink,
   type Clock,
   type EventBus,
   type IdGenerator,
+  type LeaseStore,
   type Logger,
   type StoredAuditContent,
   type StoredAuditEvent,
@@ -62,6 +77,8 @@ export interface AuditConsumerOptions {
   selfAuditWorkspaceId: string;
   /** Store the raw text of events (needs `AuditConsumerDeps.contentStore`). When false the text is dropped. Default false. */
   contentEnabled?: boolean;
+  /** TTL of the per-workspace write lease (needs `AuditConsumerDeps.leases`). Default 30 s. */
+  leaseTtlMs?: number;
 }
 
 export interface AuditConsumerDeps {
@@ -69,6 +86,15 @@ export interface AuditConsumerDeps {
   store: AuditStore;
   /** Where the raw text of events goes when `options.contentEnabled` is true. */
   contentStore?: AuditContentStore;
+  /** Where the signed chain heads go. Omit to write no anchors. */
+  anchors?: AnchorStore;
+  /**
+   * Shared lease store: with it several consumer instances can write safely (one writer per workspace at a time).
+   * Omit for the single-replica mode, which caches chain heads in memory.
+   */
+  leases?: LeaseStore;
+  /** Owner id of this instance's leases; unique per process. Default: `options.consumerName`. */
+  leaseOwnerId?: string;
   clock: Clock;
   ids: IdGenerator;
   logger: Logger;
@@ -115,6 +141,17 @@ interface Candidate {
 
 const errorMessage = (err: unknown): string => (err instanceof Error ? err.message : String(err));
 
+/** The workspace ids named by the raw payloads of a batch, de-duplicated and sorted (a fixed order of acquisition). */
+function workspacesOf(messages: BusMessage[]): string[] {
+  const ids = new Set<string>();
+  for (const m of messages) {
+    if (typeof m.payload !== 'object' || m.payload === null) continue;
+    const id = (m.payload as { workspaceId?: unknown }).workspaceId;
+    if (typeof id === 'string' && id !== '') ids.add(id);
+  }
+  return [...ids].sort();
+}
+
 function traceIdOf(payload: unknown): string | undefined {
   if (typeof payload === 'object' && payload !== null) {
     const id = (payload as { traceId?: unknown }).traceId;
@@ -126,6 +163,12 @@ function traceIdOf(payload: unknown): string | undefined {
 export class AuditConsumer {
   private readonly o: AuditConsumerOptions;
   private readonly heads = new Map<string, ChainLink | null>();
+  /** Events in each workspace's chain, in step with `heads`. Filled by one count the first time a workspace is written to. */
+  private readonly counts = new Map<string, number>();
+  /** Anchors that could not be stored yet (anchor store down), per workspace: the newest claim wins. */
+  private readonly pendingAnchors = new Map<string, ChainAnchorClaim>();
+  /** Lease keys held for the batch in flight (batches run one at a time). */
+  private heldLeases: string[] = [];
   private subscription: Subscription | null = null;
   private running = false;
   private loop: Promise<void> | null = null;
@@ -276,11 +319,73 @@ export class AuditConsumer {
    * this call is acknowledged.
    */
   async processBatch(messages: BusMessage[]): Promise<BatchResult> {
+    const leases = this.deps.leases;
+    if (!leases) return this.processBatchUnleased(messages);
+    await this.acquireLeases(leases, workspacesOf(messages));
+    try {
+      return await this.processBatchUnleased(messages);
+    } finally {
+      await this.releaseLeases(leases);
+    }
+  }
+
+  private leaseOwner(): string {
+    return this.deps.leaseOwnerId ?? this.o.consumerName;
+  }
+
+  /**
+   * One lease per workspace in the batch (the ids are read from the raw payloads: events that turn out invalid or duplicate
+   * are covered too, which only costs a little exclusivity). All or none: when one is held elsewhere the ones taken are given
+   * back and LeaseHeldError is thrown. Heads and counts of these workspaces are forgotten: they are read again under the lease.
+   */
+  private async acquireLeases(leases: LeaseStore, workspaceIds: string[]): Promise<void> {
+    const ttl = this.o.leaseTtlMs ?? 30_000;
+    const taken: string[] = [];
+    try {
+      for (const workspaceId of workspaceIds) {
+        const key = `audit-consumer:workspace:${workspaceId}`;
+        if (!(await leases.tryAcquire(key, this.leaseOwner(), ttl))) throw new LeaseHeldError(key);
+        taken.push(key);
+      }
+    } catch (err) {
+      await Promise.allSettled(taken.map((key) => leases.release(key, this.leaseOwner())));
+      throw err;
+    }
+    this.heldLeases = taken;
+    for (const workspaceId of workspaceIds) {
+      this.heads.delete(workspaceId);
+      this.counts.delete(workspaceId);
+    }
+  }
+
+  private async releaseLeases(leases: LeaseStore): Promise<void> {
+    const keys = this.heldLeases;
+    this.heldLeases = [];
+    for (const key of keys) {
+      await leases.release(key, this.leaseOwner()).catch((err: unknown) => {
+        // The lease expires by itself; the next batch of this workspace may have to wait for that.
+        this.deps.logger.warn('lease release failed; it will expire on its own', { err: new Error(errorMessage(err)), lease: key });
+      });
+    }
+  }
+
+  /** Just before the write: the leases must still be ours (a slow batch may have outlived them). Throws LeaseLostError, writing nothing. */
+  private async assertLeasesHeld(): Promise<void> {
+    const leases = this.deps.leases;
+    if (!leases?.renew) return;
+    const ttl = this.o.leaseTtlMs ?? 30_000;
+    for (const key of this.heldLeases) {
+      if (!(await leases.renew(key, this.leaseOwner(), ttl))) throw new LeaseLostError(key);
+    }
+  }
+
+  private async processBatchUnleased(messages: BusMessage[]): Promise<BatchResult> {
     const { store, ids, clock, logger: rootLogger } = this.deps;
     const sub = await this.attach();
     const batchId = ids.uuid();
     const logger = rootLogger.child({ batchId });
     const startedAt = clock.now().getTime();
+    if (this.pendingAnchors.size > 0) await this.flushAnchors(logger);
 
     const deadLetters: DeadLetterItem[] = [];
     const toAck: BusMessage[] = [];
@@ -401,15 +506,18 @@ export class AuditConsumer {
     }
 
     // 5b. Durable write. If this throws nothing has been acknowledged.
+    await this.assertLeasesHeld();
     const written = new Map<string, number>();
     if (chained.length > 0) {
       const result = await store.appendBatch(chained);
       if (result.inserted === chained.length) {
         for (const [ws, head] of heads) this.heads.set(ws, head);
+        await this.anchorWrittenHeads(heads, chained, logger);
       } else {
         // Someone else wrote these events between our check and our write. That breaks the
         // single-writer assumption, so the chain may have a gap: forget cached heads and shout.
         this.heads.clear();
+        this.counts.clear();
         logger.error('chain integrity risk: store accepted fewer events than chained; another writer may be active', {
           chained: chained.length,
           inserted: result.inserted,
@@ -450,6 +558,52 @@ export class AuditConsumer {
     // 7. Self-audit. Never affects the outcome of the batch.
     await this.selfAudit(batchId, startedAt, candidates, written, duplicates, deadLetters);
     return result;
+  }
+
+  /**
+   * Record the new heads in the anchor store (step 5b, after the events are durable). Never throws: see "Anchors" above.
+   * The count is the chain length: counted once per workspace from the store (it includes this batch), then carried forward.
+   */
+  private async anchorWrittenHeads(heads: Map<string, ChainLink | null>, chained: StoredAuditEvent[], logger: Logger): Promise<void> {
+    const anchors = this.deps.anchors;
+    if (!anchors) return;
+    const added = new Map<string, number>();
+    for (const e of chained) added.set(e.workspaceId, (added.get(e.workspaceId) ?? 0) + 1);
+    for (const [workspaceId, head] of heads) {
+      if (!head) continue;
+      try {
+        const known = this.counts.get(workspaceId);
+        const count = known === undefined ? await this.deps.store.countEvents(workspaceId) : known + (added.get(workspaceId) ?? 0);
+        this.counts.set(workspaceId, count);
+        this.pendingAnchors.set(workspaceId, { workspaceId, headHash: head.hash, count, timestamp: head.ingestedAt });
+      } catch (err) {
+        this.counts.delete(workspaceId);
+        logger.error('chain anchor not updated: could not count the chain', { err: new Error(errorMessage(err)), workspaceId });
+      }
+    }
+    await this.flushAnchors(logger);
+  }
+
+  /** Store every pending anchor. A failure leaves it pending for the next batch. */
+  private async flushAnchors(logger: Logger): Promise<void> {
+    const anchors = this.deps.anchors;
+    if (!anchors) return;
+    for (const [workspaceId, claim] of [...this.pendingAnchors]) {
+      try {
+        const stored = await anchors.put(claim);
+        this.pendingAnchors.delete(workspaceId);
+        if (stored.count > claim.count) {
+          logger.error('chain integrity risk: the anchor is ahead of the chain; newest events may have been deleted from the audit store', {
+            workspaceId,
+            chainCount: claim.count,
+            anchorCount: stored.count,
+            anchorTimestamp: stored.timestamp,
+          });
+        }
+      } catch (err) {
+        logger.error('chain anchor not stored; will retry with the next batch', { err: new Error(errorMessage(err)), workspaceId });
+      }
+    }
   }
 
   private conflict(logger: Logger, c: Candidate, existingHash: string, where: string): DeadLetterItem {

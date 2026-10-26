@@ -13,6 +13,8 @@ describe('loadConfig', () => {
       checkpointStore: 'clickhouse',
       quarantineStore: 'clickhouse',
       auditContentStore: 'clickhouse',
+      anchorStore: 'memory',
+      leaseStore: 'memory',
     });
     expect(c.content.enabled).toBe(false);
     expect(c.connectors.pairs).toEqual([]);
@@ -52,6 +54,7 @@ describe('loadConfig', () => {
   it('has consumer defaults and reads overrides', () => {
     expect(loadConfig({}).consumer).toEqual({
       reclaimIntervalMs: 30000,
+      leaseTtlMs: 30000,
       retryBaseMs: 500,
       retryMaxMs: 30000,
       selfAudit: true,
@@ -95,6 +98,66 @@ describe('loadConfig', () => {
     expect(text).not.toContain('hunter2');
     expect(text).not.toContain('secretpw');
     expect(text).toContain('REDACTED');
+  });
+});
+
+describe('lease config', () => {
+  it('defaults to the memory store and reads LEASE_STORE and CONSUMER_LEASE_TTL_MS', () => {
+    expect(loadConfig({}).adapters.leaseStore).toBe('memory');
+    const c = loadConfig({ LEASE_STORE: 'redis', CONSUMER_LEASE_TTL_MS: '5000' });
+    expect(c.adapters.leaseStore).toBe('redis');
+    expect(c.consumer.leaseTtlMs).toBe(5000);
+    expect(() => loadConfig({ CONSUMER_LEASE_TTL_MS: '0' })).toThrow(/CONSUMER_LEASE_TTL_MS/);
+  });
+});
+
+describe('anchor config', () => {
+  it('defaults to the memory store with no key', () => {
+    const c = loadConfig({});
+    expect(c.adapters.anchorStore).toBe('memory');
+    expect(c.anchors).toEqual({ hmacKey: '', databaseUrl: '' });
+  });
+
+  it('redacts the key and the database credentials for logging', () => {
+    const c = loadConfig({ ANCHOR_HMAC_KEY: 'anchor-key-secret', ANCHOR_DATABASE_URL: 'postgresql://u:dbpass@db:5432/anchors' });
+    const text = JSON.stringify(redactConfig(c));
+    expect(text).not.toContain('anchor-key-secret');
+    expect(text).not.toContain('dbpass');
+  });
+});
+
+describe('ClickHouse roles', () => {
+  it('every role falls back to CLICKHOUSE_USER / CLICKHOUSE_PASSWORD', () => {
+    const c = loadConfig({ CLICKHOUSE_USER: 'proba', CLICKHOUSE_PASSWORD: 'pw' });
+    for (const role of ['consumer', 'api', 'migrator'] as const) {
+      expect(c.clickhouse.roles[role]).toEqual({ username: 'proba', password: 'pw' });
+    }
+  });
+
+  it('uses the role user and password when set, per role', () => {
+    const c = loadConfig({
+      CLICKHOUSE_USER: 'proba',
+      CLICKHOUSE_PASSWORD: 'shared',
+      CLICKHOUSE_API_USER: 'proba_api',
+      CLICKHOUSE_API_PASSWORD: 'api-pw',
+      CLICKHOUSE_MIGRATOR_USER: 'proba_migrator',
+      CLICKHOUSE_MIGRATOR_PASSWORD: 'mig-pw',
+    });
+    expect(c.clickhouse.roles.api).toEqual({ username: 'proba_api', password: 'api-pw' });
+    expect(c.clickhouse.roles.migrator).toEqual({ username: 'proba_migrator', password: 'mig-pw' });
+    expect(c.clickhouse.roles.consumer).toEqual({ username: 'proba', password: 'shared' });
+  });
+
+  it('rejects a role user without a password, and a password without a user', () => {
+    expect(() => loadConfig({ CLICKHOUSE_CONSUMER_USER: 'proba_consumer' })).toThrow(/CLICKHOUSE_CONSUMER_PASSWORD/);
+    expect(() => loadConfig({ CLICKHOUSE_API_PASSWORD: 'x' })).toThrow(/CLICKHOUSE_API_USER/);
+  });
+
+  it('redacts the role passwords for logging', () => {
+    const c = loadConfig({ CLICKHOUSE_API_USER: 'proba_api', CLICKHOUSE_API_PASSWORD: 'api-secret-pw' });
+    const text = JSON.stringify(redactConfig(c));
+    expect(text).not.toContain('api-secret-pw');
+    expect(text).toContain('proba_api');
   });
 });
 

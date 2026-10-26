@@ -12,19 +12,21 @@ let connectors: Map<MetricPlatform, PlatformConnector> | undefined;
  * metrics-ingester: pulls ad-platform metrics through the PlatformConnector port,
  * validates them and stores them (with revisions) in the MetricsStore. Which
  * connector serves which platform is config only: PLATFORM_CONNECTORS=meta:stub,google:stub
- * today, meta:<analytics-lib> when the real library exists. Run ONE replica
+ * today, meta:<analytics-lib> when the real library exists. Replicas share the work through
+ * LEASE_STORE (one sync per account at a time); with the memory lease store run ONE replica
  * (see docs/ARCHITECTURE.md, "Metrics flow").
  */
 runService({
   name: 'metrics-ingester',
   defaultPort: 3102,
   async onStart({ config, logger }) {
-    runtime = await createRuntime(config, { logger });
+    runtime = await createRuntime(config, { logger, clickhouseRole: 'consumer', usesLeases: true });
     await Promise.all([
       runtime.metricsStore.ping(),
       runtime.checkpointStore.ping(),
       runtime.quarantineStore.ping(),
       runtime.eventBus.ping(),
+      runtime.leaseStore!.ping(),
     ]);
     // Throws (and the process exits) for an unknown adapter name or the stub in production without ALLOW_STUB_CONNECTOR=true.
     connectors = await createConnectors(config, { logger, clock: runtime.clock, ids: runtime.ids });
@@ -71,6 +73,8 @@ runService({
     scheduler = new IngestScheduler({
       connectors,
       engine,
+      leases: runtime.leaseStore!,
+      ownerId: runtime.instanceId,
       clock: runtime.clock,
       logger,
       options: {

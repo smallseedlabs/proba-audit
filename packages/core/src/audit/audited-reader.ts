@@ -47,33 +47,33 @@ export class AuditedReader {
     private readonly clock: Clock
   ) {}
 
+  /** Like every typed read, scoped to the caller's workspace (`ctx.workspaceId`), whatever the query says. */
   query(ctx: AccessContext, query: AuditQuery): Promise<StoredAuditEvent[]> {
-    return this.audited(ctx, 'audit.searched', query, (rows) => rows.length, () => this.store.query(query), { operation: 'query' });
+    const scoped = { ...query, workspaceId: ctx.workspaceId };
+    return this.audited(ctx, 'audit.searched', scoped, (rows) => rows.length, () => this.store.query(scoped), { operation: 'query' });
   }
 
-  getTrace(
-    ctx: AccessContext,
-    traceId: string,
-    options?: { workspaceId?: string; limit?: number }
-  ): Promise<StoredAuditEvent[]> {
+  /** The workspace is always the caller's (`ctx.workspaceId`); there is no way to ask for another one. */
+  getTrace(ctx: AccessContext, traceId: string, options?: { limit?: number }): Promise<StoredAuditEvent[]> {
     return this.audited(
       ctx,
       'audit.trace_viewed',
       { traceId, ...options },
       (rows) => rows.length,
-      () => this.store.getTrace(traceId, options),
+      () => this.store.getTrace(ctx.workspaceId, traceId, options),
       { operation: 'trace' },
       { type: 'trace', id: traceId }
     );
   }
 
   aggregate(ctx: AccessContext, query: AuditAggregateQuery): Promise<AuditAggregateRow[]> {
+    const scoped = { ...query, filter: { ...query.filter, workspaceId: ctx.workspaceId } };
     return this.audited(
       ctx,
       'audit.searched',
-      { ...query.filter, groupBy: query.groupBy },
+      { ...scoped.filter, groupBy: query.groupBy },
       (rows) => rows.length,
-      () => this.store.aggregate(query),
+      () => this.store.aggregate(scoped),
       { operation: 'aggregate' }
     );
   }
