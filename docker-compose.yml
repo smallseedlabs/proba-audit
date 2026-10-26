@@ -112,6 +112,21 @@ services:
     environment:
       <<: *app-env
       PORT: 3100
+      # Sign-in: Firebase ID tokens of this project, verified with Google's public keys (no secret).
+      AUDIT_API_TOKEN_VERIFIER: ${AUDIT_API_TOKEN_VERIFIER:-firebase}
+      FIREBASE_PROJECT_ID: ${FIREBASE_PROJECT_ID:-}
+      # Who may use the API (verified emails). Empty lists allow nobody.
+      AUDIT_API_ALLOWED_EMAILS: ${AUDIT_API_ALLOWED_EMAILS:-}
+      AUDIT_API_ALLOWED_EMAIL_DOMAINS: ${AUDIT_API_ALLOWED_EMAIL_DOMAINS:-}
+      AUDIT_API_ADMIN_EMAILS: ${AUDIT_API_ADMIN_EMAILS:-}
+      AUDIT_API_WORKSPACE_ID: ${AUDIT_API_WORKSPACE_ID:-seedbed}
+      # Exact origin(s) of the insights portal.
+      AUDIT_API_CORS_ORIGINS: ${AUDIT_API_CORS_ORIGINS:-}
+      # Rate limits are shared between replicas through Redis.
+      AUDIT_API_RATE_LIMITER: ${AUDIT_API_RATE_LIMITER:-redis}
+      AUDIT_API_SCOPE_SOURCE: ${AUDIT_API_SCOPE_SOURCE:-connectors}
+      AUDIT_API_ANALYTICS_ACCOUNTS: ${AUDIT_API_ANALYTICS_ACCOUNTS:-}
+      AUDIT_API_TRUST_PROXY: ${AUDIT_API_TRUST_PROXY:-false}
     ports:
       - "${AUDIT_API_HOST_PORT:-3100}:3100"
     restart: unless-stopped

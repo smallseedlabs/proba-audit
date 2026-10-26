@@ -1,18 +1,34 @@
 import type { ClickHouseClient } from '@clickhouse/client';
 import {
+  AUDIT_FACET_DEFAULT_LIMIT,
+  AUDIT_FACET_MAX_LIMIT,
+  AUDIT_FACET_NAMES,
   AUDIT_QUERY_DEFAULT_LIMIT,
   AUDIT_QUERY_MAX_LIMIT,
+  AUDIT_SEARCH_DEFAULT_LIMIT,
+  AUDIT_SEARCH_MAX_LIMIT,
+  TRACE_LIST_DEFAULT_LIMIT,
+  TRACE_LIST_MAX_LIMIT,
   type AppendResult,
   type AuditAggregateQuery,
   type AuditAggregateRow,
   type AuditEventRef,
+  type AuditFacetName,
+  type AuditFacetValue,
+  type AuditFacets,
+  type AuditFacetsQuery,
   type AuditFilter,
   type AuditGroupBy,
   type AuditQuery,
+  type AuditSearchPage,
+  type AuditSearchQuery,
   type AuditStore,
   type ChainHead,
   type ReadChainOptions,
   type StoredAuditEvent,
+  type TraceListPage,
+  type TraceListQuery,
+  type TraceSummary,
   CHAIN_READ_DEFAULT_LIMIT,
   CHAIN_READ_MAX_LIMIT,
   sameContent,
@@ -177,6 +193,40 @@ export function buildAuditWhere(f: AuditFilter): WhereClause {
   return { sql: clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '', params };
 }
 
+/** Filters plus free text on action / target and an optional keyset cursor, for GET /v1/events. */
+export function buildSearchWhere(query: AuditSearchQuery): WhereClause {
+  const base = buildAuditWhere(query);
+  const clauses: string[] = base.sql === '' ? [] : [base.sql.replace(/^WHERE /, '')];
+  const params = { ...base.params };
+  if (query.text !== undefined && query.text !== '') {
+    clauses.push(
+      `(positionCaseInsensitive(toString(action), {text:String}) > 0
+        OR positionCaseInsensitive(ifNull(target_type, ''), {text:String}) > 0
+        OR positionCaseInsensitive(ifNull(target_id, ''), {text:String}) > 0)`
+    );
+    params.text = query.text;
+  }
+  if (query.after !== undefined) {
+    const op = (query.order ?? 'desc') === 'asc' ? '>' : '<';
+    clauses.push(`(occurred_at, event_id) ${op} (${TS('afterAt')}, {afterId:UUID})`);
+    params.afterAt = query.after.occurredAt;
+    params.afterId = query.after.eventId;
+  }
+  return { sql: clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '', params };
+}
+
+/** Column expression and extra condition per facet. */
+const FACET_SQL: Record<AuditFacetName, { expr: string; where?: string }> = {
+  service: { expr: 'toString(service)' },
+  action: { expr: 'toString(action)' },
+  category: { expr: 'toString(category)' },
+  outcome: { expr: 'toString(outcome)' },
+  riskLevel: { expr: 'toString(risk_level)', where: 'risk_level IS NOT NULL' },
+  actorType: { expr: 'toString(actor_type)' },
+  actorId: { expr: 'actor_id' },
+  campaignId: { expr: 'campaign_id', where: 'campaign_id IS NOT NULL' },
+};
+
 const GROUP_EXPR: Record<AuditGroupBy, string> = {
   category: 'toString(category)',
   action: 'toString(action)',
@@ -294,7 +344,8 @@ export class ClickHouseAuditStore implements AuditStore {
       params.afterId = options.after.eventId;
     }
     const dir = asc ? 'ASC' : 'DESC';
-    // ingested_at is not in the sorting key: this reads the workspace. Meant for verification jobs.
+    // ingested_at is not in the sorting key; the minmax index idx_ingested_at (0007) prunes the range, since
+    // ingestion time follows write order. Without a range this reads the workspace: meant for bounded verification.
     const rows = await this.rows<AuditRow>(
       `SELECT * FROM audit_events WHERE ${clauses.join(' AND ')}
        ORDER BY ingested_at ${dir}, event_id ${dir} LIMIT {limit:UInt32}`,
@@ -314,6 +365,145 @@ export class ClickHouseAuditStore implements AuditStore {
       { ...where.params, limit, offset: query.offset ?? 0 }
     );
     return rows.map(fromRow);
+  }
+
+  /**
+   * Keyset page in sorting-key order. With a workspace and a time range (the API always sets both)
+   * the primary key prunes parts and granules and ClickHouse reads in order, so LIMIT stops early.
+   */
+  async search(query: AuditSearchQuery): Promise<AuditSearchPage> {
+    const where = buildSearchWhere(query);
+    const limit = Math.min(query.limit ?? AUDIT_SEARCH_DEFAULT_LIMIT, AUDIT_SEARCH_MAX_LIMIT);
+    const dir = (query.order ?? 'desc') === 'asc' ? 'ASC' : 'DESC';
+    const rows = await this.rows<AuditRow>(
+      `SELECT * FROM audit_events ${where.sql}
+       ORDER BY occurred_at ${dir}, event_id ${dir}
+       LIMIT {limit:UInt32}`,
+      { ...where.params, limit: limit + 1 }
+    );
+    const events = rows.slice(0, limit).map(fromRow);
+    const last = events[events.length - 1];
+    return { events, nextCursor: rows.length > limit && last ? { occurredAt: last.occurredAt, eventId: last.eventId } : null };
+  }
+
+  async getEvent(workspaceId: string, eventId: string): Promise<StoredAuditEvent | null> {
+    // event_id is not in the sorting key: the idx_event_id bloom filter skips granules.
+    const rows = await this.rows<AuditRow>(
+      `SELECT * FROM audit_events WHERE workspace_id = {workspaceId:String} AND event_id = {eventId:UUID} LIMIT 1`,
+      { workspaceId, eventId }
+    );
+    return rows[0] ? fromRow(rows[0]) : null;
+  }
+
+  /**
+   * Two steps. First the trace ids with activity in the window (primary key range scan, grouped by
+   * trace, newest first, keyset cursor). Then the summary of exactly those traces over ALL their
+   * events (idx_trace_id skips granules), so a trace that began before the window still counts fully.
+   * audit_events is append-only MergeTree: there are no versions to collapse, so no FINAL/argMax here.
+   */
+  async listTraces(query: TraceListQuery): Promise<TraceListPage> {
+    const limit = Math.min(query.limit ?? TRACE_LIST_DEFAULT_LIMIT, TRACE_LIST_MAX_LIMIT);
+    const clauses = ['workspace_id = {workspaceId:String}'];
+    const params: Record<string, unknown> = { workspaceId: query.workspaceId, limit: limit + 1 };
+    if (query.from !== undefined) {
+      clauses.push(`occurred_at >= ${TS('from')}`);
+      params.from = query.from;
+    }
+    if (query.to !== undefined) {
+      clauses.push(`occurred_at < ${TS('to')}`);
+      params.to = query.to;
+    }
+    const having = query.after ? `HAVING (last_at, trace_id) < (${TS('afterAt')}, {afterId:UUID})` : '';
+    if (query.after) {
+      params.afterAt = query.after.lastEventAt;
+      params.afterId = query.after.traceId;
+    }
+    const active = await this.rows<{ trace_id: string; last_at: string }>(
+      `SELECT trace_id, max(occurred_at) AS last_at FROM audit_events
+       WHERE ${clauses.join(' AND ')}
+       GROUP BY trace_id ${having}
+       ORDER BY last_at DESC, trace_id DESC
+       LIMIT {limit:UInt32}`,
+      params
+    );
+    const page = active.slice(0, limit);
+    if (page.length === 0) return { traces: [], nextCursor: null };
+
+    const summaries = await this.rows<{
+      trace_id: string;
+      root_action: string;
+      root_service: string;
+      start_ms: number;
+      last_ms: number;
+      end_ms: number;
+      event_count: number;
+      outcome_rank: number;
+      risk_rank: number;
+    }>(
+      `SELECT trace_id,
+              argMin(toString(action), tuple(isNotNull(parent_span_id), occurred_at, event_id)) AS root_action,
+              argMin(toString(service), tuple(isNotNull(parent_span_id), occurred_at, event_id)) AS root_service,
+              min(toUnixTimestamp64Milli(occurred_at)) AS start_ms,
+              max(toUnixTimestamp64Milli(occurred_at)) AS last_ms,
+              max(toFloat64(toUnixTimestamp64Milli(occurred_at)) + ifNull(duration_ms, 0)) AS end_ms,
+              count() AS event_count,
+              max(multiIf(outcome = 'failure', 3, outcome = 'denied', 2, outcome = 'partial', 1, 0)) AS outcome_rank,
+              max(multiIf(risk_level = 'high', 3, risk_level = 'medium', 2, risk_level = 'low', 1, 0)) AS risk_rank
+       FROM audit_events
+       WHERE workspace_id = {workspaceId:String} AND trace_id IN {ids:Array(UUID)}
+       GROUP BY trace_id`,
+      { workspaceId: query.workspaceId, ids: page.map((r) => r.trace_id) }
+    );
+    const byId = new Map(summaries.map((r) => [r.trace_id, r]));
+    const OUTCOMES = ['success', 'partial', 'denied', 'failure'] as const;
+    const RISKS = [undefined, 'low', 'medium', 'high'] as const;
+    const traces: TraceSummary[] = [];
+    for (const { trace_id } of page) {
+      const r = byId.get(trace_id);
+      if (!r) continue;
+      const risk = RISKS[Number(r.risk_rank)];
+      traces.push({
+        traceId: trace_id,
+        rootAction: r.root_action,
+        rootService: r.root_service,
+        startedAt: new Date(Number(r.start_ms)).toISOString(),
+        lastEventAt: new Date(Number(r.last_ms)).toISOString(),
+        eventCount: Number(r.event_count),
+        outcome: OUTCOMES[Number(r.outcome_rank)],
+        ...(risk ? { riskLevel: risk } : {}),
+        durationMs: Math.round(Number(r.end_ms) - Number(r.start_ms)),
+      });
+    }
+    const tail = page[page.length - 1];
+    return {
+      traces,
+      nextCursor: active.length > limit && tail ? { lastEventAt: tail.last_at, traceId: tail.trace_id } : null,
+    };
+  }
+
+  async facets(query: AuditFacetsQuery): Promise<AuditFacets> {
+    const limit = Math.min(query.limit ?? AUDIT_FACET_DEFAULT_LIMIT, AUDIT_FACET_MAX_LIMIT);
+    const where = buildAuditWhere({ workspaceId: query.workspaceId, from: query.from, to: query.to });
+    const results = await Promise.all(
+      AUDIT_FACET_NAMES.map(async (name) => {
+        const f = FACET_SQL[name];
+        const sql = f.where ? `${where.sql} AND ${f.where}` : where.sql;
+        const rows = await this.rows<{ v: string; c: number }>(
+          `SELECT ${f.expr} AS v, count() AS c FROM audit_events ${sql}
+           GROUP BY v ORDER BY c DESC, v ASC LIMIT {limit:UInt32}`,
+          { ...where.params, limit: limit + 1 }
+        );
+        const values: AuditFacetValue[] = rows.slice(0, limit).map((r) => ({ value: r.v, count: Number(r.c) }));
+        return { name, values, truncated: rows.length > limit };
+      })
+    );
+    const facets = {} as Record<AuditFacetName, AuditFacetValue[]>;
+    const truncated: AuditFacetName[] = [];
+    for (const r of results) {
+      facets[r.name] = r.values;
+      if (r.truncated) truncated.push(r.name);
+    }
+    return { facets, truncated };
   }
 
   getTrace(

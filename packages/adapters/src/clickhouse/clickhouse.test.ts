@@ -106,23 +106,24 @@ describe('migration runner', () => {
       '0004_audit_events_durability.sql',
       '0005_ingest_state.sql',
       '0006_rollup_timezone.sql',
+      '0007_audit_read_indexes.sql',
     ]);
-    expect(m.map((x) => x.statements.length)).toEqual([1, 1, 2, 1, 2, 2]);
-    expect(new Set(m.map((x) => x.checksum)).size).toBe(6);
+    expect(m.map((x) => x.statements.length)).toEqual([1, 1, 2, 1, 2, 2, 8]);
+    expect(new Set(m.map((x) => x.checksum)).size).toBe(7);
   });
 
   it('keeps every statement idempotent', () => {
     for (const m of loadMigrations(migrationsDir)) {
-      for (const s of m.statements) expect(s).toMatch(/^(CREATE (TABLE|DATABASE) IF NOT EXISTS|ALTER TABLE \w+ (MODIFY SETTING|ADD COLUMN IF NOT EXISTS))/);
+      for (const s of m.statements) expect(s).toMatch(/^(CREATE (TABLE|DATABASE) IF NOT EXISTS|ALTER TABLE \w+ (MODIFY SETTING|ADD COLUMN IF NOT EXISTS|ADD INDEX IF NOT EXISTS|MATERIALIZE INDEX))/);
     }
   });
 
   it('applies pending migrations in order and records them', async () => {
     const { db, commands, recorded } = fakeDb();
     const result = await runMigrations(db, loadMigrations(migrationsDir));
-    expect(result.applied).toHaveLength(6);
-    expect(commands).toHaveLength(9);
-    expect(recorded.map((r) => r.version)).toEqual([1, 2, 3, 4, 5, 6]);
+    expect(result.applied).toHaveLength(7);
+    expect(commands).toHaveLength(17);
+    expect(recorded.map((r) => r.version)).toEqual([1, 2, 3, 4, 5, 6, 7]);
   });
 
   it('skips applied migrations and only runs new ones', async () => {
@@ -136,9 +137,10 @@ describe('migration runner', () => {
       '0004_audit_events_durability.sql',
       '0005_ingest_state.sql',
       '0006_rollup_timezone.sql',
+      '0007_audit_read_indexes.sql',
     ]);
-    expect(commands).toHaveLength(8);
-    expect(recorded.map((r) => r.version)).toEqual([2, 3, 4, 5, 6]);
+    expect(commands).toHaveLength(16);
+    expect(recorded.map((r) => r.version)).toEqual([2, 3, 4, 5, 6, 7]);
   });
 
   it('refuses to continue when an applied migration was edited', async () => {

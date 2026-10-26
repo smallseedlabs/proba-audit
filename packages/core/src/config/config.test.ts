@@ -124,3 +124,55 @@ describe('metrics ingestion config', () => {
     expect(c.connectors.stub.seed).toBe('abc');
   });
 });
+
+describe('read API config', () => {
+  it('has safe defaults: firebase verifier, no access, no cross-origin, one workspace', () => {
+    const { api } = loadConfig({});
+    expect(api.adapters).toEqual({ tokenVerifier: 'firebase', rateLimiter: 'memory', scopeSource: 'connectors' });
+    expect(api.workspaceId).toBe('seedbed');
+    expect(api.access).toEqual({ allowedEmails: [], allowedEmailDomains: [], adminEmails: [] });
+    expect(api.corsOrigins).toEqual([]);
+    expect(api.trustProxy).toBe(false);
+    expect(api.staticTokens).toEqual([]);
+    expect(api.chain).toEqual({ maxRangeHours: 24, maxEvents: 100000 });
+    expect(api.rateLimit).toMatchObject({ max: 120, windowMs: 60000, chainMax: 6 });
+  });
+
+  it('reads lists case-insensitively and de-duplicated', () => {
+    const { api } = loadConfig({
+      AUDIT_API_ALLOWED_EMAILS: ' Ana@Example.com, bo@example.com ,ana@example.com',
+      AUDIT_API_ALLOWED_EMAIL_DOMAINS: 'Example.COM',
+      AUDIT_API_ADMIN_EMAILS: 'Root@Example.com',
+      FIREBASE_PROJECT_ID: ' my-project ',
+      AUDIT_API_WORKSPACE_ID: 'acme',
+      AUDIT_API_TRUST_PROXY: 'true',
+      AUDIT_API_TOKEN_VERIFIER: 'static',
+      AUDIT_API_ANALYTICS_ACCOUNTS: 'meta:act_1, google:123-456',
+    });
+    expect(api.access).toEqual({ allowedEmails: ['ana@example.com', 'bo@example.com'], allowedEmailDomains: ['example.com'], adminEmails: ['root@example.com'] });
+    expect(api).toMatchObject({ firebaseProjectId: 'my-project', workspaceId: 'acme', trustProxy: true });
+    expect(api.analyticsAccounts).toEqual([{ platform: 'meta', accountId: 'act_1' }, { platform: 'google', accountId: '123-456' }]);
+  });
+
+  it('accepts only exact origins for CORS', () => {
+    expect(loadConfig({ AUDIT_API_CORS_ORIGINS: 'http://localhost:5173, https://insights.example.com/' }).api.corsOrigins).toEqual(['http://localhost:5173', 'https://insights.example.com']);
+    for (const bad of ['*', 'insights.example.com', 'https://insights.example.com/app', 'ftp://x.example.com']) {
+      expect(() => loadConfig({ AUDIT_API_CORS_ORIGINS: bad }), bad).toThrow(/AUDIT_API_CORS_ORIGINS/);
+    }
+  });
+
+  it('validates static tokens and analytics accounts', () => {
+    const tokens = JSON.stringify([{ token: 'long-enough-token', subject: 's1', email: 'a@example.com' }]);
+    expect(loadConfig({ AUDIT_API_STATIC_TOKENS: tokens }).api.staticTokens).toEqual([{ token: 'long-enough-token', subject: 's1', email: 'a@example.com', emailVerified: true }]);
+    expect(() => loadConfig({ AUDIT_API_STATIC_TOKENS: 'not json' })).toThrow(/AUDIT_API_STATIC_TOKENS/);
+    expect(() => loadConfig({ AUDIT_API_STATIC_TOKENS: JSON.stringify([{ token: 'short', subject: 's', email: 'a@example.com' }]) })).toThrow(/AUDIT_API_STATIC_TOKENS/);
+    expect(() => loadConfig({ AUDIT_API_ANALYTICS_ACCOUNTS: 'nope:1' })).toThrow(/AUDIT_API_ANALYTICS_ACCOUNTS/);
+    expect(() => loadConfig({ AUDIT_API_ANALYTICS_ACCOUNTS: 'meta' })).toThrow(/AUDIT_API_ANALYTICS_ACCOUNTS/);
+  });
+
+  it('never logs static tokens', () => {
+    const tokens = JSON.stringify([{ token: 'long-enough-token', subject: 's1', email: 'a@example.com' }]);
+    const logged = JSON.stringify(redactConfig(loadConfig({ AUDIT_API_STATIC_TOKENS: tokens })));
+    expect(logged).not.toContain('long-enough-token');
+  });
+});

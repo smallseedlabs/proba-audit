@@ -254,5 +254,187 @@ export function runAuditStoreContract(name: string, factory: () => Promise<Audit
         ingestedAt: second.ingestedAt,
       });
     });
+
+    describe('read API', () => {
+      const t = (min: number, sec = 0) => `2026-10-25T10:${String(min).padStart(2, '0')}:${String(sec).padStart(2, '0')}.000Z`;
+
+      it('searches with every filter, combined with AND, and scopes to the workspace', async () => {
+        const store = await create();
+        const workspaceId = uniqueName('ws');
+        const other = uniqueName('ws');
+        const goalId = randomUUID();
+        const threadId = randomUUID();
+        const traceId = randomUUID();
+        await store.appendBatch([
+          makeStoredAuditEvent({ workspaceId, occurredAt: t(1), action: 'campaign.launched', category: 'command', campaignId: 'cmp_9', riskLevel: 'high', actor: { type: 'user', id: 'u-1' }, service: 'hub', goalId, threadId, traceId, target: { type: 'campaign', id: 'cmp_9' } }),
+          makeStoredAuditEvent({ workspaceId, occurredAt: t(2), action: 'brain.llm_call', category: 'brain', outcome: 'failure', actor: { type: 'brain', id: 'b-1' }, service: 'brain' }),
+          makeStoredAuditEvent({ workspaceId: other, occurredAt: t(2), action: 'campaign.launched', campaignId: 'cmp_9' }),
+        ]);
+        const q = async (f: object) => (await store.search({ workspaceId, ...f })).events.map((e) => e.action);
+        expect(await q({})).toEqual(['brain.llm_call', 'campaign.launched']);
+        expect(await q({ campaignId: 'cmp_9' })).toEqual(['campaign.launched']);
+        expect(await q({ traceId })).toEqual(['campaign.launched']);
+        expect(await q({ goalId, threadId })).toEqual(['campaign.launched']);
+        expect(await q({ actorId: 'u-1' })).toEqual(['campaign.launched']);
+        expect(await q({ actorType: 'brain' })).toEqual(['brain.llm_call']);
+        expect(await q({ outcome: 'failure', category: 'brain', service: 'brain' })).toEqual(['brain.llm_call']);
+        expect(await q({ riskLevel: 'high' })).toEqual(['campaign.launched']);
+        expect(await q({ action: 'campaign.launched', riskLevel: 'low' })).toEqual([]);
+        expect(await q({ from: t(2) })).toEqual(['brain.llm_call']);
+        expect(await q({ to: t(2) })).toEqual(['campaign.launched']);
+      });
+
+      it('searches free text on action and target, ignoring case and treating wildcards literally', async () => {
+        const store = await create();
+        const workspaceId = uniqueName('ws');
+        await store.appendBatch([
+          makeStoredAuditEvent({ workspaceId, occurredAt: t(1), action: 'campaign.launched', target: { type: 'campaign', id: 'Spring_Sale_50%' } }),
+          makeStoredAuditEvent({ workspaceId, occurredAt: t(2), action: 'goal.created', target: { type: 'goal', id: 'g-1' } }),
+          makeStoredAuditEvent({ workspaceId, occurredAt: t(3), action: 'auth.sign_in' }),
+        ]);
+        const q = async (text: string) => (await store.search({ workspaceId, text, order: 'asc' })).events.map((e) => e.action);
+        expect(await q('LAUNCH')).toEqual(['campaign.launched']);
+        expect(await q('spring_sale')).toEqual(['campaign.launched']);
+        expect(await q('50%')).toEqual(['campaign.launched']);
+        expect(await q('%')).toEqual(['campaign.launched']);
+        expect(await q('goal')).toEqual(['goal.created']);
+        expect(await q('campaign')).toEqual(['campaign.launched']);
+        expect(await q('nothing-like-this')).toEqual([]);
+      });
+
+      it('pages with a keyset cursor in both orders without gaps or repeats, even with equal timestamps', async () => {
+        const store = await create();
+        const workspaceId = uniqueName('ws');
+        const events = Array.from({ length: 7 }, (_, i) =>
+          makeStoredAuditEvent({ workspaceId, occurredAt: t(Math.floor(i / 2)), details: { i } })
+        );
+        await store.appendBatch(events);
+        for (const order of ['asc', 'desc'] as const) {
+          const seen: string[] = [];
+          let after: { occurredAt: string; eventId: string } | undefined;
+          let pages = 0;
+          do {
+            const page = await store.search({ workspaceId, order, limit: 3, after });
+            expect(page.events.length).toBeLessThanOrEqual(3);
+            seen.push(...page.events.map((e) => e.eventId));
+            after = page.nextCursor ?? undefined;
+            pages += 1;
+          } while (after && pages < 10);
+          expect(pages).toBe(3);
+          expect(seen).toHaveLength(7);
+          expect(new Set(seen).size).toBe(7);
+          const times = seen.map((id) => events.find((e) => e.eventId === id)!.occurredAt);
+          const sorted = [...times].sort();
+          expect(times).toEqual(order === 'asc' ? sorted : sorted.reverse());
+        }
+        const exact = await store.search({ workspaceId, limit: 7 });
+        expect(exact.events).toHaveLength(7);
+        expect(exact.nextCursor).toBeNull();
+      });
+
+      it('caps the page size', async () => {
+        const store = await create();
+        const workspaceId = uniqueName('ws');
+        await store.appendBatch([makeStoredAuditEvent({ workspaceId })]);
+        const page = await store.search({ workspaceId, limit: 1_000_000 });
+        expect(page.events).toHaveLength(1);
+      });
+
+      it('gets one event by id, only inside its workspace', async () => {
+        const store = await create();
+        const workspaceId = uniqueName('ws');
+        const e = makeStoredAuditEvent({ workspaceId, details: { a: 1 }, tags: ['x'] });
+        await store.appendBatch([e]);
+        expect(await store.getEvent(workspaceId, e.eventId)).toEqual(e);
+        expect(await store.getEvent(uniqueName('ws'), e.eventId)).toBeNull();
+        expect(await store.getEvent(workspaceId, randomUUID())).toBeNull();
+      });
+
+      it('lists recent traces newest first with a summary of the whole trace', async () => {
+        const store = await create();
+        const workspaceId = uniqueName('ws');
+        const a = randomUUID();
+        const b = randomUUID();
+        const c = randomUUID();
+        await store.appendBatch([
+          // trace a: root + child failure + denied sibling, high risk; ends 3s after the last start
+          makeStoredAuditEvent({ workspaceId, traceId: a, spanId: '1000000000000001', occurredAt: t(1), action: 'command.received', service: 'hub', durationMs: 5 }),
+          makeStoredAuditEvent({ workspaceId, traceId: a, spanId: '1000000000000002', parentSpanId: '1000000000000001', occurredAt: t(1, 2), action: 'brain.llm_call', category: 'brain', outcome: 'failure', riskLevel: 'medium', durationMs: 3000, service: 'brain' }),
+          makeStoredAuditEvent({ workspaceId, traceId: a, spanId: '1000000000000003', parentSpanId: '1000000000000001', occurredAt: t(1, 3), action: 'policy.denied', category: 'policy', outcome: 'denied', riskLevel: 'high' }),
+          // trace b: single success
+          makeStoredAuditEvent({ workspaceId, traceId: b, spanId: '2000000000000001', occurredAt: t(5), action: 'auth.sign_in', category: 'auth', service: 'hub' }),
+          // trace c: started before the window, active inside it
+          makeStoredAuditEvent({ workspaceId, traceId: c, spanId: '3000000000000001', occurredAt: t(0), action: 'goal.created', category: 'data_access' }),
+          makeStoredAuditEvent({ workspaceId, traceId: c, spanId: '3000000000000002', parentSpanId: '3000000000000001', occurredAt: t(8), action: 'goal.updated', category: 'data_access', outcome: 'partial' }),
+          makeStoredAuditEvent({ workspaceId: uniqueName('ws'), occurredAt: t(9) }),
+        ]);
+        const page = await store.listTraces({ workspaceId, from: t(1), to: t(10) });
+        expect(page.traces.map((x) => x.traceId)).toEqual([c, b, a]);
+        expect(page.nextCursor).toBeNull();
+        const [sc, sb, sa] = page.traces;
+        expect(sa).toEqual({
+          traceId: a,
+          rootAction: 'command.received',
+          rootService: 'hub',
+          startedAt: t(1),
+          lastEventAt: t(1, 3),
+          eventCount: 3,
+          outcome: 'failure',
+          riskLevel: 'high',
+          durationMs: 5000, // 10:01:02 + 3000 ms = 10:01:05 is the latest end; the trace began at 10:01:00
+        });
+        expect(sb).toMatchObject({ rootAction: 'auth.sign_in', eventCount: 1, outcome: 'success', durationMs: 0 });
+        expect(sb.riskLevel).toBeUndefined();
+        // The summary covers the event before the window too.
+        expect(sc).toMatchObject({ rootAction: 'goal.created', eventCount: 2, startedAt: t(0), lastEventAt: t(8), outcome: 'partial' });
+      });
+
+      it('pages the trace list with a cursor', async () => {
+        const store = await create();
+        const workspaceId = uniqueName('ws');
+        const ids = Array.from({ length: 5 }, () => randomUUID());
+        await store.appendBatch(ids.map((traceId, i) => makeStoredAuditEvent({ workspaceId, traceId, occurredAt: t(i) })));
+        const seen: string[] = [];
+        let after;
+        let pages = 0;
+        do {
+          const page: Awaited<ReturnType<typeof store.listTraces>> = await store.listTraces({ workspaceId, limit: 2, after });
+          seen.push(...page.traces.map((x) => x.traceId));
+          after = page.nextCursor ?? undefined;
+          pages += 1;
+        } while (after && pages < 10);
+        expect(pages).toBe(3);
+        expect(seen).toEqual([...ids].reverse());
+        expect(await store.listTraces({ workspaceId: uniqueName('ws') })).toEqual({ traces: [], nextCursor: null });
+      });
+
+      it('returns capped facets with counts, most frequent first', async () => {
+        const store = await create();
+        const workspaceId = uniqueName('ws');
+        await store.appendBatch([
+          makeStoredAuditEvent({ workspaceId, occurredAt: t(1), service: 'hub', action: 'command.received', campaignId: 'cmp_a' }),
+          makeStoredAuditEvent({ workspaceId, occurredAt: t(2), service: 'hub', action: 'command.received', campaignId: 'cmp_a', riskLevel: 'high' }),
+          makeStoredAuditEvent({ workspaceId, occurredAt: t(3), service: 'brain', action: 'brain.llm_call', category: 'brain', actor: { type: 'brain', id: 'b-1' }, outcome: 'failure' }),
+          makeStoredAuditEvent({ workspaceId, occurredAt: t(30), service: 'late', action: 'system.started', category: 'system' }),
+          makeStoredAuditEvent({ workspaceId: uniqueName('ws'), service: 'foreign' }),
+        ]);
+        const all = await store.facets({ workspaceId, from: t(0), to: t(10) });
+        expect(all.facets.service).toEqual([{ value: 'hub', count: 2 }, { value: 'brain', count: 1 }]);
+        expect(all.facets.action[0]).toEqual({ value: 'command.received', count: 2 });
+        expect(all.facets.outcome).toEqual([{ value: 'success', count: 2 }, { value: 'failure', count: 1 }]);
+        expect(all.facets.riskLevel).toEqual([{ value: 'high', count: 1 }]);
+        expect(all.facets.campaignId).toEqual([{ value: 'cmp_a', count: 2 }]);
+        expect(all.facets.actorType.map((v) => v.value).sort()).toEqual(['brain', 'service']);
+        expect(all.facets.category.map((v) => v.value).sort()).toEqual(['brain', 'command']);
+        expect(all.truncated).toEqual([]);
+        const capped = await store.facets({ workspaceId, from: t(0), to: t(10), limit: 1 });
+        expect(capped.facets.service).toEqual([{ value: 'hub', count: 2 }]);
+        expect(capped.truncated).toContain('service');
+        expect(capped.truncated).not.toContain('riskLevel');
+        const wide = await store.facets({ workspaceId });
+        expect(wide.facets.service.map((v) => v.value)).toContain('late');
+        expect(wide.facets.service.map((v) => v.value)).not.toContain('foreign');
+      });
+    });
   });
 }

@@ -173,3 +173,11 @@ export interface FetchWindow {
   to: string;
   granularity: MetricGranularity;
 }
+
+/** How recent the metrics of a set of accounts are (UTC ISO 8601). */
+export interface MetricsFreshness {
+  /** When the rollups were last recomputed; null when there are none. */
+  rollupsComputedAt: string | null;
+  /** When an ad platform was last asked for the data stored; null when there are none. */
+  observationsFetchedAt: string | null;
+}

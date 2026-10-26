@@ -11,7 +11,7 @@ proba-audit is the audit trail and ad-metrics analytics backend of Proba.
 
 The event and observation shapes are defined once, in
 [proba-protocol](https://github.com/smallseedlabs/proba-protocol) (`@smallseedlabs/proba-protocol/audit`).
-This repo never redefines them. (Pinned to the `v0.3.0` release tag.)
+This repo never redefines them. (Pinned to the `v0.3.1` release tag.)
 
 This PR is the **foundation only**: ports, default adapters, config, logger, migrations and
 runnable-but-empty processes. The consumer, API, ingester and rollup logic come later.
@@ -21,14 +21,14 @@ runnable-but-empty processes. The consumer, API, ingester and rollup logic come 
 | App | Port | Job (later) |
 |-----|------|-------------|
 | `apps/audit-consumer` | 3101 | Read audit events from the bus, validate, extend the hash chain, append to the AuditStore, ack / dead-letter |
-| `apps/audit-api` | 3100 | Query API over the AuditStore and MetricsStore |
+| `apps/audit-api` | 3100 | Read-only HTTP API over the AuditStore and MetricsStore for the insights portal (see "Read API") |
 | `apps/metrics-ingester` | 3102 | Pull ad metrics through the `PlatformConnector` port on a schedule, validate, store `MetricObservation`s (see "Metrics flow") |
 | `apps/rollup` | 3103 | Recompute hourly/daily rollups from the latest observation revisions, per account timezone |
 
 Each one loads config, logs its lifecycle as structured JSON, serves `GET /health`, and exits 0 on SIGTERM/SIGINT
 (all four use `runService` from `packages/core`). `audit-consumer` runs the audit pipeline described below,
-`metrics-ingester` and `rollup` run the metrics flow ("Metrics flow"); `audit-api` is still the foundation skeleton (its first
-read functions exist as a library, see "Read side"). One Dockerfile has a target per app (plus `migrate` and `metrics-report`).
+`metrics-ingester` and `rollup` run the metrics flow ("Metrics flow"); `audit-api` serves the read API ("Read API").
+One Dockerfile has a target per app (plus `migrate` and `metrics-report`).
 
 ## The two flows
 
@@ -175,9 +175,10 @@ The consumer records its own activity through the same `AuditEmitter` and bus as
 
 These events come back through the consumer, so there is a loop guard: a batch consisting only of the consumer's own events (same `service`) produces
 no batch event, which stops the feedback after one hop.
-`AuditedReader` (`packages/core/src/audit/audited-reader.ts`) is the same idea for reads: audit-api routes call it instead of the store
-and each query emits `data_access.audit_query`, `data_access.audit_trace` or `data_access.audit_aggregate` (filter names and result
-size, never values or data). audit-api has no query routes yet, so nothing calls it in this repo.
+`AuditedReader` (`packages/core/src/audit/audited-reader.ts`) is the same idea for reads: audit-api routes call it instead of the store.
+The typed reads emit `data_access.audit_query`, `data_access.audit_trace` or `data_access.audit_aggregate`; every HTTP read uses
+`AuditedReader.read`, which emits the generic `data_access.read` with `details.operation` (`events.search`, `events.get`, `traces.get`,
+`traces.list`, `facets.list`, `chain.verify`, `session.get`) and the route and role. Filter names and result size are recorded, never values or data.
 
 ### Logging
 
@@ -369,6 +370,63 @@ The profile sets `NODE_ENV=development` and `ALLOW_STUB_CONNECTOR=true` for its 
 | Crash mid-run | No cursor was written; the next run repeats the window and double counts nothing |
 | Rollup failure | Watermark unchanged; the next run recomputes the same window |
 | Consumer's stream or group deleted | The audit-consumer recreates the stream and group and carries on |
+
+## Read API
+
+`apps/audit-api` is a Fastify service (the same framework as proba-hub) with read-only, versioned routes under `/v1`. The contract is
+[`docs/openapi.yaml`](openapi.yaml); `apps/audit-api/src/openapi.test.ts` fails when the document, the registered routes, the query schemas, the caps
+or the real response bodies drift apart.
+
+| Route | Purpose | Role |
+|-------|---------|------|
+| `GET /v1/session` | the caller's identity and role | viewer |
+| `GET /v1/events` | search: time range, `traceId`, `actor`, `actorType`, `service`, `action`, `category`, `outcome`, `riskLevel`, `goalId`, `threadId`, `campaignId`, text `q` on action and target; `order`, `limit` (max 200), `cursor` | viewer |
+| `GET /v1/events/:eventId` | one event with its chain fields | viewer |
+| `GET /v1/traces` | recent traces with summaries (root action, event count, outcome, risk, duration) | viewer |
+| `GET /v1/traces/:traceId` | span tree with parent/child, durations, outcome roll-up, related goal/thread/campaign ids | viewer |
+| `GET /v1/chain/verify?from&to` | `verifyChain` over the caller's workspace, bounded (24 h, 100 000 events by default) | admin |
+| `GET /v1/analytics/summary`, `/compare`, `/campaigns` | `getMetricsSummary` / `comparePeriods` / top campaigns by spend, with data freshness (`asOf`) | viewer |
+| `GET /v1/facets` | distinct values per filter with counts, capped | viewer |
+| `GET /health`, `GET /ready` | liveness; readiness of ClickHouse and Redis (no credentials, no audit event) | none |
+
+**No free SQL.** Every route parses its query with a zod schema (`apps/audit-api/src/http/schemas.ts`): unknown parameters are rejected (a `workspaceId`
+parameter is a 400), strings are bounded, page sizes are capped (events 200, traces 100, facets 100 values, campaigns 100 rows), time ranges are
+capped (events 90 days, traces 7 days) and the default range is the last 24 hours. Free text is matched literally (`positionCaseInsensitive`), never as a pattern.
+Pagination is keyset: the cursor is an opaque, URL-safe sort position (`occurredAt`, `eventId`, and the order it was issued for) that grants nothing,
+because the workspace and every filter are applied again on each request.
+
+**Workspace scope is injected.** The workspace comes from the authenticated session (configuration), never from the request. Analytics
+use the same rule one level down: the metric tables are keyed by ad account, so a `ScopeResolver` (`AUDIT_API_SCOPE_SOURCE=connectors|static`) maps the
+workspace to its accounts.
+
+### Authentication and authorisation
+
+- **Authentication**: `Authorization: Bearer <Firebase ID token>`: the same token proba-hub accepts. A `TokenVerifier` port
+  (`packages/core/src/ports/token-verifier.ts`) has a `firebase` adapter, which verifies the RS256 signature against Google's public securetoken JWKS (no secret; keys cached,
+  an unreachable key endpoint is a `503`, never a pass) with the same claim checks as the Hub (`iss`, `aud` = `FIREBASE_PROJECT_ID`, `exp`, `iat`, `auth_time`, non-empty `sub`,
+  small clock skew), and a `static` adapter for local automated use only (refused when `NODE_ENV=production`). Selected by `AUDIT_API_TOKEN_VERIFIER`.
+  Tokens are never accepted in the URL. Unlike the Hub, the API does not exchange the ID token for its own session: it verifies it on every call (stateless, no secret to share).
+- **Authorisation** (`apps/audit-api/src/authorization.ts`): the verified email must be present **and verified** by Firebase. It is `admin` when in `AUDIT_API_ADMIN_EMAILS`, `viewer`
+  when in `AUDIT_API_ALLOWED_EMAILS` or its domain is in `AUDIT_API_ALLOWED_EMAIL_DOMAINS`, otherwise `403`. All lists come from configuration; an empty policy allows nobody
+  (and logs a warning at start-up). Chain verification is admin-only.
+- **Audited**: every authenticated read emits a `data_access.*` event under the response's `X-Trace-Id` (see "Self-audit"), and the read is refused with `500` if that event cannot be
+  published (fail closed). Refusals are emitted as `auth.denied` (reason, never the token), throttled so a flood cannot flood the trail. Unexpected errors emit `system.error`.
+- **Rate limited** through the `RateLimiter` port (`memory`, `redis`; `AUDIT_API_RATE_LIMITER`): per signed-in user, a lower limit for chain verification, and per client address
+  for rejected credentials. `429` carries `Retry-After`. The Redis adapter fails open (and logs) if Redis is unreachable.
+- **CORS** allows only the exact origins in `AUDIT_API_CORS_ORIGINS` (none by default), GET and OPTIONS only, and exposes `X-Trace-Id` and `Retry-After`.
+- Every response has `X-Trace-Id` (a fresh id; a client-supplied one is ignored), `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`. Logs are structured JSON with the
+  `traceId`, the route pattern and query parameter *names* only.
+
+### Store reads (ports)
+
+The `AuditStore` port gained `search` (keyset, `ORDER BY occurred_at, event_id` which is the table's sorting key), `getEvent`, `listTraces` (two steps: the newest trace ids in the window, then
+their summaries over all their events), `facets` and `readChain` support for bounded verification. `MetricsStore` gained `getFreshness` (last rollup, last fetch). Memory and ClickHouse
+implementations pass the same contract suites. `audit_events` is a plain MergeTree (append-only, no `FINAL`); the metric tables are ReplacingMergeTree and read with `FINAL` / `argMax`.
+Migration `0007` adds skip indexes for event id, campaign, action and `ingested_at` (indexes only, data untouched).
+
+### Freshness
+
+Analytics responses include `freshness`: `rollupsComputedAt`, `observationsFetchedAt` and `asOf`, the earlier of the two (the moment the figures are current to), or `null` when there is no data.
 
 ## Data model overview
 

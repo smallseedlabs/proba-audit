@@ -5,8 +5,8 @@
 [![CI](https://github.com/smallseedlabs/proba-audit/actions/workflows/ci.yml/badge.svg)](https://github.com/smallseedlabs/proba-audit/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
-This is the **foundation**: ports, default adapters, config, logger, ClickHouse migrations and four runnable (but empty) processes.
-Consumer, API, ingester and rollup logic come in later PRs. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+Ports, default adapters, config, logger and ClickHouse migrations, plus the audit consumer, the metrics ingester, the rollup worker and a
+read-only HTTP API (`audit-api`) that the insights portal uses. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Layout
 
@@ -38,6 +38,20 @@ docker compose --profile apps up -d --build
 curl localhost:3100/health     # audit-api   (3101 consumer, 3102 ingester, 3103 rollup)
 docker compose --profile apps down
 ```
+
+### Read API
+
+`audit-api` serves versioned, read-only routes under `/v1` (events, traces, chain verification, analytics, facets); the contract is
+[docs/openapi.yaml](docs/openapi.yaml). Callers sign in with the same Firebase ID token as the Proba Hub:
+
+```bash
+# in .env: FIREBASE_PROJECT_ID, AUDIT_API_ALLOWED_EMAILS (or _DOMAINS / _ADMIN_EMAILS), AUDIT_API_CORS_ORIGINS
+docker compose --profile apps up -d --build audit-api
+curl -H "Authorization: Bearer $ID_TOKEN" 'localhost:3100/v1/events?outcome=failure&limit=20'
+```
+
+Nobody is allowed until an allow-list is configured. For automated local use set `AUDIT_API_TOKEN_VERIFIER=static` with `AUDIT_API_STATIC_TOKENS`
+(refused when `NODE_ENV=production`). See [Read API](docs/ARCHITECTURE.md#read-api).
 
 Run one app locally: `npm run build && node apps/audit-api/dist/index.js` (or `npm run dev:api`).
 If a host port is taken, set `REDIS_HOST_PORT` / `CLICKHOUSE_HTTP_HOST_PORT` (and match `REDIS_URL` / `CLICKHOUSE_URL`).
@@ -72,8 +86,8 @@ Every adapter must pass its port's contract suite (`runEventBusContract(...)` et
 
 ## Protocol dependency
 
-The audit/metric contract comes from `@smallseedlabs/proba-protocol/audit` (released in proba-protocol `v0.3.0`),
-installed from the release tag: `github:smallseedlabs/proba-protocol#v0.3.0`. Schemas are never copied into this repo.
+The audit/metric contract comes from `@smallseedlabs/proba-protocol/audit` (released in proba-protocol `v0.3.1`),
+installed from the release tag: `github:smallseedlabs/proba-protocol#v0.3.1`. Schemas are never copied into this repo.
 
 ## License
 

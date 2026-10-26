@@ -38,6 +38,8 @@ export interface ChainVerification {
   problems: ChainProblem[];
   /** False when verification stopped early after `maxProblems` problems. */
   complete: boolean;
+  /** Present (true) only when the `maxEvents` bound stopped verification before the range was exhausted. */
+  truncated?: boolean;
 }
 
 export interface VerifyChainOptions {
@@ -45,6 +47,8 @@ export interface VerifyChainOptions {
   pageSize?: number;
   /** Stop after this many problems. Default 50. */
   maxProblems?: number;
+  /** Stop after checking this many events (a bound for requests served on demand). Default: no bound. */
+  maxEvents?: number;
 }
 
 /**
@@ -68,6 +72,8 @@ export async function verifyChain(
 ): Promise<ChainVerification> {
   const pageSize = options.pageSize ?? 1000;
   const maxProblems = options.maxProblems ?? 50;
+  const maxEvents = options.maxEvents ?? Infinity;
+  let truncated = false;
   const problems: ChainProblem[] = [];
   const report = (type: ChainProblemType, e: StoredAuditEvent, detail: string): void => {
     if (problems.length < maxProblems) problems.push({ type, eventId: e.eventId, detail });
@@ -104,6 +110,10 @@ export async function verifyChain(
     if (page.length === 0) break;
 
     for (const e of page) {
+      if (checked >= maxEvents) {
+        truncated = true;
+        break;
+      }
       checked += 1;
       first ??= e;
       last = e;
@@ -124,7 +134,7 @@ export async function verifyChain(
       previousIngestedAt = e.ingestedAt;
       isFirst = false;
     }
-    if (page.length < pageSize) break;
+    if (truncated || page.length < pageSize) break;
     const tail = page[page.length - 1] as StoredAuditEvent;
     cursor = { ingestedAt: tail.ingestedAt, eventId: tail.eventId };
   }
@@ -139,5 +149,6 @@ export async function verifyChain(
     lastHash: last?.hash ?? null,
     problems,
     complete: problems.length < maxProblems,
+    ...(truncated ? { truncated: true } : {}),
   };
 }

@@ -9,3 +9,5 @@ export * from './audit-emitter.js';
 export * from './outbox-store.js';
 export * from './checkpoint-store.js';
 export * from './quarantine-store.js';
+export * from './token-verifier.js';
+export * from './rate-limiter.js';

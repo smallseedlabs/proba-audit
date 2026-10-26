@@ -354,5 +354,32 @@ export function runMetricsStoreContract(name: string, factory: () => Promise<Met
       await store.upsertObservations([makeObservation({ accountId, ...hour(8) })]);
       expect((await store.changedSince(settled))?.observationCount).toBeGreaterThanOrEqual(1);
     });
+
+    it('reports how fresh the data of the given accounts is', async () => {
+      const store = await create();
+      const accountId = uniqueName('act');
+      const otherId = uniqueName('act');
+      const scope = [{ platform: 'meta' as const, accountId }];
+      expect(await store.getFreshness(scope)).toEqual({ rollupsComputedAt: null, observationsFetchedAt: null });
+      expect(await store.getFreshness([])).toEqual({ rollupsComputedAt: null, observationsFetchedAt: null });
+
+      await store.upsertObservations([
+        makeObservation({ accountId, ...hour(3), fetchedAt: '2026-10-25T04:00:00.000Z' }),
+        makeObservation({ accountId, ...hour(4), fetchedAt: '2026-10-25T05:30:00.000Z' }),
+        makeObservation({ accountId: otherId, ...hour(5), fetchedAt: '2026-10-26T09:00:00.000Z' }),
+      ]);
+      // A restatement fetched later moves the time forward; the superseded revision does not count twice.
+      await store.upsertObservations([makeObservation({ accountId, ...hour(3), revision: 1, fetchedAt: '2026-10-25T06:15:00.000Z' })]);
+      const beforeRollup = await store.getFreshness(scope);
+      expect(beforeRollup).toEqual({ rollupsComputedAt: null, observationsFetchedAt: '2026-10-25T06:15:00.000Z' });
+
+      await store.computeRollups({ bucket: 'hour', from: '2026-10-25T00:00:00.000Z', to: '2026-10-26T00:00:00.000Z' });
+      const afterRollup = await store.getFreshness(scope);
+      expect(afterRollup.observationsFetchedAt).toBe('2026-10-25T06:15:00.000Z');
+      expect(afterRollup.rollupsComputedAt).not.toBeNull();
+      expect(Math.abs(Date.now() - Date.parse(afterRollup.rollupsComputedAt as string))).toBeLessThan(60_000);
+      // Another account's fetch (2026-10-26) never leaks in.
+      expect((await store.getFreshness([{ platform: 'google', accountId }])).observationsFetchedAt).toBeNull();
+    });
   });
 }

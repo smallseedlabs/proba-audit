@@ -11,6 +11,8 @@ import {
   type MetricsStore,
   type PlatformConnector,
   type QuarantineStore,
+  type RateLimiter,
+  type TokenVerifier,
 } from '@smallseedlabs/proba-audit-core';
 import { createClickHouseClient } from '../clickhouse/client.js';
 import { ClickHouseAuditStore } from '../clickhouse/audit-store.js';
@@ -23,6 +25,10 @@ import { InMemoryAuditStore } from '../memory/audit-store.js';
 import { InMemoryEventBus } from '../memory/event-bus.js';
 import { InMemoryMetricsStore } from '../memory/metrics-store.js';
 import { RedisStreamsEventBus } from '../redis/redis-streams-event-bus.js';
+import { FirebaseTokenVerifier } from '../auth/firebase-token-verifier.js';
+import { StaticTokenVerifier } from '../auth/static-token-verifier.js';
+import { InMemoryRateLimiter } from '../ratelimit/memory-rate-limiter.js';
+import { RedisRateLimiter } from '../ratelimit/redis-rate-limiter.js';
 import { RandomIdGenerator, SystemClock } from './system.js';
 
 /** What every adapter factory receives. */
@@ -49,6 +55,10 @@ export interface Registries {
    * PLATFORM_CONNECTORS (meta:<name>). Register a real library's adapter here.
    */
   platformConnector: AdapterRegistry<PlatformConnector, ConnectorDeps>;
+  /** Who is calling the read API: AUDIT_API_TOKEN_VERIFIER. */
+  tokenVerifier: AdapterRegistry<TokenVerifier, AdapterDeps>;
+  /** How the read API counts requests: AUDIT_API_RATE_LIMITER. */
+  rateLimiter: AdapterRegistry<RateLimiter, AdapterDeps>;
 }
 
 /**
@@ -109,7 +119,16 @@ export function createDefaultRegistries(): Registries {
       })
   );
 
-  return { eventBus, auditStore, metricsStore, checkpointStore, quarantineStore, platformConnector };
+  // The read API (apps/audit-api). `static` exists for automated checks and local runs and refuses production.
+  const tokenVerifier = new AdapterRegistry<TokenVerifier, AdapterDeps>('TokenVerifier')
+    .register('firebase', ({ config }) => new FirebaseTokenVerifier({ projectId: config.api.firebaseProjectId }))
+    .register('static', ({ config }) => new StaticTokenVerifier({ tokens: config.api.staticTokens, nodeEnv: config.env }));
+
+  const rateLimiter = new AdapterRegistry<RateLimiter, AdapterDeps>('RateLimiter')
+    .register('memory', ({ clock }) => new InMemoryRateLimiter(clock))
+    .register('redis', ({ config, logger }) => new RedisRateLimiter({ url: config.eventBus.redisUrl, logger }));
+
+  return { eventBus, auditStore, metricsStore, checkpointStore, quarantineStore, platformConnector, tokenVerifier, rateLimiter };
 }
 
 /**

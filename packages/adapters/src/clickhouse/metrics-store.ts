@@ -3,7 +3,9 @@ import {
   METRIC_QUERY_DEFAULT_LIMIT,
   METRIC_QUERY_MAX_LIMIT,
   alignWindow,
+  type AccountRef,
   type ChangedWindow,
+  type MetricsFreshness,
   type Clock,
   type MetricAggregate,
   type RollupAggregateFilter,
@@ -482,6 +484,29 @@ export class ClickHouseMetricsStore implements MetricsStore {
       },
       observationCount: Number(r.observation_count),
     }));
+  }
+
+  /**
+   * max() of a timestamp is the same with or without FINAL: a superseded row never has a later
+   * computed_at / fetched_at than the row that replaced it, so no collapsing is needed here.
+   */
+  async getFreshness(accounts: readonly AccountRef[]): Promise<MetricsFreshness> {
+    if (accounts.length === 0) return { rollupsComputedAt: null, observationsFetchedAt: null };
+    const params = { ap: accounts.map((a) => a.platform), aa: accounts.map((a) => a.accountId) };
+    const scope = 'has(arrayZip({ap:Array(String)}, {aa:Array(String)}), (toString(platform), account_id))';
+    const [hourly, daily, observed] = await Promise.all([
+      this.rows<{ t: string | null }>(`SELECT maxOrNull(computed_at) AS t FROM metric_rollups_hourly WHERE ${scope}`, params),
+      this.rows<{ t: string | null }>(`SELECT maxOrNull(computed_at) AS t FROM metric_rollups_daily WHERE ${scope}`, params),
+      this.rows<{ t: string | null }>(`SELECT maxOrNull(fetched_at) AS t FROM metric_observations WHERE ${scope}`, params),
+    ]);
+    const latest = (values: (string | null | undefined)[]): string | null => {
+      const times = values.filter((v): v is string => typeof v === 'string').map((v) => Date.parse(v));
+      return times.length === 0 ? null : new Date(Math.max(...times)).toISOString();
+    };
+    return {
+      rollupsComputedAt: latest([hourly[0]?.t, daily[0]?.t]),
+      observationsFetchedAt: latest([observed[0]?.t]),
+    };
   }
 
   async changedSince(since?: string): Promise<ChangedWindow | null> {
