@@ -12,3 +12,4 @@ export * from './id-generator.contract.js';
 export * from './logger.contract.js';
 export * from './platform-connector.contract.js';
 export * from './outbox-store.contract.js';
+export * from './ingest-state.contract.js';

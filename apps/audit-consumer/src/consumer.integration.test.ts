@@ -6,6 +6,7 @@
 import { randomUUID } from 'node:crypto';
 import { resolve } from 'node:path';
 import pg from 'pg';
+import { createClient } from 'redis';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import {
   OutboxRelay,
@@ -178,6 +179,29 @@ describe('audit pipeline: Redis -> consumer -> ClickHouse', () => {
     await waitFor(async () => (await count(dead.store, ws)) === 4);
     await waitFor(async () => (await live.h.pending()) === 0);
     expect(await verifyChain(dead.store, ws)).toMatchObject({ ok: true, checked: 4 });
+  });
+
+  it('recreates the stream and consumer group if they disappear while running, and keeps ingesting', async () => {
+    const s = stack();
+    const ws = s.ws('g');
+    await s.h.consumer.start();
+    await s.h.publish(makeEvent({ workspaceId: ws, details: { n: 1 } }));
+    await waitFor(async () => (await count(s.store, ws)) === 1);
+
+    // Someone deletes the stream (a Redis flush has the same effect): the group goes with it.
+    const redis = createClient({ url: config.eventBus.redisUrl });
+    await redis.connect();
+    try {
+      expect(await redis.del(s.topic)).toBe(1);
+      // The consumer is blocked in XREADGROUP; give it time to hit NOGROUP and recover.
+      await waitFor(async () => s.h.logger.records.some((r) => r.fields.lifecycle === 'group_recreated'));
+      await s.h.publish(makeEvent({ workspaceId: ws, details: { n: 2 } }), makeEvent({ workspaceId: ws, details: { n: 3 } }));
+      await waitFor(async () => (await count(s.store, ws)) === 3);
+      await waitFor(async () => (await s.h.pending()) === 0);
+    } finally {
+      await redis.quit();
+    }
+    expect(await verifyChain(s.store, ws)).toMatchObject({ ok: true, checked: 3 });
   });
 
   it('handles duplicates: identical redeliveries are skipped, conflicting content goes to the real DLQ', async () => {

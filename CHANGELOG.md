@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Metrics flow on a development data source: the finalised `PlatformConnector` port (accounts, campaigns, incremental
+  `fetchObservations` by cursor, capabilities, typed rate-limit/transient/auth errors, `runPlatformConnectorContract`),
+  `StubPlatformConnector` (deterministic from seed and clock, per-account timezone, controllable restatements, injectable faults,
+  `stub:` source refs, refuses production unless `ALLOW_STUB_CONNECTOR=true`), and `PLATFORM_CONNECTORS=meta:stub,google:stub`.
+- `metrics-ingester`: per (platform, account) scheduler with jitter, overlap lease and failure backoff; `SyncEngine` with incremental
+  windows, retries with backoff, rate-limit hints, protocol validation, quarantine, idempotent writes, checkpoints written after the data
+  is durable, one `traceId` per run, and `metrics.fetch_started|ingested|restated|fetch_completed|fetch_failed` audit events.
+- `CheckpointStore` and `QuarantineStore` ports (memory and ClickHouse), ClickHouse migration `0005` (`ingest_checkpoints`,
+  `metric_observation_quarantine`) and `0006` (`timezone`, `bucket_date` on daily rollups).
+- `rollup`: `RollupWorker` driven by `MetricsStore.changedSince`, hourly and daily rollups per campaign and account, daily buckets in the account
+  timezone, restatement-correct sums, `metrics.rollup_run` events. `MetricsStore.aggregateRollups` and `changedSince`.
+- Analytics read functions `MetricsAnalytics.getMetricsSummary` and `comparePeriods` (strict validation and caps), `AuditedAnalyticsReader`
+  with an injected `ScopeResolver` (`data_access.metrics_summary` / `data_access.metrics_compare`).
+- Compose profile `metrics-e2e` and the `metrics-report` target; "Metrics flow" in `docs/ARCHITECTURE.md`.
+
+### Changed
+
+- proba-audit pins proba-protocol `v0.3.0`.
+- `StaticPlatformConnector` implements the new port.
+
+### Fixed
+
+- `audit-consumer` recreates the stream and consumer group when they disappear while it is running (NOGROUP).
+
+### Added (earlier)
+
 - Audit pipeline: `AuditEmitter` port with bus and outbox emitters, `OutboxStore` port
   (`InMemoryOutboxStore`, `PostgresOutboxStore` + `migrations/postgres/0001_audit_outbox.sql`),
   `OutboxRelay`, `verifyChain`, `AuditedReader`, and the `audit-consumer` app (consumer group,

@@ -59,7 +59,7 @@ services:
   # One-shot: create the database and apply ClickHouse migrations.
   # docker compose --profile apps run --rm migrate
   migrate:
-    profiles: ["apps"]
+    profiles: ["apps", "metrics-e2e"]
     build:
       context: .
       target: migrate
@@ -77,6 +77,12 @@ services:
       EVENT_BUS: ${EVENT_BUS:-redis-streams}
       AUDIT_STORE: ${AUDIT_STORE:-clickhouse}
       METRICS_STORE: ${METRICS_STORE:-clickhouse}
+      CHECKPOINT_STORE: ${CHECKPOINT_STORE:-clickhouse}
+      QUARANTINE_STORE: ${QUARANTINE_STORE:-clickhouse}
+      # Which analytics library serves which ad platform. Empty: the ingester idles.
+      # The development data source is meta:stub (see the metrics-e2e profile).
+      PLATFORM_CONNECTORS: ${PLATFORM_CONNECTORS:-}
+      INGEST_WORKSPACE_ID: ${INGEST_WORKSPACE_ID:-seedbed}
 
   audit-consumer:
     profiles: ["apps"]
@@ -137,6 +143,82 @@ services:
     ports:
       - "${ROLLUP_HOST_PORT:-3103}:3103"
     restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # End to end on the development data source (no real ad platform involved):
+  #   docker compose --profile metrics-e2e up -d --build e2e-ingester e2e-rollup e2e-audit-consumer
+  #   docker compose --profile metrics-e2e run --rm metrics-report     # waits up to 90 s for data
+  #   docker compose --profile metrics-e2e down
+  # The ingester pulls from the stub connector every few seconds (the stub restates recent
+  # hours every minute), the rollup worker follows, the audit consumer stores the audit trail,
+  # and metrics-report prints what the read side returns. NODE_ENV=development and
+  # ALLOW_STUB_CONNECTOR are set here ONLY: the apps profile above runs production-like and
+  # refuses the stub.
+  # ---------------------------------------------------------------------------
+  e2e-ingester:
+    profiles: ["metrics-e2e"]
+    build:
+      context: .
+      target: metrics-ingester
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    environment: &e2e-env
+      <<: *app-env
+      NODE_ENV: development
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      PLATFORM_CONNECTORS: meta:stub,google:stub
+      ALLOW_STUB_CONNECTOR: "true"
+      INGEST_INTERVAL_MS: ${E2E_INGEST_INTERVAL_MS:-5000}
+      INGEST_INITIAL_LOOKBACK_HOURS: 72
+      # The stub revises every period of the last 2 hours once a minute, so a short run shows restatements.
+      STUB_RESTATE_EVERY_MINUTES: 1
+      STUB_RESTATE_REVISIONS: 120
+      PORT: 3102
+
+  e2e-rollup:
+    profiles: ["metrics-e2e"]
+    build:
+      context: .
+      target: rollup
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    environment:
+      <<: *e2e-env
+      ROLLUP_INTERVAL_MS: ${E2E_ROLLUP_INTERVAL_MS:-3000}
+      PORT: 3103
+
+  e2e-audit-consumer:
+    profiles: ["metrics-e2e"]
+    build:
+      context: .
+      target: audit-consumer
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    environment:
+      <<: *e2e-env
+      PORT: 3101
+
+  metrics-report:
+    profiles: ["metrics-e2e"]
+    build:
+      context: .
+      target: metrics-report
+    depends_on:
+      - e2e-ingester
+      - e2e-rollup
+      - e2e-audit-consumer
+    environment:
+      <<: *e2e-env
+      PORT: 0
 
 volumes:
   clickhouse_data:

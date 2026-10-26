@@ -6,10 +6,13 @@ import {
   makeStoredAuditEvent,
   runAuditStoreContract,
   runMetricsStoreContract,
+  runCheckpointStoreContract,
+  runQuarantineStoreContract,
 } from '@smallseedlabs/proba-audit-core/testing';
 import { createClickHouseClient, ensureDatabase, type ClickHouseOptions } from './client.js';
 import { ClickHouseAuditStore } from './audit-store.js';
 import { ClickHouseMetricsStore } from './metrics-store.js';
+import { ClickHouseCheckpointStore, ClickHouseQuarantineStore } from './ingest-state-stores.js';
 import { clickHouseMigrationDb } from './migrate-db.js';
 import { loadMigrations, runMigrations } from './migrate.js';
 
@@ -35,6 +38,14 @@ runMetricsStoreContract('clickhouse', async () => ({
   store: new ClickHouseMetricsStore({ client: createClickHouseClient(options(TEST_DB)), ownsClient: true }),
 }));
 
+runCheckpointStoreContract('clickhouse', async () => ({
+  store: new ClickHouseCheckpointStore({ client: createClickHouseClient(options(TEST_DB)), ownsClient: true }),
+}));
+
+runQuarantineStoreContract('clickhouse', async () => ({
+  store: new ClickHouseQuarantineStore({ client: createClickHouseClient(options(TEST_DB)), ownsClient: true }),
+}));
+
 describe('ClickHouse migrations', () => {
   const admin = () => createClickHouseClient(options('default'));
 
@@ -58,15 +69,15 @@ describe('ClickHouse migrations', () => {
       const migrations = loadMigrations(migrationsDir);
 
       const first = await runMigrations(db, migrations);
-      expect(first.applied).toHaveLength(4);
+      expect(first.applied).toHaveLength(6);
       const second = await runMigrations(db, migrations);
       expect(second.applied).toEqual([]);
-      expect(second.skipped).toHaveLength(4);
+      expect(second.skipped).toHaveLength(6);
 
       const rows = await (
         await client.query({ query: 'SELECT version, name FROM schema_migrations ORDER BY version', format: 'JSONEachRow' })
       ).json<{ version: number; name: string }>();
-      expect(rows.map((r) => r.version)).toEqual([1, 2, 3, 4]);
+      expect(rows.map((r) => r.version)).toEqual([1, 2, 3, 4, 5, 6]);
 
       const tables = await (
         await client.query({
@@ -75,8 +86,18 @@ describe('ClickHouse migrations', () => {
           format: 'JSONEachRow',
         })
       ).json<{ name: string; engine: string }>();
+      const daily = await (
+        await client.query({
+          query: "SELECT name, default_expression FROM system.columns WHERE database = {db:String} AND table = 'metric_rollups_daily' AND name IN ('timezone', 'bucket_date') ORDER BY name",
+          query_params: { db: MIGRATION_DB },
+          format: 'JSONEachRow',
+        })
+      ).json<{ name: string; default_expression: string }>();
+      expect(daily.map((c) => c.name)).toEqual(['bucket_date', 'timezone']);
       expect(Object.fromEntries(tables.map((t) => [t.name, t.engine]))).toEqual({
         audit_events: 'MergeTree',
+        ingest_checkpoints: 'ReplacingMergeTree',
+        metric_observation_quarantine: 'MergeTree',
         metric_observations: 'ReplacingMergeTree',
         metric_rollups_daily: 'ReplacingMergeTree',
         metric_rollups_hourly: 'ReplacingMergeTree',

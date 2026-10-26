@@ -10,3 +10,4 @@ export * from './logger/index.js';
 export * from './runtime/index.js';
 export * from './registry.js';
 export * from './audit/index.js';
+export * from './analytics/index.js';

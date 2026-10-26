@@ -74,6 +74,11 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
   CMD node -e "require('http').get('http://localhost:'+process.env.PORT+'/health', (r) => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"
 CMD ["node", "apps/metrics-ingester/dist/index.js"]
 
+# One-shot report of what the metrics flow stored (used by the metrics-e2e compose profile).
+FROM metrics-ingester AS metrics-report
+HEALTHCHECK NONE
+CMD ["node", "apps/metrics-ingester/dist/report-cli.js", "--wait-seconds=90"]
+
 FROM runtime AS rollup
 COPY --from=builder --chown=proba:proba /app/apps/rollup/package.json /app/apps/rollup/
 COPY --from=builder --chown=proba:proba /app/apps/rollup/dist /app/apps/rollup/dist

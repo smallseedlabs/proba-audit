@@ -4,9 +4,12 @@
  */
 
 import type {
+  ChangedWindow,
+  MetricAggregate,
   MetricObservation,
   MetricObservationFilter,
   MetricRollup,
+  RollupAggregateFilter,
   RollupFilter,
   RollupRequest,
   UpsertResult,
@@ -23,11 +26,26 @@ export interface MetricsStore {
   /** Latest revision per key, ordered by periodStart ascending. */
   queryObservations(filter: MetricObservationFilter): Promise<MetricObservation[]>;
   /**
-   * Recompute rollups for whole UTC buckets covering the window, from the
-   * latest revision of each observation. Idempotent. Returns rollup rows written.
+   * Recompute rollups for whole buckets covering the window, from the latest
+   * revision of each observation. Idempotent: a restated observation replaces its
+   * earlier revision in the sums, never adds to it. Hourly buckets are UTC hours.
+   * Daily buckets are local days in each observation's `timezone` (UTC when it has
+   * none), so a daily bucket starts at local midnight of the account. Returns the
+   * number of rollup rows written.
    */
   computeRollups(request: RollupRequest): Promise<number>;
   queryRollups(filter: RollupFilter): Promise<MetricRollup[]>;
+  /**
+   * Sum stored rollups over a range, grouped by platform / account / campaign /
+   * bucket. Never mixes currencies or source granularities. `reach` is not summed.
+   */
+  aggregateRollups(filter: RollupAggregateFilter): Promise<MetricAggregate[]>;
+  /**
+   * The span of observations written (or rewritten) after `since` (an earlier
+   * `watermark`; omit for everything), or null when there are none. Tells the
+   * rollup process which window to recompute.
+   */
+  changedSince(since?: string): Promise<ChangedWindow | null>;
   /** Throws if the backing service is unreachable. */
   ping(): Promise<void>;
   close(): Promise<void>;

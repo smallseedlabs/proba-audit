@@ -11,7 +11,7 @@ proba-audit is the audit trail and ad-metrics analytics backend of Proba.
 
 The event and observation shapes are defined once, in
 [proba-protocol](https://github.com/smallseedlabs/proba-protocol) (`@smallseedlabs/proba-protocol/audit`).
-This repo never redefines them. (Pinned to the `v0.2.0` release tag.)
+This repo never redefines them. (Pinned to the `v0.3.0` release tag.)
 
 This PR is the **foundation only**: ports, default adapters, config, logger, migrations and
 runnable-but-empty processes. The consumer, API, ingester and rollup logic come later.
@@ -22,12 +22,13 @@ runnable-but-empty processes. The consumer, API, ingester and rollup logic come 
 |-----|------|-------------|
 | `apps/audit-consumer` | 3101 | Read audit events from the bus, validate, extend the hash chain, append to the AuditStore, ack / dead-letter |
 | `apps/audit-api` | 3100 | Query API over the AuditStore and MetricsStore |
-| `apps/metrics-ingester` | 3102 | Use PlatformConnectors to fetch ad metrics and upsert `MetricObservation`s |
-| `apps/rollup` | 3103 | Recompute hourly/daily rollups from the latest observation revisions |
+| `apps/metrics-ingester` | 3102 | Pull ad metrics through the `PlatformConnector` port on a schedule, validate, store `MetricObservation`s (see "Metrics flow") |
+| `apps/rollup` | 3103 | Recompute hourly/daily rollups from the latest observation revisions, per account timezone |
 
 Each one loads config, logs its lifecycle as structured JSON, serves `GET /health`, and exits 0 on SIGTERM/SIGINT
-(all four use `runService` from `packages/core`). `audit-consumer` runs the audit pipeline described below; the other three
-are still the foundation skeleton. One Dockerfile has a target per app (plus `migrate`).
+(all four use `runService` from `packages/core`). `audit-consumer` runs the audit pipeline described below,
+`metrics-ingester` and `rollup` run the metrics flow ("Metrics flow"); `audit-api` is still the foundation skeleton (its first
+read functions exist as a library, see "Read side"). One Dockerfile has a target per app (plus `migrate` and `metrics-report`).
 
 ## The two flows
 
@@ -45,7 +46,7 @@ flowchart LR
   C -. invalid / exhausted .-> DLQ[(dead-letter stream)]
   API[audit-api] -- query / aggregate --> AS
   API -- query --> MS[(MetricsStore<br/>ClickHouse)]
-  ING[metrics-ingester] -- fetchMetrics --> PC[PlatformConnector<br/>per ad platform]
+  ING[metrics-ingester] -- fetchObservations --> PC[PlatformConnector<br/>per ad platform]
   ING -- upsertObservations --> MS
   R[rollup] -- computeRollups --> MS
 ```
@@ -55,9 +56,10 @@ flowchart LR
 `schemaVersion` (making a `StoredAuditEvent`) -> `AuditStore.appendBatch` -> `XACK` only after that write.
 Details, guarantees and failure modes are in "Audit pipeline" below.
 
-**Metrics flow:** `metrics-ingester` asks a `PlatformConnector` for a window -> `MetricsStore.upsertObservations`
-(a higher `revision` replaces a lower one; a stale one is skipped) -> `rollup` calls `computeRollups` for the
-touched window -> `audit-api` serves observations and rollups.
+**Metrics flow:** `metrics-ingester` asks a `PlatformConnector` for what changed since its last cursor ->
+validates -> `MetricsStore.upsertObservations` (a higher `revision` replaces a lower one; a stale one is skipped) ->
+`rollup` recomputes the touched hourly and daily buckets -> the analytics read functions serve the numbers.
+Details: "Metrics flow" below.
 
 ## Ports and adapters
 
@@ -195,6 +197,179 @@ Everything is structured JSON through the `Logger` port. Batch lines carry `batc
 | Invalid event | dead-lettered with reason |
 | Bus failure in the relay | rows marked failed, retried after the lease |
 
+## Metrics flow
+
+```mermaid
+flowchart LR
+  subgraph Libs["Ad-platform analytics libraries (one per platform, built later)"]
+    L1[meta] ~~~ L2[google] ~~~ L3[reddit / x / microsoft]
+  end
+  STUB[StubPlatformConnector<br/>development data source]
+  Libs -. adapter .-> PC
+  STUB --> PC[PlatformConnector port]
+  PC --> ENG[metrics-ingester<br/>scheduler + SyncEngine]
+  ENG -- validated observations --> MS[(metric_observations<br/>ReplacingMergeTree by revision)]
+  ENG -- invalid --> Q[(metric_observation_quarantine)]
+  ENG <-- cursor --> CP[(ingest_checkpoints)]
+  ENG -. metrics.fetch_* / ingested / restated .-> BUS[(audit EventBus)]
+  MS -- changedSince --> R[rollup worker]
+  R --> RU[(hourly + daily rollups)]
+  RU --> RD[MetricsAnalytics<br/>summary, comparePeriods]
+  RD --> PORTAL[portals and data tools]
+```
+
+The ad platforms are reached through **analytics libraries**, one per platform (Meta, Google, Reddit, X, Microsoft), that expose
+each platform's analytics data and are consumed by the portals. Those libraries do not exist yet. The ingester is built against the
+`PlatformConnector` port, today served by a **development data source**, so the whole flow runs and is tested now, and the real
+library plugs in later by configuration only.
+
+### `PlatformConnector` (packages/core/src/ports/platform-connector.ts)
+
+| Member | Meaning |
+|--------|---------|
+| `platform` | Stable id from the protocol enum (`meta`, `google`, `reddit`, `x`, `microsoft`, `other`) |
+| `adapter` | Name used in `PLATFORM_CONNECTORS` (for example `stub`) |
+| `capabilities()` | Granularities (`hour`, `day`), `maxLookbackDays`, `supportsRestatements`, `restatementWindowHours`, `supportsCursor`, `maxPageSize` |
+| `listAccounts(workspaceId)` / `listCampaigns(account)` | What the workspace has connected; accounts carry the IANA reporting `timezone` and `currency` |
+| `fetchObservations(account, { window, cursor?, pageToken?, pageSize? })` | One page of protocol `MetricObservation`s plus `nextPageToken` (more pages) and `nextCursor` (store it once the whole pull is durable) |
+
+Rules every adapter follows (`runPlatformConnectorContract(name, factory, fixture)` checks them): valid observations of the connector's
+platform and the requested account/granularity; `revision` starts at 0 and grows by one per restatement; **one level per campaign**
+(ad rows, or adset rows, or campaign rows, never a mix, because rollups sum rows per campaign); no credentials in an observation;
+failures thrown as `RateLimitedError` (with the platform's `retryAfterMs` hint), `TransientConnectorError`, `ConnectorAuthError`
+or `ConnectorRequestError`. The cursor is opaque: with it the connector returns only new and restated observations; without it, the full window.
+
+### The stub (`StubPlatformConnector`, adapter name `stub`)
+
+A development data source: deterministic from `STUB_SEED` and the clock (the same seed, account, ad
+and hour always give the same numbers), with a diurnal curve in each account's local time. Per platform it serves three accounts
+(Europe/London GBP, America/New_York USD, Australia/Sydney AUD) with several campaigns, adsets and ads, hourly and daily rows of
+impressions, clicks, spend, conversions, reach, video views and revenue.
+
+- **Restatements:** the revision of a completed period is a pure function of time: every `STUB_RESTATE_EVERY_MINUTES` after the period
+  ends the platform revises it again (late conversions mostly go up, spend moves slightly), up to `STUB_RESTATE_REVISIONS` times.
+  Set revisions to 0 for a platform that never restates. A daily row is the sum of its hourly rows at the same moment.
+- **Faults:** `STUB_FAILURE_RATE` fails a fraction of calls with a transient error; tests use `injectFault(...)` (rate limit with
+  hint, transient, auth, request) and `corruptNext(...)` (invalid observations for the quarantine).
+- **Every `sourceRef` starts with `stub:`**, so development data can never be mistaken for platform data.
+- **Production guard:** the stub refuses to start when `NODE_ENV=production` unless `ALLOW_STUB_CONNECTOR=true`
+  (`StubConnectorNotAllowedError`, thrown while the ingester starts, so the process exits).
+
+### Ingest engine (`apps/metrics-ingester`)
+
+`IngestScheduler` runs one loop per (platform, account) of every configured connector: first run after a small random delay, then
+every `INGEST_INTERVAL_MS` (60 s by default; `INGEST_INTERVAL_OVERRIDES=meta:30000,google:120000` per platform) with
+`INGEST_JITTER_RATIO` jitter. After failures the delay doubles up to `INGEST_FAILURE_BACKOFF_MAX_MS`, and never goes below a platform's
+rate-limit hint. Accounts are re-listed every `INGEST_ACCOUNT_REFRESH_MS`.
+
+**Overlap protection and the single-instance assumption.** A lease per (platform, account) prevents two runs of one account at the same
+time; a lease expires after a few intervals so a hung run cannot block the account. The lease lives in the process: **run one
+`metrics-ingester` replica** (and one `rollup`). A second replica would not corrupt anything (runs are idempotent and revision-ordered)
+but would pull every window twice and waste platform quota. Scaling out later needs a shared lease (Redis) behind the same `LeaseTable` shape.
+
+`SyncEngine.syncAccount` is one run, with its own `traceId` (also on every log line):
+
+1. Read the checkpoint for (workspace, platform, account, granularity). Window: from the last success minus the connector's
+   restatement window (or `INGEST_INITIAL_LOOKBACK_HOURS` on a first run), clamped to `maxLookbackDays`, to the last full hour.
+   After downtime the window reaches back to the last success, so nothing is missed.
+2. Fetch pages (`INGEST_PAGE_SIZE`) with the stored cursor. Each call is retried up to `INGEST_MAX_ATTEMPTS` with exponential backoff and
+   full jitter (`INGEST_RETRY_BASE_MS` .. `INGEST_RETRY_MAX_MS`). A rate-limit hint is honoured; one longer than
+   `INGEST_MAX_RATE_LIMIT_WAIT_MS` ends the run and the scheduler comes back after it. Auth and request errors are not retried.
+3. Validate every observation with the protocol's `validateMetricObservation`, and check platform and account. Invalid ones go to
+   `metric_observation_quarantine` with a reason (`schema_invalid`, `platform_mismatch`, `account_mismatch`), the validation issues
+   (paths and messages) and the raw payload; the rest of the page continues.
+4. Compare the page with what is stored and write only what changes: new periods, higher revisions, corrected values.
+   Pulling the same window twice therefore writes nothing (`unchanged`), a stale revision is ignored (`staleSkipped`).
+5. Only after the last page is durable, store the new cursor. A crash anywhere means the next run repeats the window, harmlessly.
+
+Audit events (through the `AuditEmitter` on the bus, category `metrics`, target `ad_account` `platform:accountId`, actor the service): `metrics.fetch_started`,
+`metrics.ingested` (count, window; only when something new was stored), `metrics.restated` (count, earliest/latest period; only when
+something was restated), `metrics.fetch_completed` (counts, pages, window, `durationMs`) or `metrics.fetch_failed` (outcome `failure`,
+`errorCode`, redacted message, attempts, `retryAfterMs`). One `ingested` / `restated` event per run, not per observation (a run
+can hold thousands). No credentials, tokens or `credentialsRef` ever appear in logs or events.
+Volume to expect: two events per account per interval (start and completion), so 60 s intervals mean about 2,900 events per account per day.
+
+### Rollups (`apps/rollup`)
+
+`RollupWorker` asks `MetricsStore.changedSince(watermark)` which span of observations was written (or rewritten by a restatement)
+since the stored watermark, and recomputes the hourly and daily buckets that span touches, **from the latest revision of every
+observation**: a restatement replaces its earlier revision in the sums, it is never added to it, and recomputing the same window gives the same rows.
+Hourly buckets are UTC hours. **Daily buckets are local days in each observation's `timezone`** (UTC when it has none): `bucket_start`
+is the UTC instant of local midnight, `timezone` and `bucket_date` (the local calendar date) are stored, and a daily bucket is always
+summed whole (a 23- or 25-hour DST day included). `reach` is never summed (unique reach is not additive). Windows larger than
+`ROLLUP_MAX_WINDOW_DAYS` are split. The watermark (in `ingest_checkpoints`, source `rollup`) moves only after a run succeeds; each run emits `metrics.rollup_run`
+(period, rows, `durationMs`, own `traceId`). ClickHouse needs constant time zones, so daily rollups run once per zone present (zone names are validated before use).
+
+### Read side (library level)
+
+`MetricsAnalytics` (packages/core/src/analytics) is the first set of read functions over the rollups. They will back the portal and the
+controlled data tools; the brain never queries metric tables itself.
+
+- `getMetricsSummary(scope, { campaignId?, from, to, granularity })`: totals per currency (with CTR, CPC, CPM, CPA, ROAS), a series per bucket
+  (hourly: UTC hours; daily: local dates) and campaigns by spend. Currencies are never added together; `reach` is never returned as a sum.
+- `comparePeriods(scope, { campaignId?, granularity, current, previous? })`: two equal-length periods and the change (absolute and percent) per currency;
+  `previous` defaults to the period right before `current`.
+- **Scope is injected, not passed by the caller.** `AnalyticsScope { workspaceId, accounts[] }` is produced by trusted code. `AuditedAnalyticsReader`
+  (the metrics counterpart of `AuditedReader`) takes a `ScopeResolver` and a caller's `AccessContext`, resolves the scope itself, refuses a scope of another
+  workspace, and records every read as `data_access.metrics_summary` / `data_access.metrics_compare` (filter names and result size only, never numbers; failures too).
+- **Strict validation with caps:** unknown keys are rejected (so a query cannot smuggle in accounts), timestamps must be UTC ISO with `Z` and aligned
+  to the bucket (hour: on the hour; day: UTC midnight, the date of the daily bucket), at most 14 days hourly and 366 days daily, campaign ids
+  `[A-Za-z0-9_.:-]{1,128}`, at most 500 accounts in a scope, at most 200 campaign rows (`ANALYTICS_LIMITS`).
+- `sourceGranularity` (default `hour`, must match `INGEST_GRANULARITY`) keeps hourly and daily source rows from being mixed.
+
+Known limit: the metric tables have no `workspace_id` column today; isolation between workspaces is the account scope. One deployment
+serves one workspace's connectors (`INGEST_WORKSPACE_ID`) until the tables get a workspace column.
+
+### How to swap the stub for a real analytics library
+
+1. Implement `PlatformConnector` in an adapter that wraps the library (for example `packages/adapters/src/meta-lib/meta-lib-platform-connector.ts`). Map its
+   data to protocol `MetricObservation`s (revision from 0, the account's IANA timezone, `sourceRef` an opaque pointer that does **not** start with `stub:`),
+   and map its errors to the typed `ConnectorError`s (rate limits with the platform's `retryAfterMs`). Keep credentials inside the library.
+2. Prove it with the contract: `runPlatformConnectorContract('MetaLibConnector', () => new MetaLibConnector(...), { now, advance? })` in the adapter's test file.
+3. Register it, one line in `createDefaultRegistries()`:
+   `platformConnector.register('meta-lib', ({ config, clock, platform }) => new MetaLibConnector({ platform, ... }))`.
+4. Set `PLATFORM_CONNECTORS=meta:meta-lib,google:stub` (any mix per platform). Nothing else changes: the scheduler, retries, checkpoints, quarantine, rollups,
+   audit events and read functions are the same. Existing development data stays in the tables under `stub:` source refs; clear it (or use a fresh database)
+   before pointing a platform at real data.
+
+### Configuration
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `PLATFORM_CONNECTORS` | empty | `platform:adapter` pairs, for example `meta:stub,google:stub`; empty means the ingester idles |
+| `ALLOW_STUB_CONNECTOR` | `false` | Allow the stub when `NODE_ENV=production` |
+| `CHECKPOINT_STORE`, `QUARANTINE_STORE` | `clickhouse` | `clickhouse` or `memory` (adapter registry keys) |
+| `INGEST_WORKSPACE_ID` | `seedbed` | Workspace the ingester and rollup act for |
+| `INGEST_INTERVAL_MS` / `INGEST_INTERVAL_OVERRIDES` | `60000` / empty | Interval per account; per platform overrides `meta:30000,...` |
+| `INGEST_JITTER_RATIO`, `INGEST_GRANULARITY` | `0.1`, `hour` | Spread of each delay; `hour` or `day` |
+| `INGEST_INITIAL_LOOKBACK_HOURS`, `INGEST_PAGE_SIZE`, `INGEST_ACCOUNT_REFRESH_MS` | `48`, `500`, `300000` | First-run backfill, page size, account re-listing |
+| `INGEST_MAX_ATTEMPTS`, `INGEST_RETRY_BASE_MS`, `INGEST_RETRY_MAX_MS`, `INGEST_MAX_RATE_LIMIT_WAIT_MS`, `INGEST_FAILURE_BACKOFF_MAX_MS` | `4`, `1000`, `30000`, `60000`, `600000` | Retry and backoff |
+| `STUB_SEED`, `STUB_RESTATE_EVERY_MINUTES`, `STUB_RESTATE_REVISIONS`, `STUB_FAILURE_RATE` | `proba-dev`, `30`, `2`, `0` | The development data source |
+| `ROLLUP_INTERVAL_MS`, `ROLLUP_MAX_WINDOW_DAYS` | `30000`, `7` | Rollup cadence and chunk size |
+
+### End to end on the stub
+
+```bash
+docker compose --profile metrics-e2e up -d --build e2e-ingester e2e-rollup e2e-audit-consumer
+docker compose --profile metrics-e2e run --rm metrics-report     # waits up to 90 s, prints the read-side output as JSON
+docker compose --profile metrics-e2e down
+```
+
+The profile sets `NODE_ENV=development` and `ALLOW_STUB_CONNECTOR=true` for its own services only; the `apps` profile stays production-like and refuses the stub.
+
+### Failure modes (metrics)
+
+| Failure | What happens |
+|---------|--------------|
+| Platform rate limit | Wait for the hint (up to `INGEST_MAX_RATE_LIMIT_WAIT_MS`), else end the run and come back after it |
+| Transient platform error | Retried with backoff; after `INGEST_MAX_ATTEMPTS` the run fails (`metrics.fetch_failed`), cursor unchanged, scheduler backs off |
+| Credentials rejected / bad request | Run fails at once, no retry, audited |
+| Invalid observation | Quarantined with reason, rest of the page stored |
+| Store (ClickHouse) down | Retried with backoff, then the run fails; cursor unchanged |
+| Crash mid-run | No cursor was written; the next run repeats the window and double counts nothing |
+| Rollup failure | Watermark unchanged; the next run recomputes the same window |
+| Consumer's stream or group deleted | The audit-consumer recreates the stream and group and carries on |
+
 ## Data model overview
 
 ClickHouse database `proba_audit` (migrations in `migrations/clickhouse`, applied by `npm run migrate`, tracked in `schema_migrations`):
@@ -203,13 +378,15 @@ ClickHouse database `proba_audit` (migrations in `migrations/clickhouse`, applie
 |-------|--------|-----------|----------|-------|
 | `audit_events` | MergeTree | `toYYYYMM(occurred_at)` | `(workspace_id, occurred_at, event_id)` | Raw, append-only. Mirrors `StoredAuditEvent`: ids, actor, category, outcome, cost, `occurred_at`, `details` (JSON text), `tags`, plus `prev_hash`, `hash`, `ingested_at`, `schema_version`. Bloom-filter indexes on `trace_id`, `goal_id`, `thread_id`. |
 | `metric_observations` | ReplacingMergeTree(`revision`) | `toYYYYMM(period_start)` | `(platform, account_id, campaign_id, adset_id, ad_id, granularity, period_start)` | Latest revision wins. Read with `FINAL`. `adset_id`/`ad_id` are `''` at campaign level. |
-| `metric_rollups_hourly`, `metric_rollups_daily` | ReplacingMergeTree(`computed_at`) | `toYYYYMM(bucket_start)` | `(platform, account_id, campaign_id, adset_id, ad_id, source_granularity, currency, bucket_start)` | Sums per UTC bucket, recomputed from the latest revisions (idempotent). No `reach` (not additive). |
+| `metric_rollups_hourly`, `metric_rollups_daily` | ReplacingMergeTree(`computed_at`) | `toYYYYMM(bucket_start)` | `(platform, account_id, campaign_id, adset_id, ad_id, source_granularity, currency, bucket_start)` | Sums per bucket, recomputed from the latest revisions (idempotent). Hourly buckets are UTC hours; daily buckets are local days of the account (`timezone`, `bucket_date`, migration `0006`). No `reach` (not additive). |
+| `ingest_checkpoints` | ReplacingMergeTree(`updated_at`) | none | `(workspace_id, source, account_id, stream)` | Last successful cursor per (workspace, platform, account, granularity); the rollup watermark uses source `rollup`. Migration `0005`. |
+| `metric_observation_quarantine` | MergeTree | `toYYYYMM(quarantined_at)` | `(workspace_id, platform, account_id, quarantined_at, quarantine_id)` | Dead letter for invalid observations: reason, issues, raw payload, run id. 90 day TTL. Migration `0005`. |
 | `schema_migrations` | MergeTree | none | `version` | Applied migrations with checksum. |
 
 `audit_events` also has `fsync_after_insert = 1, fsync_part_directory = 1` (migration `0004`). The Postgres outbox table is separate: `migrations/postgres/0001_audit_outbox.sql`.
 
 Timestamps are UTC (`DateTime64(3, 'UTC')`) and ISO 8601 with a trailing `Z` everywhere on the wire.
-Rollup day buckets are UTC days; a per-account timezone day (`MetricObservation.timezone`) is not applied yet.
+Rollup day buckets follow the account's reporting timezone (`MetricObservation.timezone`, UTC when absent); see "Rollups".
 
 ## The traceId rule
 

@@ -1,12 +1,21 @@
 import { describe, expect, it } from 'vitest';
-import { ConfigError, loadConfig, redactConfig } from './index.js';
+import { ConfigError, loadConfig, parseIntervalOverrides, parsePlatformConnectors, redactConfig } from './index.js';
 
 describe('loadConfig', () => {
   it('applies defaults', () => {
     const c = loadConfig({}, { serviceName: 'audit-api', defaultPort: 3100 });
     expect(c.env).toBe('development');
     expect(c.service).toEqual({ name: 'audit-api', host: '0.0.0.0', port: 3100 });
-    expect(c.adapters).toEqual({ eventBus: 'redis-streams', auditStore: 'clickhouse', metricsStore: 'clickhouse' });
+    expect(c.adapters).toEqual({
+      eventBus: 'redis-streams',
+      auditStore: 'clickhouse',
+      metricsStore: 'clickhouse',
+      checkpointStore: 'clickhouse',
+      quarantineStore: 'clickhouse',
+    });
+    expect(c.connectors.pairs).toEqual([]);
+    expect(c.connectors.allowStub).toBe(false);
+    expect(c.ingest.intervalMs).toBe(60_000);
     expect(c.eventBus.auditTopic).toBe('proba.audit.events');
     expect(c.eventBus.maxDeliveries).toBe(5);
     expect(c.clickhouse.database).toBe('proba_audit');
@@ -77,5 +86,41 @@ describe('loadConfig', () => {
     expect(text).not.toContain('hunter2');
     expect(text).not.toContain('secretpw');
     expect(text).toContain('REDACTED');
+  });
+});
+
+describe('metrics ingestion config', () => {
+  it('parses PLATFORM_CONNECTORS into ordered platform:adapter pairs', () => {
+    const c = loadConfig({ PLATFORM_CONNECTORS: 'meta:stub, google:stub ,reddit:reddit-lib', ALLOW_STUB_CONNECTOR: 'true' });
+    expect(c.connectors.pairs).toEqual([
+      { platform: 'meta', adapter: 'stub' },
+      { platform: 'google', adapter: 'stub' },
+      { platform: 'reddit', adapter: 'reddit-lib' },
+    ]);
+    expect(c.connectors.allowStub).toBe(true);
+  });
+
+  it('rejects malformed connector pairs and duplicates', () => {
+    for (const bad of ['meta', 'meta:', ':stub', 'tiktok:stub', 'meta:a,meta:b']) {
+      expect(() => parsePlatformConnectors(bad)).toThrow();
+      expect(() => loadConfig({ PLATFORM_CONNECTORS: bad })).toThrow(ConfigError);
+    }
+    expect(parsePlatformConnectors('')).toEqual([]);
+  });
+
+  it('parses per-connector interval overrides', () => {
+    expect(parseIntervalOverrides('meta:30000,google:120000')).toEqual({ meta: 30_000, google: 120_000 });
+    expect(parseIntervalOverrides('')).toEqual({});
+    for (const bad of ['meta', 'meta:abc', 'tiktok:1000', 'meta=10']) {
+      expect(() => parseIntervalOverrides(bad)).toThrow();
+    }
+  });
+
+  it('applies ingest overrides from the environment', () => {
+    const c = loadConfig({ INGEST_INTERVAL_MS: '5000', INGEST_INTERVAL_OVERRIDES: 'x:1000', INGEST_WORKSPACE_ID: 'ws_1', STUB_SEED: 'abc' });
+    expect(c.ingest.intervalMs).toBe(5000);
+    expect(c.ingest.intervalOverridesMs).toEqual({ x: 1000 });
+    expect(c.ingest.workspaceId).toBe('ws_1');
+    expect(c.connectors.stub.seed).toBe('abc');
   });
 });

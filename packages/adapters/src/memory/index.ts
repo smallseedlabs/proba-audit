@@ -4,3 +4,5 @@ export * from './audit-store.js';
 export * from './metrics-store.js';
 export * from './platform-connector.js';
 export * from './outbox-store.js';
+export * from './checkpoint-store.js';
+export * from './quarantine-store.js';
