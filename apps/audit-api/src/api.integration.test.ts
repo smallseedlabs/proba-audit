@@ -320,7 +320,7 @@ describe('audit API on ClickHouse and Redis', () => {
         mine = messages.map((m) => m.payload).find((e) => e.traceId === traceId);
         await sub.ack(messages.map((m) => m.id));
       }
-      expect(mine).toMatchObject({ action: 'data_access.read', workspaceId: WORKSPACE, service: 'audit-api', actor: { type: 'user', id: 'uid-viewer' } });
+      expect(mine).toMatchObject({ action: 'audit.searched', workspaceId: WORKSPACE, service: 'audit-api', actor: { type: 'user', id: 'uid-viewer' } });
       expect((mine as AuditEvent).details).toMatchObject({ operation: 'events.search', route: 'GET /v1/events' });
       expect(JSON.stringify(mine)).not.toContain('needle-text');
       expect(JSON.stringify(mine)).not.toContain('viewer@insights');

@@ -70,6 +70,7 @@ export interface AuditRow {
   hash: string;
   ingested_at: string;
   schema_version: number;
+  content_digest?: string | null;
 }
 
 export function toRow(e: StoredAuditEvent): AuditRow {
@@ -107,6 +108,7 @@ export function toRow(e: StoredAuditEvent): AuditRow {
     hash: e.hash,
     ingested_at: e.ingestedAt,
     schema_version: e.schemaVersion,
+    content_digest: e.contentDigest ?? null,
   };
 }
 
@@ -152,6 +154,7 @@ export function fromRow(r: AuditRow): StoredAuditEvent {
     hash: r.hash,
     ingestedAt: r.ingested_at,
     schemaVersion: r.schema_version,
+    ...(r.content_digest ? { contentDigest: r.content_digest } : {}),
   };
 }
 

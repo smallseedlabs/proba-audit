@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import yaml from 'js-yaml';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { validateStoredAuditEvent } from '@smallseedlabs/proba-audit-core';
+import { buildAuditContent, validateStoredAuditEvent } from '@smallseedlabs/proba-audit-core';
 import {
   API_LIMITS,
   campaignsQuerySchema,
@@ -20,7 +20,7 @@ import {
   summaryQuerySchema,
   tracesQuerySchema,
 } from './http/schemas.js';
-import { TOKENS, chainAll, createHarness, makeEvent, makeObservation, type Harness } from './harness.testing.js';
+import { TOKENS, chainAll, createHarness, makeEvent, makeObservation, seedWithContent, type Harness } from './harness.testing.js';
 
 // Both packages are CommonJS: load them the way Node does, whatever the test runner's interop.
 const nodeRequire = createRequire(import.meta.url);
@@ -235,6 +235,43 @@ describe('what the server returns conforms to the document', () => {
     const res = await h.get('/v1/facets');
     check('Facets', res.body);
     expect(res.body.facets.service.length).toBeGreaterThan(0);
+  });
+
+  it('/v1/events/{eventId}/content and /v1/traces/{traceId}/content, and events that have text', async () => {
+    const withText = await createHarness({ env: { AUDIT_CONTENT_ENABLED: 'true' } });
+    try {
+      const tid = randomUUID();
+      const [e] = await seedWithContent(withText, [{ event: { traceId: tid }, content: buildAuditContent('user_message', 'hello there') }]);
+      const one = await withText.get(`/v1/events/${e.eventId}/content`, TOKENS.admin);
+      expect(one.status).toBe(200);
+      check('EventContent', one.body);
+      const trace = await withText.get(`/v1/traces/${tid}/content`, TOKENS.admin);
+      expect(trace.status).toBe(200);
+      check('TraceContent', trace.body);
+      for (const token of [TOKENS.viewer, TOKENS.admin]) {
+        const list = await withText.get('/v1/events', token);
+        check('EventsPage', list.body);
+        check('StoredAuditEvent', (await withText.get(`/v1/events/${e.eventId}`, token)).body);
+      }
+      const verify = await withText.get('/v1/chain/verify?from=2026-10-25T09:00:00Z&to=2026-10-25T11:00:00Z', TOKENS.admin);
+      check('ChainVerification', verify.body);
+      expect(verify.body.content).toEqual({ checked: 1, missing: 0 });
+      // Errors on the new routes are documented too.
+      for (const [url, token, status] of [
+        [`/v1/events/${e.eventId}/content`, TOKENS.viewer, 403],
+        [`/v1/events/${randomUUID()}/content`, TOKENS.admin, 404],
+        [`/v1/traces/${randomUUID()}/content`, TOKENS.admin, 404],
+        ['/v1/events/not-a-uuid/content', TOKENS.admin, 400],
+      ] as [string, string, number][]) {
+        const res = await withText.get(url, token);
+        expect(res.status, url).toBe(status);
+        check('Error', res.body);
+        const key = url.includes('/traces/') ? '/v1/traces/{traceId}/content' : '/v1/events/{eventId}/content';
+        expect(doc.paths[key]?.get.responses[String(status)], `${key} documents ${status}`).toBeDefined();
+      }
+    } finally {
+      await withText.close();
+    }
   });
 
   it('errors use the documented body, with the trace id in header and body', async () => {

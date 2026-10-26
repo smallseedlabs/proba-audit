@@ -4,6 +4,7 @@ import { join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { makeObservation, makeStoredAuditEvent } from '@smallseedlabs/proba-audit-core/testing';
 import { buildAggregateSql, buildAuditWhere, fromRow, toRow } from './audit-store.js';
+import { fromContentRow, toContentRow } from './audit-content-store.js';
 import { fromObservationRow, toObservationRow } from './metrics-store.js';
 import {
   loadMigrations,
@@ -107,9 +108,10 @@ describe('migration runner', () => {
       '0005_ingest_state.sql',
       '0006_rollup_timezone.sql',
       '0007_audit_read_indexes.sql',
+      '0008_audit_event_content.sql',
     ]);
-    expect(m.map((x) => x.statements.length)).toEqual([1, 1, 2, 1, 2, 2, 8]);
-    expect(new Set(m.map((x) => x.checksum)).size).toBe(7);
+    expect(m.map((x) => x.statements.length)).toEqual([1, 1, 2, 1, 2, 2, 8, 2]);
+    expect(new Set(m.map((x) => x.checksum)).size).toBe(8);
   });
 
   it('keeps every statement idempotent', () => {
@@ -121,9 +123,9 @@ describe('migration runner', () => {
   it('applies pending migrations in order and records them', async () => {
     const { db, commands, recorded } = fakeDb();
     const result = await runMigrations(db, loadMigrations(migrationsDir));
-    expect(result.applied).toHaveLength(7);
-    expect(commands).toHaveLength(17);
-    expect(recorded.map((r) => r.version)).toEqual([1, 2, 3, 4, 5, 6, 7]);
+    expect(result.applied).toHaveLength(8);
+    expect(commands).toHaveLength(19);
+    expect(recorded.map((r) => r.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
   });
 
   it('skips applied migrations and only runs new ones', async () => {
@@ -138,9 +140,10 @@ describe('migration runner', () => {
       '0005_ingest_state.sql',
       '0006_rollup_timezone.sql',
       '0007_audit_read_indexes.sql',
+      '0008_audit_event_content.sql',
     ]);
-    expect(commands).toHaveLength(16);
-    expect(recorded.map((r) => r.version)).toEqual([2, 3, 4, 5, 6, 7]);
+    expect(commands).toHaveLength(18);
+    expect(recorded.map((r) => r.version)).toEqual([2, 3, 4, 5, 6, 7, 8]);
   });
 
   it('refuses to continue when an applied migration was edited', async () => {
@@ -157,5 +160,37 @@ describe('migration runner', () => {
     const bad = mkdtempSync(join(tmpdir(), 'mig-'));
     writeFileSync(join(bad, 'create.sql'), 'SELECT 1;');
     expect(() => loadMigrations(bad)).toThrow(/Invalid migration filename/);
+  });
+});
+
+describe('audit_event_content rows', () => {
+  it('round-trips the text with its metadata and digest', () => {
+    const item = {
+      workspaceId: 'seedbed',
+      eventId: '22222222-2222-4222-8222-222222222222',
+      occurredAt: '2026-10-25T10:00:00.000Z',
+      content: { kind: 'brain_reply', text: 'Done \u{1F600}', truncated: true, originalLength: 20000, redactions: 2 },
+      contentDigest: 'a'.repeat(64),
+    };
+    const row = toContentRow(item);
+    expect(row).toMatchObject({ workspace_id: 'seedbed', truncated: 1, original_length: 20000, redactions: 2, content_digest: 'a'.repeat(64) });
+    expect(fromContentRow({ ...row, truncated: Number(row.truncated), original_length: String(row.original_length) as unknown as number })).toEqual(item);
+  });
+
+  it('keeps the digest column on audit_events rows, and none for events without text', () => {
+    const withText = makeStoredAuditEvent({ contentDigest: 'b'.repeat(64) });
+    expect(fromRow(toRow(withText)).contentDigest).toBe('b'.repeat(64));
+    expect(fromRow(toRow(makeStoredAuditEvent())).contentDigest).toBeUndefined();
+  });
+});
+
+describe('migration 0008', () => {
+  it('keeps the text in its own table, apart from audit_events', () => {
+    const m = loadMigrations(migrationsDir).find((x) => x.filename === '0008_audit_event_content.sql')!;
+    const sql = m.statements.join('\n');
+    expect(sql).toMatch(/ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS content_digest/);
+    expect(sql).toMatch(/CREATE TABLE IF NOT EXISTS audit_event_content/);
+    expect(sql).toMatch(/ORDER BY \(workspace_id, event_id\)/);
+    expect(sql).toMatch(/PARTITION BY toYYYYMM\(occurred_at\)/);
   });
 });

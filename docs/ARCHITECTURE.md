@@ -155,7 +155,8 @@ redelivered event is recognised as an identical duplicate. ClickHouse `audit_eve
 - **Content hash** (duplicate detection) = sha256 of the same canonical string *without* `prevHash`, `hash`, `ingestedAt`, `schemaVersion`. It is what tells an identical redelivery from a conflicting event with the same `eventId`; it is unaffected by chaining.
 - **Storage precision:** before hashing, `occurredAt` is rounded to milliseconds and `cost.amount` to 8 decimals (the ClickHouse column types), so a stored event hashes the same after it is read back.
 - **Head cache:** the consumer keeps `{ hash, ingestedAt }` per workspace in memory, filled from `AuditStore.getChainHead` the first time a workspace is seen after a start, and only advanced after a successful write.
-- **Verification:** `verifyChain(store, workspaceId, range?, options?)` (`packages/core/src/audit/verify-chain.ts`) pages through `AuditStore.readChain` and checks, per event: protocol schema, workspace, recomputed hash, `prevHash` link, and strictly increasing `ingestedAt`. With no `range.from` the first event must be the genesis; with one it must follow the real predecessor. It returns `{ ok, checked, problems[], lastHash, ... }` with problem types `hash_mismatch`, `broken_link`, `bad_genesis`, `non_monotonic_ingested_at`, `invalid_event`, `workspace_mismatch`. ClickHouse has no index on `ingested_at`, so run it as a maintenance job, not per request.
+- **Raw text (`content`, protocol 0.3.3):** the text is never part of `audit_events`. With `AUDIT_CONTENT_ENABLED=true` the consumer writes it to a separate `AuditContentStore` (ClickHouse table `audit_event_content`, keyed by workspace + event, migration 0008, memory adapter for tests) *before* the event row, and the event keeps only `contentDigest` = sha256 of the canonical text (`kind`, `text`, `truncated`, `originalLength`, `redactions`). The digest is a stored field, so it is covered by `hash`: changing the digest breaks the hash, changing the text no longer matches the digest (`content_mismatch`). Because the chain holds only the digest, the text table can have its own TTL / partition drops and its own grants without invalidating the chain; text missing for an event with a digest counts as "missing" (retention), not as a failure. With the flag off the text is dropped on ingest (logged as a warning with a count, never the text). A redelivery rewrites the text row idempotently, which also heals a crash between the two writes.
+- **Verification:** `verifyChain(store, workspaceId, range?, options?)` (`packages/core/src/audit/verify-chain.ts`) pages through `AuditStore.readChain` and checks, per event: protocol schema, workspace, recomputed hash, `prevHash` link, and strictly increasing `ingestedAt`. With no `range.from` the first event must be the genesis; with one it must follow the real predecessor. It returns `{ ok, checked, problems[], lastHash, ... }` with problem types `hash_mismatch`, `broken_link`, `bad_genesis`, `non_monotonic_ingested_at`, `invalid_event`, `workspace_mismatch`, and, when a content store is given, `content_mismatch` plus `content: { checked, missing }`. ClickHouse has no index on `ingested_at`, so run it as a maintenance job, not per request.
 
 ### Single writer
 
@@ -176,9 +177,13 @@ The consumer records its own activity through the same `AuditEmitter` and bus as
 These events come back through the consumer, so there is a loop guard: a batch consisting only of the consumer's own events (same `service`) produces
 no batch event, which stops the feedback after one hop.
 `AuditedReader` (`packages/core/src/audit/audited-reader.ts`) is the same idea for reads: audit-api routes call it instead of the store.
-The typed reads emit `data_access.audit_query`, `data_access.audit_trace` or `data_access.audit_aggregate`; every HTTP read uses
-`AuditedReader.read`, which emits the generic `data_access.read` with `details.operation` (`events.search`, `events.get`, `traces.get`,
-`traces.list`, `facets.list`, `chain.verify`, `session.get`) and the route and role. Filter names and result size are recorded, never values or data.
+The typed reads emit `audit.searched` (`query`, `aggregate`) or `audit.trace_viewed` (`getTrace`); every HTTP read uses `AuditedReader.read`, which maps the
+operation to the protocol's specific action (`AUDIT_READ_ACTIONS`): `events.search`, `traces.list` and `facets.list` → `audit.searched`, `events.get` →
+`audit.event_viewed` (target: the event), `traces.get` → `audit.trace_viewed` (target: the trace), `chain.verify` → `audit.integrity_checked`; `details.operation`,
+the route and the role are kept. Reads of raw text use `readContent` with `contentIncluded: true`. Analytics reads (`AuditedAnalyticsReader`) emit `analytics.queried`
+(summary, campaigns) and `analytics.compared`. All are `data_access` / low in the protocol catalog; the generic `data_access.read` and the old `data_access.audit_*` /
+`data_access.metrics_*` names are no longer emitted (`apps/audit-api/src/read-actions.test.ts` checks the emitted actions against `AUDIT_ACTION_INFO`).
+`GET /v1/session` is not recorded: it returns the caller's own token claims and reads nothing from the audit trail. Filter names and result size are recorded, never values or data.
 
 ### Logging
 
@@ -312,7 +317,7 @@ controlled data tools; the brain never queries metric tables itself.
   `previous` defaults to the period right before `current`.
 - **Scope is injected, not passed by the caller.** `AnalyticsScope { workspaceId, accounts[] }` is produced by trusted code. `AuditedAnalyticsReader`
   (the metrics counterpart of `AuditedReader`) takes a `ScopeResolver` and a caller's `AccessContext`, resolves the scope itself, refuses a scope of another
-  workspace, and records every read as `data_access.metrics_summary` / `data_access.metrics_compare` (filter names and result size only, never numbers; failures too).
+  workspace, and records every read as `analytics.queried` / `analytics.compared` (filter names and result size only, never numbers; failures too).
 - **Strict validation with caps:** unknown keys are rejected (so a query cannot smuggle in accounts), timestamps must be UTC ISO with `Z` and aligned
   to the bucket (hour: on the hour; day: UTC midnight, the date of the daily bucket), at most 14 days hourly and 366 days daily, campaign ids
   `[A-Za-z0-9_.:-]{1,128}`, at most 500 accounts in a scope, at most 200 campaign rows (`ANALYTICS_LIMITS`).
@@ -382,12 +387,16 @@ or the real response bodies drift apart.
 | `GET /v1/session` | the caller's identity and role | viewer |
 | `GET /v1/events` | search: time range, `traceId`, `actor`, `actorType`, `service`, `action`, `category`, `outcome`, `riskLevel`, `goalId`, `threadId`, `campaignId`, text `q` on action and target; `order`, `limit` (max 200), `cursor` | viewer |
 | `GET /v1/events/:eventId` | one event with its chain fields | viewer |
+| `GET /v1/events/:eventId/content` | the raw text of one event, its digest and `verified` (text still matches the chain). 404 `content_disabled` unless `AUDIT_CONTENT_ENABLED=true` | **admin** |
 | `GET /v1/traces` | recent traces with summaries (root action, event count, outcome, risk, duration) | viewer |
 | `GET /v1/traces/:traceId` | span tree with parent/child, durations, outcome roll-up, related goal/thread/campaign ids | viewer |
+| `GET /v1/traces/:traceId/content` | the raw text of every event of the trace that has some, oldest first | **admin** |
 | `GET /v1/chain/verify?from&to` | `verifyChain` over the caller's workspace, bounded (24 h, 100 000 events by default) | admin |
 | `GET /v1/analytics/summary`, `/compare`, `/campaigns` | `getMetricsSummary` / `comparePeriods` / top campaigns by spend, with data freshness (`asOf`) | viewer |
 | `GET /v1/facets` | distinct values per filter with counts, capped | viewer |
 | `GET /health`, `GET /ready` | liveness; readiness of ClickHouse and Redis (no credentials, no audit event) | none |
+
+**Raw text is admin-only and audited.** Event and trace routes never contain text: an event only says `hasContent: true` (and administrators also see `contentDigest`; viewers never do, since a short guessable message could be confirmed from its digest). The two `/content` routes require the admin role (a viewer gets 403, recorded as `auth.denied`) and are served only when `AUDIT_CONTENT_ENABLED=true`. Every content read is itself an audit event, `audit.event_viewed` or `audit.trace_viewed`, with `details.contentIncluded: true`, the operation, the number of texts and the target, but never the text; if that audit event cannot be sent the read fails, so there is no unaudited read of text.
 
 **No free SQL.** Every route parses its query with a zod schema (`apps/audit-api/src/http/schemas.ts`): unknown parameters are rejected (a `workspaceId`
 parameter is a 400), strings are bounded, page sizes are capped (events 200, traces 100, facets 100 values, campaigns 100 rows), time ranges are
@@ -409,7 +418,7 @@ workspace to its accounts.
 - **Authorisation** (`apps/audit-api/src/authorization.ts`): the verified email must be present **and verified** by Firebase. It is `admin` when in `AUDIT_API_ADMIN_EMAILS`, `viewer`
   when in `AUDIT_API_ALLOWED_EMAILS` or its domain is in `AUDIT_API_ALLOWED_EMAIL_DOMAINS`, otherwise `403`. All lists come from configuration; an empty policy allows nobody
   (and logs a warning at start-up). Chain verification is admin-only.
-- **Audited**: every authenticated read emits a `data_access.*` event under the response's `X-Trace-Id` (see "Self-audit"), and the read is refused with `500` if that event cannot be
+- **Audited**: every authenticated read of data (all but `/v1/session`) emits an `audit.*` or `analytics.*` event under the response's `X-Trace-Id` (see "Self-audit"), and the read is refused with `500` if that event cannot be
   published (fail closed). Refusals are emitted as `auth.denied` (reason, never the token), throttled so a flood cannot flood the trail. Unexpected errors emit `system.error`.
 - **Rate limited** through the `RateLimiter` port (`memory`, `redis`; `AUDIT_API_RATE_LIMITER`): per signed-in user, a lower limit for chain verification, and per client address
   for rejected credentials. `429` carries `Retry-After`. The Redis adapter fails open (and logs) if Redis is unreachable.

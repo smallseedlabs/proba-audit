@@ -6,6 +6,7 @@
 export * from './fixtures.js';
 export * from './event-bus.contract.js';
 export * from './audit-store.contract.js';
+export * from './audit-content-store.contract.js';
 export * from './metrics-store.contract.js';
 export * from './clock.contract.js';
 export * from './id-generator.contract.js';

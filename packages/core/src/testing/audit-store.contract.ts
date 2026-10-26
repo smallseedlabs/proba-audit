@@ -52,6 +52,7 @@ export function runAuditStoreContract(name: string, factory: () => Promise<Audit
         details: { model: 'x', nested: { a: [1, 2] } },
         tags: ['llm', 'retry'],
         prevHash: randomHash(),
+        contentDigest: randomHash(),
       });
       const minimal = makeStoredAuditEvent({ workspaceId, occurredAt: '2026-10-25T10:00:05.000Z' });
       const result = await store.appendBatch([full, minimal]);

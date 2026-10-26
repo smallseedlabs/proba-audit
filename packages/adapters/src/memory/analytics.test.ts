@@ -240,7 +240,7 @@ describe('AuditedAnalyticsReader', () => {
     expect(s.totals[0].spend).toBe(20);
     expect(emitter.drafts).toHaveLength(1);
     expect(emitter.drafts[0]).toMatchObject({
-      action: 'data_access.metrics_summary',
+      action: 'analytics.queried',
       category: 'data_access',
       outcome: 'success',
       workspaceId: 'ws_1',
@@ -254,7 +254,7 @@ describe('AuditedAnalyticsReader', () => {
   it('audits comparisons', async () => {
     const { reader: r, emitter } = await reader();
     await r.comparePeriods(ctx, { granularity: 'day', current: { from: day.from, to: day.to } });
-    expect(emitter.drafts[0]).toMatchObject({ action: 'data_access.metrics_compare', outcome: 'success' });
+    expect(emitter.drafts[0]).toMatchObject({ action: 'analytics.compared', outcome: 'success' });
   });
 
   it('audits rejected queries and rethrows', async () => {

@@ -12,7 +12,9 @@ describe('loadConfig', () => {
       metricsStore: 'clickhouse',
       checkpointStore: 'clickhouse',
       quarantineStore: 'clickhouse',
+      auditContentStore: 'clickhouse',
     });
+    expect(c.content.enabled).toBe(false);
     expect(c.connectors.pairs).toEqual([]);
     expect(c.connectors.allowStub).toBe(false);
     expect(c.ingest.intervalMs).toBe(60_000);
@@ -20,6 +22,13 @@ describe('loadConfig', () => {
     expect(c.eventBus.maxDeliveries).toBe(5);
     expect(c.clickhouse.database).toBe('proba_audit');
     expect(c.log.level).toBe('info');
+  });
+
+  it('keeps raw text off unless AUDIT_CONTENT_ENABLED is set', () => {
+    expect(loadConfig({}, { serviceName: 'audit-api' }).content.enabled).toBe(false);
+    expect(loadConfig({ AUDIT_CONTENT_ENABLED: 'true' }, { serviceName: 'audit-api' }).content.enabled).toBe(true);
+    expect(loadConfig({ AUDIT_CONTENT_ENABLED: 'false' }, { serviceName: 'audit-api' }).content.enabled).toBe(false);
+    expect(loadConfig({ AUDIT_CONTENT_STORE: 'memory' }, { serviceName: 'audit-api' }).adapters.auditContentStore).toBe('memory');
   });
 
   it('reads and coerces values from the environment', () => {

@@ -461,13 +461,13 @@ describe('every call is audited', () => {
     h = await createHarness();
   });
 
-  it('emits one data_access.read per read under the response trace id, naming filters but never values', async () => {
+  it('emits one audit.searched per search under the response trace id, naming filters but never values', async () => {
     const res = await h.get('/v1/events?q=secret-search-text&actor=u-secret&limit=5');
     const events = await h.emitted();
     expect(events).toHaveLength(1);
     const [read] = events;
     expect(read).toMatchObject({
-      action: 'data_access.read',
+      action: 'audit.searched',
       category: 'data_access',
       outcome: 'success',
       workspaceId: WORKSPACE,
@@ -497,15 +497,15 @@ describe('every call is audited', () => {
     await h.get('/v1/analytics/campaigns?from=2026-10-25T00:00:00Z&to=2026-10-26T00:00:00Z');
     const emitted = await h.emitted();
     expect(emitted.map((x) => [x.action, x.details.operation])).toEqual([
-      ['data_access.read', 'events.get'],
-      ['data_access.read', 'traces.get'],
-      ['data_access.read', 'traces.list'],
-      ['data_access.read', 'facets.list'],
-      ['data_access.read', 'session.get'],
-      ['data_access.read', 'chain.verify'],
-      ['data_access.metrics_summary', undefined],
-      ['data_access.metrics_compare', undefined],
-      ['data_access.metrics_summary', undefined],
+      ['audit.event_viewed', 'events.get'],
+      ['audit.trace_viewed', 'traces.get'],
+      ['audit.searched', 'traces.list'],
+      ['audit.searched', 'facets.list'],
+      // /v1/session is not recorded: it reads nothing from the audit trail or the metrics.
+      ['audit.integrity_checked', 'chain.verify'],
+      ['analytics.queried', undefined],
+      ['analytics.compared', undefined],
+      ['analytics.queried', undefined],
     ]);
     expect(new Set(emitted.map((x) => x.traceId)).size).toBe(emitted.length); // one trace per request
   });
@@ -532,7 +532,7 @@ describe('every call is audited', () => {
     expect(res.status).toBe(500);
     expect(JSON.stringify(res.body)).not.toContain('secret');
     const emitted = await h.emitted();
-    expect(emitted.map((x) => x.action)).toEqual(['data_access.read', 'system.error']); // the failed read, then the error
+    expect(emitted.map((x) => x.action)).toEqual(['audit.searched', 'system.error']); // the failed read, then the error
     expect(emitted[0].outcome).toBe('failure');
     expect(emitted[1]).toMatchObject({ outcome: 'failure', errorCode: 'unhandled_error', target: { type: 'route', id: 'GET /v1/events' } });
   });

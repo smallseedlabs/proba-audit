@@ -1,10 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { buildAuditEvent } from '../audit/protocol.js';
+import { buildAuditContent, buildAuditEvent } from '../audit/protocol.js';
 import {
   chainEvent,
   computeEventHash,
   contentHash,
   deriveTags,
+  digestAuditContent,
   nextIngestedAt,
   normalizeForStorage,
   prepareForStorage,
@@ -119,5 +120,40 @@ describe('nextIngestedAt', () => {
     expect(nextIngestedAt('2026-10-25T10:00:05.000Z')).toBe('2026-10-25T10:00:05.000Z');
     expect(nextIngestedAt('2026-10-25T10:00:05.000Z', '2026-10-25T10:00:01.000Z')).toBe('2026-10-25T10:00:05.000Z');
     expect(nextIngestedAt('2026-10-25T10:00:01.000Z', '2026-10-25T10:00:05.000Z')).toBe('2026-10-25T10:00:05.001Z');
+  });
+});
+
+describe('raw text in the hash chain', () => {
+  const content = buildAuditContent('user_message', 'Pause the campaign');
+
+  it('stores a digest of the text instead of the text, and covers the digest with the hash', () => {
+    const stored = chainEvent(event({ content }), null, '2026-10-25T10:00:00.000Z');
+    expect('content' in stored).toBe(false);
+    expect(stored.contentDigest).toBe(digestAuditContent(content));
+    expect(stored.contentDigest).toMatch(/^[0-9a-f]{64}$/);
+    expect(computeEventHash({ ...stored, hash: '' })).toBe(stored.hash);
+    // A different text, or a different digest, gives a different hash.
+    const other = chainEvent(event({ content: buildAuditContent('user_message', 'Delete the campaign') }), null, '2026-10-25T10:00:00.000Z');
+    expect(other.hash).not.toBe(stored.hash);
+    expect(computeEventHash({ ...stored, contentDigest: other.contentDigest, hash: '' })).not.toBe(stored.hash);
+  });
+
+  it('digests the canonical text: same text, same digest; any field change, other digest', () => {
+    expect(digestAuditContent({ ...content })).toBe(digestAuditContent(content));
+    for (const changed of [{ text: 'Pause the campaigns' }, { kind: 'brain_reply' }, { truncated: true }, { redactions: 1 }]) {
+      expect(digestAuditContent({ ...content, ...changed })).not.toBe(digestAuditContent(content));
+    }
+  });
+
+  it('an event without text has no digest and hashes exactly as before', () => {
+    const stored = chainEvent(event(), null, '2026-10-25T10:00:00.000Z');
+    expect('contentDigest' in stored).toBe(false);
+  });
+
+  it('treats the same event with and without text as different content (redelivery with changed text conflicts)', () => {
+    const a = prepareForStorage(event({ content }));
+    const b = prepareForStorage(event({ content: buildAuditContent('user_message', 'Something else') }));
+    expect(sameContent(a, b)).toBe(false);
+    expect(sameContent(a, prepareForStorage(event({ content: { ...content } })))).toBe(true);
   });
 });

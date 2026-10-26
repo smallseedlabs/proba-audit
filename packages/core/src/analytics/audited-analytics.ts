@@ -20,7 +20,7 @@ export type ScopeResolver = (ctx: AccessContext) => Promise<AnalyticsScope>;
 
 /**
  * AuditedReader's counterpart for metrics: every analytics read is recorded as a
- * `data_access.metrics_*` event through the AuditEmitter, under the caller's trace.
+ * `analytics.queried` / `analytics.compared` event through the AuditEmitter, under the caller's trace.
  * The event names the filters used (names only) and the size of the result, never the numbers.
  * Failures (including rejected queries) are recorded too, then rethrown.
  */
@@ -35,7 +35,7 @@ export class AuditedAnalyticsReader {
   getMetricsSummary(ctx: AccessContext, query: SummaryQuery): Promise<MetricsSummary> {
     return this.audited(
       ctx,
-      'data_access.metrics_summary',
+      'analytics.queried',
       { campaignId: query.campaignId, from: query.from, to: query.to, granularity: query.granularity },
       (r) => r.series.length + (r.campaigns?.length ?? 0),
       (scope) => this.analytics.getMetricsSummary(scope, query)
@@ -45,7 +45,7 @@ export class AuditedAnalyticsReader {
   comparePeriods(ctx: AccessContext, query: CompareQuery): Promise<PeriodComparison> {
     return this.audited(
       ctx,
-      'data_access.metrics_compare',
+      'analytics.compared',
       { campaignId: query.campaignId, current: query.current, previous: query.previous, granularity: query.granularity },
       (r) => r.comparison.length,
       (scope) => this.analytics.comparePeriods(scope, query)

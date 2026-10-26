@@ -264,9 +264,9 @@ describe('AuditedReader (self-audit of reads)', () => {
     const sub = await bus.subscribe({ topic: 'audit', group: 'g', consumer: 'c' });
     const events = (await sub.read()).map((m) => m.payload as AuditEvent);
     expect(events.map((e) => e.action)).toEqual([
-      'data_access.audit_query',
-      'data_access.audit_aggregate',
-      'data_access.audit_trace',
+      'audit.searched',
+      'audit.searched',
+      'audit.trace_viewed',
     ]);
     expect(events[0]).toMatchObject({
       category: 'data_access',

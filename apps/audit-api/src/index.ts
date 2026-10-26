@@ -37,6 +37,7 @@ async function main(): Promise<void> {
   const verifier = await registries.tokenVerifier.create(config.api.adapters.tokenVerifier, deps);
   const limiter = await registries.rateLimiter.create(config.api.adapters.rateLimiter, deps);
   const scope = await createScopeRegistry().create(config.api.adapters.scopeSource, deps);
+  logger.info(config.content.enabled ? 'raw text of audit events is served to administrators (AUDIT_CONTENT_ENABLED)' : 'raw text of audit events is disabled (AUDIT_CONTENT_ENABLED=false)', { lifecycle: 'content_mode', contentEnabled: config.content.enabled });
   logger.info('api adapters created', {
     lifecycle: 'adapters_created',
     tokenVerifier: verifier.name,
@@ -66,6 +67,7 @@ async function main(): Promise<void> {
     verifier,
     limiter,
     auditStore: runtime.auditStore,
+    auditContentStore: runtime.auditContentStore,
     metricsStore: runtime.metricsStore,
     scope: scope.resolve,
     emitter: emitterFor('throw'),
@@ -74,6 +76,7 @@ async function main(): Promise<void> {
       { name: 'auditStore', check: () => runtime.auditStore.ping() },
       { name: 'metricsStore', check: () => runtime.metricsStore.ping() },
       { name: 'eventBus', check: () => runtime.eventBus.ping() },
+      ...(config.content.enabled ? [{ name: 'auditContentStore', check: () => runtime.auditContentStore.ping() }] : []),
     ],
   });
 

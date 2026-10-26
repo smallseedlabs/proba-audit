@@ -29,6 +29,14 @@ export const envSchema = z.object({
   METRICS_STORE: nonEmpty('clickhouse'),
   CHECKPOINT_STORE: nonEmpty('clickhouse'),
   QUARANTINE_STORE: nonEmpty('clickhouse'),
+  AUDIT_CONTENT_STORE: nonEmpty('clickhouse'),
+
+  // Raw text of audit events (AuditEvent.content). Off by default: the consumer then drops it (never stored, no
+  // digest) and the read API never returns it. On: the consumer stores it in AUDIT_CONTENT_STORE and the API serves it to admins.
+  AUDIT_CONTENT_ENABLED: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((v) => v === 'true'),
 
   // Redis Streams
   REDIS_URL: nonEmpty('redis://localhost:6379'),
@@ -197,7 +205,10 @@ export interface AppConfig {
     metricsStore: string;
     checkpointStore: string;
     quarantineStore: string;
+    auditContentStore: string;
   };
+  /** Raw text of audit events: stored by the consumer and served (to admins) by the API only when enabled. */
+  content: { enabled: boolean };
   eventBus: {
     redisUrl: string;
     auditTopic: string;
@@ -383,7 +394,9 @@ export function loadConfig(env: EnvSource = process.env, options: LoadConfigOpti
       metricsStore: e.METRICS_STORE,
       checkpointStore: e.CHECKPOINT_STORE,
       quarantineStore: e.QUARANTINE_STORE,
+      auditContentStore: e.AUDIT_CONTENT_STORE,
     },
+    content: { enabled: e.AUDIT_CONTENT_ENABLED },
     eventBus: {
       redisUrl: e.REDIS_URL,
       auditTopic: e.AUDIT_TOPIC,

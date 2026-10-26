@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { makeObservation, makeStoredAuditEvent } from '@smallseedlabs/proba-audit-core/testing';
+import { buildAuditContent, digestAuditContent } from '@smallseedlabs/proba-audit-core';
+import { InMemoryAuditContentStore } from './audit-content-store.js';
 import { InMemoryAuditStore } from './audit-store.js';
 import { ManualClock, SequentialIdGenerator } from './clock-ids.js';
 import { InMemoryEventBus } from './event-bus.js';
@@ -64,5 +66,27 @@ describe('InMemory stores copy data', () => {
     await store.computeRollups({ bucket: 'hour', from: '2026-10-25T10:00:00.000Z', to: '2026-10-25T11:00:00.000Z' });
     const [r] = await store.queryRollups({ bucket: 'hour', accountId: 'a' });
     expect(r.computedAt).toBe('2026-11-01T00:00:00.000Z');
+  });
+});
+
+describe('InMemoryAuditContentStore', () => {
+  const content = buildAuditContent('user_message', 'hello');
+  const row = (eventId: string, workspaceId = 'seedbed') => ({
+    workspaceId,
+    eventId,
+    occurredAt: '2026-10-25T10:00:00.000Z',
+    content,
+    contentDigest: digestAuditContent(content),
+  });
+
+  it('stores per workspace and event, returns copies, and is idempotent', async () => {
+    const store = new InMemoryAuditContentStore();
+    await store.put([row('e1'), row('e2'), row('e1')]);
+    expect(await store.get('seedbed', 'e1')).toEqual(row('e1'));
+    expect(await store.get('other', 'e1')).toBeNull();
+    expect((await store.getMany('seedbed', ['e1', 'e2', 'e3', 'e1'])).map((r) => r.eventId).sort()).toEqual(['e1', 'e2']);
+    const copy = await store.get('seedbed', 'e1');
+    copy!.content.text = 'changed';
+    expect((await store.get('seedbed', 'e1'))!.content.text).toBe('hello');
   });
 });

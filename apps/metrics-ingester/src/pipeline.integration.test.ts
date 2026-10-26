@@ -427,7 +427,7 @@ describe('metrics flow on ClickHouse: stub -> ingest -> rollup -> read', () => {
     expect(s.totals[0].impressions).toBeGreaterThan(0);
     const c = await reader.comparePeriods(ctx, { granularity: 'day', current: { from: day.from, to: day.to } });
     expect(c.comparison[0].impressions.current).toBeGreaterThan(0);
-    expect(drafts).toEqual(['data_access.metrics_summary', 'data_access.metrics_compare']);
+    expect(drafts).toEqual(['analytics.queried', 'analytics.compared']);
     // Another workspace's scope sees none of it.
     const other = await w.analytics.getMetricsSummary({ workspaceId: 'x', accounts: [{ platform: 'meta', accountId: uniqueName('nobody') }] }, day);
     expect(other.totals).toEqual([]);

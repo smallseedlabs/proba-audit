@@ -12,11 +12,13 @@ import {
   OutboxRelay,
   createOutboxAuditEmitter,
   loadConfig,
+  buildAuditContent,
   verifyChain,
   type AuditEvent,
 } from '@smallseedlabs/proba-audit-core';
 import { uniqueName } from '@smallseedlabs/proba-audit-core/testing';
 import {
+  ClickHouseAuditContentStore,
   ClickHouseAuditStore,
   PostgresOutboxStore,
   RandomIdGenerator,
@@ -93,6 +95,42 @@ async function waitFor(check: () => Promise<boolean>, timeoutMs = 20_000): Promi
   }
   throw new Error('condition not met in time');
 }
+
+describe('audit pipeline: raw text on real Redis and ClickHouse', () => {
+  it('stores the text in audit_event_content and only its digest in audit_events, and detects tampering', async () => {
+    const contentStore = new ClickHouseAuditContentStore({ client: createClickHouseClient(chOptions), ownsClient: true });
+    closers.push(() => contentStore.close());
+    const bus = new RedisStreamsEventBus({ url: config.eventBus.redisUrl });
+    const store = new ClickHouseAuditStore({ client: createClickHouseClient(chOptions), ownsClient: true });
+    const topic = uniqueName('topic');
+    const h = new ConsumerHarness({ bus, store, contentStore, clock, ids, topic, group: uniqueName('group'), selfAudit: false, overrides: { blockMs: 100, contentEnabled: true } });
+    closers.push(async () => {
+      await h.close();
+      await bus.close();
+      await store.close();
+    });
+    const ws = `content-${topic}`;
+    const text = 'Please pause the Black Friday campaign \u{1F600}';
+    const withText = makeEvent({ workspaceId: ws, action: 'thread.message_received', content: buildAuditContent('user_message', text) });
+    await h.publish(withText, makeEvent({ workspaceId: ws }));
+    await h.pump();
+
+    const rows = await store.readChain(ws, { limit: 10 });
+    expect(rows).toHaveLength(2);
+    expect(rows[0].contentDigest).toMatch(/^[0-9a-f]{64}$/);
+    expect(rows[1].contentDigest).toBeUndefined();
+    expect(JSON.stringify(rows)).not.toContain('Black Friday');
+    const stored = await contentStore.get(ws, withText.eventId);
+    expect(stored?.content).toMatchObject({ kind: 'user_message', text, truncated: false });
+    expect(await verifyChain(store, ws, {}, { contentStore })).toMatchObject({ ok: true, checked: 2, content: { checked: 1, missing: 0 } });
+
+    // An attacker with write access to the text table replaces the text (ReplacingMergeTree: the newer row wins).
+    await contentStore.put([{ ...stored!, content: { ...stored!.content, text: 'Please delete the campaign' }, contentDigest: stored!.contentDigest }]);
+    const tampered = await verifyChain(store, ws, {}, { contentStore });
+    expect(tampered.ok).toBe(false);
+    expect(tampered.problems.map((p) => p.type)).toEqual(['content_mismatch']);
+  });
+});
 
 const count = async (store: ClickHouseAuditStore, workspaceId: string) => (await store.readChain(workspaceId, { limit: 10_000 })).length;
 
