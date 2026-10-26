@@ -32,6 +32,7 @@ import { FirebaseTokenVerifier } from '../auth/firebase-token-verifier.js';
 import { StaticTokenVerifier } from '../auth/static-token-verifier.js';
 import { InMemoryRateLimiter } from '../ratelimit/memory-rate-limiter.js';
 import { RedisRateLimiter } from '../ratelimit/redis-rate-limiter.js';
+import { assertInMemoryAdaptersAllowed } from './in-memory-guard.js';
 import { RandomIdGenerator, SystemClock } from './system.js';
 
 /** What every adapter factory receives. */
@@ -197,10 +198,16 @@ export interface CreateRuntimeOptions {
   ids?: IdGenerator;
   /** Replace the built-in registries (to add adapters). */
   registries?: Registries;
+  /** audit-api sets this: its rate limiter (AUDIT_API_RATE_LIMITER) counts for the in-memory production guard. */
+  usesRateLimiter?: boolean;
 }
 
-/** Build every port from config (EVENT_BUS, AUDIT_STORE, METRICS_STORE). */
+/**
+ * Build every port from config (EVENT_BUS, AUDIT_STORE, METRICS_STORE). In production it refuses in-memory
+ * adapters unless ALLOW_IN_MEMORY_ADAPTERS=true (InMemoryAdaptersNotAllowedError), before anything is created.
+ */
 export async function createRuntime(config: AppConfig, options: CreateRuntimeOptions): Promise<Runtime> {
+  assertInMemoryAdaptersAllowed(config, { includeRateLimiter: options.usesRateLimiter });
   const registries = options.registries ?? createDefaultRegistries();
   const deps: AdapterDeps = {
     config,

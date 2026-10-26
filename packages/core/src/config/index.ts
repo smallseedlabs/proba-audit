@@ -30,6 +30,12 @@ export const envSchema = z.object({
   CHECKPOINT_STORE: nonEmpty('clickhouse'),
   QUARANTINE_STORE: nonEmpty('clickhouse'),
   AUDIT_CONTENT_STORE: nonEmpty('clickhouse'),
+  // The in-memory adapters lose everything on restart and are per process: they refuse to start in production
+  // unless this is true (a deliberate, temporary opt-in, for example a smoke test of a production image).
+  ALLOW_IN_MEMORY_ADAPTERS: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((v) => v === 'true'),
 
   // Raw text of audit events (AuditEvent.content). Off by default: the consumer then drops it (never stored, no
   // digest) and the read API never returns it. On: the consumer stores it in AUDIT_CONTENT_STORE and the API serves it to admins.
@@ -207,6 +213,8 @@ export interface AppConfig {
     quarantineStore: string;
     auditContentStore: string;
   };
+  /** Explicit opt-in to run in-memory adapters when NODE_ENV=production (see InMemoryAdaptersNotAllowedError). */
+  allowInMemoryAdapters: boolean;
   /** Raw text of audit events: stored by the consumer and served (to admins) by the API only when enabled. */
   content: { enabled: boolean };
   eventBus: {
@@ -396,6 +404,7 @@ export function loadConfig(env: EnvSource = process.env, options: LoadConfigOpti
       quarantineStore: e.QUARANTINE_STORE,
       auditContentStore: e.AUDIT_CONTENT_STORE,
     },
+    allowInMemoryAdapters: e.ALLOW_IN_MEMORY_ADAPTERS,
     content: { enabled: e.AUDIT_CONTENT_ENABLED },
     eventBus: {
       redisUrl: e.REDIS_URL,

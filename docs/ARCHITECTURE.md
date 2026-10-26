@@ -95,6 +95,15 @@ The adapter for each port is chosen by an environment variable and created throu
 No config schema change is needed: adapter names are plain strings, checked against the registry at startup
 (an unknown name fails with the list of available adapters). No app code changes either, because apps only see ports.
 
+### In-memory adapters in production
+
+Every port has a `memory` adapter for tests and local runs. It keeps data in the process: gone on restart, invisible to other replicas.
+Like the stub connector, it is refused in production: when `NODE_ENV=production` and any of `EVENT_BUS`, `AUDIT_STORE`, `METRICS_STORE`,
+`CHECKPOINT_STORE`, `QUARANTINE_STORE`, `AUDIT_CONTENT_STORE` (and, for `audit-api`, `AUDIT_API_RATE_LIMITER`) is `memory`, `createRuntime`
+throws `InMemoryAdaptersNotAllowedError` (listing the offending variables) before creating anything, and the process exits. `ALLOW_IN_MEMORY_ADAPTERS=true`
+is the deliberate opt-in (default `false`). Outside production nothing changes. The guard is keyed on the registry name `memory`; an adapter you register
+under another name is your responsibility.
+
 ### EventBus delivery model
 
 At-least-once, with consumer groups. `read` delivers new messages, which stay *pending* until `ack`. `reclaimPending`

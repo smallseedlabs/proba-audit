@@ -14,6 +14,7 @@ import { StubConnectorNotAllowedError, StubPlatformConnector } from '../stub/stu
 import { InMemoryEventBus } from '../memory/event-bus.js';
 import { InMemoryAuditStore } from '../memory/audit-store.js';
 import { InMemoryMetricsStore } from '../memory/metrics-store.js';
+import { InMemoryAdaptersNotAllowedError } from './in-memory-guard.js';
 import { createConnectors, createDefaultRegistries, createRuntime } from './registries.js';
 
 const memoryEnv = { EVENT_BUS: 'memory', AUDIT_STORE: 'memory', METRICS_STORE: 'memory', CHECKPOINT_STORE: 'memory', QUARANTINE_STORE: 'memory' };
@@ -63,6 +64,75 @@ describe('createRuntime', () => {
     expect(r.checkpointStore.names()).toEqual(['clickhouse', 'memory']);
     expect(r.quarantineStore.names()).toEqual(['clickhouse', 'memory']);
     expect(r.platformConnector.names()).toEqual(['stub']);
+  });
+});
+
+describe('in-memory adapters in production (ALLOW_IN_MEMORY_ADAPTERS)', () => {
+  const prod = (extra: Record<string, string> = {}) => loadConfig({ ...memoryEnv, AUDIT_CONTENT_STORE: 'memory', NODE_ENV: 'production', ...extra });
+  // Everything durable except the one adapter under test, so a refusal names exactly that adapter.
+  const durable = { EVENT_BUS: 'redis-streams', AUDIT_STORE: 'clickhouse', METRICS_STORE: 'clickhouse', CHECKPOINT_STORE: 'clickhouse', QUARANTINE_STORE: 'clickhouse', AUDIT_CONTENT_STORE: 'clickhouse' };
+
+  it('refuses to start in production with any in-memory adapter, naming each', async () => {
+    const err = await createRuntime(prod(), { logger: new MemoryLogger() }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(InMemoryAdaptersNotAllowedError);
+    expect((err as InMemoryAdaptersNotAllowedError).adapters).toEqual([
+      'EVENT_BUS',
+      'AUDIT_STORE',
+      'METRICS_STORE',
+      'CHECKPOINT_STORE',
+      'QUARANTINE_STORE',
+      'AUDIT_CONTENT_STORE',
+    ]);
+    expect((err as Error).message).toContain('ALLOW_IN_MEMORY_ADAPTERS=true');
+  });
+
+  it.each(['EVENT_BUS', 'AUDIT_STORE', 'METRICS_STORE', 'CHECKPOINT_STORE', 'QUARANTINE_STORE', 'AUDIT_CONTENT_STORE'])(
+    'a single in-memory %s is enough to refuse',
+    async (key) => {
+      const config = loadConfig({ ...durable, [key]: 'memory', NODE_ENV: 'production' });
+      const err = await createRuntime(config, { logger: new MemoryLogger() }).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(InMemoryAdaptersNotAllowedError);
+      expect((err as InMemoryAdaptersNotAllowedError).adapters).toEqual([key]);
+    }
+  );
+
+  it('refuses before creating any adapter', async () => {
+    const registries = createDefaultRegistries();
+    let created = false;
+    registries.eventBus.register('probe', () => {
+      created = true;
+      return new InMemoryEventBus() as EventBus;
+    });
+    await expect(createRuntime(prod({ EVENT_BUS: 'probe' }), { logger: new MemoryLogger(), registries })).rejects.toBeInstanceOf(InMemoryAdaptersNotAllowedError);
+    expect(created).toBe(false);
+  });
+
+  it('the rate limiter counts only for the read API (usesRateLimiter)', async () => {
+    const config = (limiter: string) => prod({ ALLOW_IN_MEMORY_ADAPTERS: 'false', AUDIT_API_RATE_LIMITER: limiter });
+    const refused = async (limiter: string, usesRateLimiter: boolean) =>
+      ((await createRuntime(config(limiter), { logger: new MemoryLogger(), usesRateLimiter }).catch((e: unknown) => e)) as InMemoryAdaptersNotAllowedError).adapters;
+    expect(await refused('memory', true)).toContain('AUDIT_API_RATE_LIMITER');
+    expect(await refused('memory', false)).not.toContain('AUDIT_API_RATE_LIMITER');
+    expect(await refused('redis', true)).not.toContain('AUDIT_API_RATE_LIMITER');
+  });
+
+  it('starts in production with ALLOW_IN_MEMORY_ADAPTERS=true', async () => {
+    const rt = await createRuntime(prod({ ALLOW_IN_MEMORY_ADAPTERS: 'true' }), { logger: new MemoryLogger() });
+    expect(rt.auditStore).toBeInstanceOf(InMemoryAuditStore);
+    await rt.close();
+  });
+
+  it('is allowed outside production without the opt-in', async () => {
+    for (const NODE_ENV of ['development', 'test']) {
+      const rt = await createRuntime(loadConfig({ ...memoryEnv, NODE_ENV }), { logger: new MemoryLogger() });
+      await rt.close();
+    }
+  });
+
+  it('defaults to false and accepts only true or false', () => {
+    expect(loadConfig({}).allowInMemoryAdapters).toBe(false);
+    expect(loadConfig({ ALLOW_IN_MEMORY_ADAPTERS: 'true' }).allowInMemoryAdapters).toBe(true);
+    expect(() => loadConfig({ ALLOW_IN_MEMORY_ADAPTERS: 'yes' })).toThrow(ConfigError);
   });
 });
 

@@ -31,7 +31,7 @@ async function main(): Promise<void> {
     });
   }
 
-  const runtime = await createRuntime(config, { logger });
+  const runtime = await createRuntime(config, { logger, usesRateLimiter: true });
   const registries = createDefaultRegistries();
   const deps = { config, logger, clock: runtime.clock, ids: runtime.ids };
   const verifier = await registries.tokenVerifier.create(config.api.adapters.tokenVerifier, deps);
