@@ -9,3 +9,5 @@ export * from './clickhouse/index.js';
 export * from './runtime/index.js';
 export * from './postgres/index.js';
 export * from './stub/index.js';
+export * from './auth/index.js';
+export * from './ratelimit/index.js';

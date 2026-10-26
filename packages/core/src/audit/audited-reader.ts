@@ -60,12 +60,30 @@ export class AuditedReader {
     );
   }
 
+  /**
+   * A read of any other shape (the HTTP read API: event search, one event, trace list, facets,
+   * chain verification) recorded as the generic `data_access.read`. `operation` says which read
+   * it was (for example `events.search`) and `details` adds non-sensitive context such as the
+   * route; neither may carry returned data, credentials or personal data.
+   */
+  read<T>(
+    ctx: AccessContext,
+    operation: string,
+    filters: object,
+    size: (result: T) => number,
+    run: () => Promise<T>,
+    details: Record<string, unknown> = {}
+  ): Promise<T> {
+    return this.audited(ctx, 'data_access.read', filters, size, run, { operation, ...details });
+  }
+
   private async audited<T>(
     ctx: AccessContext,
     action: string,
     filters: object,
     size: (result: T) => number,
-    run: () => Promise<T>
+    run: () => Promise<T>,
+    context: Record<string, unknown> = {}
   ): Promise<T> {
     const started = this.clock.now().getTime();
     const emitter = ctx.traceId ? this.emitter.forTrace(ctx.traceId, ctx.parentSpanId) : this.emitter;
@@ -81,6 +99,7 @@ export class AuditedReader {
         durationMs: this.clock.now().getTime() - started,
         errorMessage: error?.message.slice(0, 500),
         details: {
+          ...context,
           filters: Object.entries(filters)
             .filter(([, v]) => v !== undefined)
             .map(([k]) => k)

@@ -2,7 +2,7 @@
   "name": "@smallseedlabs/proba-audit-api",
   "version": "0.1.0",
   "private": true,
-  "description": "proba-audit: audit-api process",
+  "description": "proba-audit: audit-api process (read-only HTTP API)",
   "type": "module",
   "main": "./dist/index.js",
   "license": "Apache-2.0",
@@ -10,7 +10,11 @@
     "start": "node dist/index.js"
   },
   "dependencies": {
+    "@fastify/cors": "^9.0.1",
     "@smallseedlabs/proba-audit-adapters": "*",
-    "@smallseedlabs/proba-audit-core": "*"
+    "@smallseedlabs/proba-audit-core": "*",
+    "@smallseedlabs/proba-protocol": "github:smallseedlabs/proba-protocol#v0.3.1",
+    "fastify": "^4.28.1",
+    "zod": "^3.23.8"
   }
 }

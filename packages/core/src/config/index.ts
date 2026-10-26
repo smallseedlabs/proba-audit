@@ -84,6 +84,42 @@ export const envSchema = z.object({
   ROLLUP_INTERVAL_MS: positiveInt(30000),
   ROLLUP_MAX_WINDOW_DAYS: positiveInt(7),
 
+  // Read API (apps/audit-api). Adapter names are registry keys, like the ports above.
+  AUDIT_API_TOKEN_VERIFIER: nonEmpty('firebase'),
+  AUDIT_API_RATE_LIMITER: nonEmpty('memory'),
+  AUDIT_API_SCOPE_SOURCE: nonEmpty('connectors'),
+  // Firebase project whose ID tokens are accepted (iss/aud). The same variable proba-hub uses.
+  FIREBASE_PROJECT_ID: z.string().default(''),
+  // JSON array of { token, subject, email, emailVerified? }. Only for the `static` verifier, never in production.
+  AUDIT_API_STATIC_TOKENS: z.string().default(''),
+  AUDIT_API_WORKSPACE_ID: nonEmpty('seedbed'),
+  // Who may call the API: a verified email in the allow-list or in an allowed domain gets `viewer`;
+  // an email in the admin list gets `admin`. Nobody is allowed when all three are empty.
+  AUDIT_API_ALLOWED_EMAILS: z.string().default(''),
+  AUDIT_API_ALLOWED_EMAIL_DOMAINS: z.string().default(''),
+  AUDIT_API_ADMIN_EMAILS: z.string().default(''),
+  // Browser origins allowed by CORS (the portal). Empty: no cross-origin access.
+  AUDIT_API_CORS_ORIGINS: z.string().default(''),
+  // Trust X-Forwarded-For for the client address (rate limiting, logs). Only behind a proxy you control.
+  AUDIT_API_TRUST_PROXY: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((v) => v === 'true'),
+  AUDIT_API_RATE_LIMIT_MAX: positiveInt(120),
+  AUDIT_API_RATE_LIMIT_WINDOW_MS: positiveInt(60000),
+  // Chain verification reads a lot: its own, much lower limit per caller.
+  AUDIT_API_CHAIN_RATE_LIMIT_MAX: positiveInt(6),
+  // Rejected sign-ins allowed per client address per window before it is refused outright.
+  AUDIT_API_AUTH_FAILURE_LIMIT_MAX: positiveInt(30),
+  AUDIT_API_AUTH_FAILURE_WINDOW_MS: positiveInt(900000),
+  // Which ad accounts a workspace sees for analytics: `connectors` asks the PLATFORM_CONNECTORS,
+  // `static` uses AUDIT_API_ANALYTICS_ACCOUNTS (platform:accountId pairs).
+  AUDIT_API_ANALYTICS_ACCOUNTS: z.string().default(''),
+  AUDIT_API_SCOPE_CACHE_MS: positiveInt(60000),
+  // Chain verification is bounded in time and in events.
+  AUDIT_API_CHAIN_MAX_RANGE_HOURS: positiveInt(24),
+  AUDIT_API_CHAIN_MAX_EVENTS: positiveInt(100000),
+
   // ClickHouse
   CLICKHOUSE_URL: nonEmpty('http://localhost:8123'),
   CLICKHOUSE_USER: nonEmpty('default'),
@@ -93,6 +129,59 @@ export const envSchema = z.object({
 });
 
 export type Env = z.infer<typeof envSchema>;
+
+export interface StaticTokenEntry {
+  token: string;
+  subject: string;
+  email: string;
+  emailVerified: boolean;
+}
+
+const staticTokensSchema = z.array(
+  z.object({
+    token: z.string().min(8),
+    subject: z.string().min(1).max(128),
+    email: z.string().email(),
+    emailVerified: z.boolean().default(true),
+  })
+);
+
+/** `a@x.com, B@x.com` -> lower-case, trimmed, de-duplicated. */
+export function parseList(value: string): string[] {
+  return [...new Set(value.split(',').map((v) => v.trim().toLowerCase()).filter(Boolean))];
+}
+
+/** `meta:act_1,google:123` -> account refs, platforms from the protocol enum. */
+export function parseAccountRefs(value: string): { platform: MetricPlatform; accountId: string }[] {
+  const out: { platform: MetricPlatform; accountId: string }[] = [];
+  for (const raw of value.split(',').map((v) => v.trim()).filter(Boolean)) {
+    const index = raw.indexOf(':');
+    const platform = metricPlatformSchema.safeParse(index < 0 ? raw : raw.slice(0, index));
+    const accountId = index < 0 ? '' : raw.slice(index + 1);
+    if (!platform.success || accountId === '' || accountId.length > 128) {
+      throw new Error(`"${raw}" is not platform:accountId (platform one of ${metricPlatformSchema.options.join(', ')})`);
+    }
+    out.push({ platform: platform.data, accountId });
+  }
+  return out;
+}
+
+/** CORS origins must be exact origins: scheme://host[:port], never `*` and never with a path. */
+export function parseCorsOrigins(value: string): string[] {
+  const origins: string[] = [];
+  for (const raw of value.split(',').map((v) => v.trim()).filter(Boolean)) {
+    let origin: string;
+    try {
+      const u = new URL(raw);
+      origin = u.origin;
+      if (!/^https?:$/.test(u.protocol) || origin !== raw.replace(/\/$/, '')) throw new Error('not an origin');
+    } catch {
+      throw new Error(`"${raw}" is not an origin like https://insights.example.com (no wildcard, no path)`);
+    }
+    if (!origins.includes(origin)) origins.push(origin);
+  }
+  return origins;
+}
 
 export interface AppConfig {
   env: Env['NODE_ENV'];
@@ -155,6 +244,21 @@ export interface AppConfig {
     pageSize: number;
   };
   rollup: { intervalMs: number; maxWindowDays: number };
+  /** Read API (apps/audit-api). */
+  api: {
+    /** The one workspace this deployment serves; injected into every request from the authenticated session. */
+    workspaceId: string;
+    adapters: { tokenVerifier: string; rateLimiter: string; scopeSource: string };
+    firebaseProjectId: string;
+    staticTokens: StaticTokenEntry[];
+    access: { allowedEmails: string[]; allowedEmailDomains: string[]; adminEmails: string[] };
+    corsOrigins: string[];
+    trustProxy: boolean;
+    rateLimit: { max: number; windowMs: number; chainMax: number; authFailureMax: number; authFailureWindowMs: number };
+    analyticsAccounts: { platform: MetricPlatform; accountId: string }[];
+    scopeCacheMs: number;
+    chain: { maxRangeHours: number; maxEvents: number };
+  };
   clickhouse: {
     url: string;
     username: string;
@@ -240,6 +344,26 @@ export function loadConfig(env: EnvSource = process.env, options: LoadConfigOpti
   } catch (err) {
     issues.push(`INGEST_INTERVAL_OVERRIDES: ${(err as Error).message}`);
   }
+  let staticTokens: StaticTokenEntry[] = [];
+  if (e.AUDIT_API_STATIC_TOKENS !== '') {
+    try {
+      staticTokens = staticTokensSchema.parse(JSON.parse(e.AUDIT_API_STATIC_TOKENS));
+    } catch (err) {
+      issues.push(`AUDIT_API_STATIC_TOKENS: not a JSON array of { token, subject, email } (${(err as Error).message.slice(0, 120)})`);
+    }
+  }
+  let analyticsAccounts: { platform: MetricPlatform; accountId: string }[] = [];
+  try {
+    analyticsAccounts = parseAccountRefs(e.AUDIT_API_ANALYTICS_ACCOUNTS);
+  } catch (err) {
+    issues.push(`AUDIT_API_ANALYTICS_ACCOUNTS: ${(err as Error).message}`);
+  }
+  let corsOrigins: string[] = [];
+  try {
+    corsOrigins = parseCorsOrigins(e.AUDIT_API_CORS_ORIGINS);
+  } catch (err) {
+    issues.push(`AUDIT_API_CORS_ORIGINS: ${(err as Error).message}`);
+  }
   if (issues.length > 0) throw new ConfigError(issues);
 
   return {
@@ -304,6 +428,29 @@ export function loadConfig(env: EnvSource = process.env, options: LoadConfigOpti
       pageSize: e.INGEST_PAGE_SIZE,
     },
     rollup: { intervalMs: e.ROLLUP_INTERVAL_MS, maxWindowDays: e.ROLLUP_MAX_WINDOW_DAYS },
+    api: {
+      workspaceId: e.AUDIT_API_WORKSPACE_ID,
+      adapters: { tokenVerifier: e.AUDIT_API_TOKEN_VERIFIER, rateLimiter: e.AUDIT_API_RATE_LIMITER, scopeSource: e.AUDIT_API_SCOPE_SOURCE },
+      firebaseProjectId: e.FIREBASE_PROJECT_ID.trim(),
+      staticTokens,
+      access: {
+        allowedEmails: parseList(e.AUDIT_API_ALLOWED_EMAILS),
+        allowedEmailDomains: parseList(e.AUDIT_API_ALLOWED_EMAIL_DOMAINS),
+        adminEmails: parseList(e.AUDIT_API_ADMIN_EMAILS),
+      },
+      corsOrigins,
+      trustProxy: e.AUDIT_API_TRUST_PROXY,
+      rateLimit: {
+        max: e.AUDIT_API_RATE_LIMIT_MAX,
+        windowMs: e.AUDIT_API_RATE_LIMIT_WINDOW_MS,
+        chainMax: e.AUDIT_API_CHAIN_RATE_LIMIT_MAX,
+        authFailureMax: e.AUDIT_API_AUTH_FAILURE_LIMIT_MAX,
+        authFailureWindowMs: e.AUDIT_API_AUTH_FAILURE_WINDOW_MS,
+      },
+      analyticsAccounts,
+      scopeCacheMs: e.AUDIT_API_SCOPE_CACHE_MS,
+      chain: { maxRangeHours: e.AUDIT_API_CHAIN_MAX_RANGE_HOURS, maxEvents: e.AUDIT_API_CHAIN_MAX_EVENTS },
+    },
     clickhouse: {
       url: e.CLICKHOUSE_URL,
       username: e.CLICKHOUSE_USER,
@@ -335,6 +482,8 @@ function redactUrl(url: string): string {
 export function redactConfig(config: AppConfig): Record<string, unknown> {
   return {
     ...config,
+    // Tokens are credentials: the log shows how many are configured, never the values.
+    api: { ...config.api, staticTokens: config.api.staticTokens.map(() => '[REDACTED]') },
     eventBus: { ...config.eventBus, redisUrl: redactUrl(config.eventBus.redisUrl) },
     clickhouse: {
       ...config.clickhouse,
@@ -342,4 +491,10 @@ export function redactConfig(config: AppConfig): Record<string, unknown> {
       password: config.clickhouse.password ? '[REDACTED]' : '',
     },
   };
+}
+
+/** True when no email, domain or admin is configured for the read API: nobody can use it. */
+export function isPolicyEmptyForConfig(config: AppConfig): boolean {
+  const a = config.api.access;
+  return a.allowedEmails.length === 0 && a.allowedEmailDomains.length === 0 && a.adminEmails.length === 0;
 }
