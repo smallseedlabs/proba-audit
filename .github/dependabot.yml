@@ -4,21 +4,38 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 3
     commit-message:
       prefix: "chore(deps)"
     groups:
       minor-and-patch:
         update-types: ["minor", "patch"]
+    # Major upgrades (TypeScript, zod, eslint, vitest, ...) are done deliberately, by hand, not by bot.
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
+    open-pull-requests-limit: 3
     commit-message:
       prefix: "chore(ci)"
+    # One pull request for all workflow action updates (majors included: they are runtime-only for CI).
+    groups:
+      github-actions:
+        patterns: ["*"]
   - package-ecosystem: "docker"
     directory: "/"
     schedule:
       interval: "weekly"
+    open-pull-requests-limit: 3
     commit-message:
       prefix: "chore(docker)"
+    groups:
+      minor-and-patch:
+        update-types: ["minor", "patch"]
+    # Base image / service major versions (node, nginx, postgres, redis, clickhouse) are upgraded deliberately.
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
