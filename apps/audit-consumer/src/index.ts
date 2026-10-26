@@ -20,6 +20,7 @@ runService({
   async onStart({ config, logger }) {
     runtime = await createRuntime(config, { logger });
     await runtime.auditStore.ping();
+    if (config.content.enabled) await runtime.auditContentStore.ping();
     await runtime.eventBus.ping();
 
     // The consumer audits itself through the same emitter and bus as every service.
@@ -40,6 +41,7 @@ runService({
     consumer = new AuditConsumer({
       bus: runtime.eventBus,
       store: runtime.auditStore,
+      contentStore: runtime.auditContentStore,
       clock: runtime.clock,
       ids: runtime.ids,
       logger,
@@ -57,6 +59,7 @@ runService({
         retryMaxMs: config.consumer.retryMaxMs,
         serviceName: config.service.name,
         selfAuditWorkspaceId: config.consumer.selfAuditWorkspaceId,
+        contentEnabled: config.content.enabled,
       },
     });
     await consumer.start();

@@ -9,6 +9,7 @@ import {
   buildAuditEvent,
   createBusAuditEmitter,
   type AuditEvent,
+  type AuditContentStore,
   type AuditStore,
   type BusMessage,
   type Clock,
@@ -21,6 +22,7 @@ import { AuditConsumer, type AuditConsumerOptions } from './consumer.js';
 export interface HarnessOptions {
   bus: EventBus;
   store: AuditStore;
+  contentStore?: AuditContentStore;
   clock: Clock;
   ids: IdGenerator;
   topic: string;
@@ -69,6 +71,7 @@ export class ConsumerHarness {
     this.consumer = new AuditConsumer({
       bus: h.bus,
       store: h.store,
+      ...(h.contentStore ? { contentStore: h.contentStore } : {}),
       clock: h.clock,
       ids: h.ids,
       logger: this.logger,

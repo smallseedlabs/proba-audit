@@ -11,6 +11,12 @@
  * - One hash chain per workspace, continued from a per-workspace head that is cached
  *   in memory and recovered from the store the first time a workspace is seen.
  *
+ * Raw text (AuditEvent.content, protocol 0.3.3): when content is enabled the text goes to the
+ * AuditContentStore BEFORE the event row is written (and again for identical redeliveries, so a
+ * crash between the two writes is healed by the retry), and the event row keeps only a digest of it
+ * (`contentDigest`, covered by the hash). When content is disabled the text is dropped: nothing of
+ * it is stored, not even a digest. A conflicting event never writes its text.
+ *
  * Single writer: the cached chain heads assume that ONE consumer instance writes
  * to the store at a time (see docs/ARCHITECTURE.md). Run one replica.
  */
@@ -18,9 +24,11 @@
 import {
   chainEvent,
   contentHash,
+  digestAuditContent,
   prepareForStorage,
   sameContent,
   validateAuditEvent,
+  type AuditContentStore,
   type AuditEmitter,
   type AuditEvent,
   type AuditStore,
@@ -30,6 +38,7 @@ import {
   type EventBus,
   type IdGenerator,
   type Logger,
+  type StoredAuditContent,
   type StoredAuditEvent,
   type Subscription,
 } from '@smallseedlabs/proba-audit-core';
@@ -51,11 +60,15 @@ export interface AuditConsumerOptions {
   serviceName: string;
   /** Workspace for self-audit events that belong to no workspace. */
   selfAuditWorkspaceId: string;
+  /** Store the raw text of events (needs `AuditConsumerDeps.contentStore`). When false the text is dropped. Default false. */
+  contentEnabled?: boolean;
 }
 
 export interface AuditConsumerDeps {
   bus: EventBus;
   store: AuditStore;
+  /** Where the raw text of events goes when `options.contentEnabled` is true. */
+  contentStore?: AuditContentStore;
   clock: Clock;
   ids: IdGenerator;
   logger: Logger;
@@ -77,6 +90,10 @@ export interface BatchResult {
   conflicts: number;
   /** Workspaces that got events written. */
   workspaces: string[];
+  /** Events whose raw text was written to the content store by this batch. */
+  contentStored: number;
+  /** Events that carried raw text which was dropped because content is disabled. */
+  contentDropped: number;
 }
 
 interface DeadLetterItem {
@@ -90,8 +107,10 @@ interface DeadLetterItem {
 interface Candidate {
   message: BusMessage;
   event: AuditEvent;
-  /** The event as it will be stored (normalised, with derived tags). */
+  /** The event as it will be stored (normalised, with derived tags, raw text replaced by its digest). */
   prepared: AuditEvent;
+  /** The raw text to store with the event, when content is enabled and the event has some. */
+  content?: StoredAuditContent;
 }
 
 const errorMessage = (err: unknown): string => (err instanceof Error ? err.message : String(err));
@@ -266,6 +285,11 @@ export class AuditConsumer {
     const deadLetters: DeadLetterItem[] = [];
     const toAck: BusMessage[] = [];
     let duplicates = 0;
+    let contentDropped = 0;
+    let contentStored = 0;
+    const contentEnabled = this.o.contentEnabled === true && this.deps.contentStore !== undefined;
+    /** Events identical to ones already stored: their text is (re)written too, in case an earlier attempt died between the two writes. */
+    const redelivered: Candidate[] = [];
 
     // 1. Validate with the protocol schema.
     const candidates: Candidate[] = [];
@@ -286,8 +310,29 @@ export class AuditConsumer {
         deadLetters.push({ message, kind: 'invalid_event', reason, issues });
         continue;
       }
-      const event = parsed.data as AuditEvent;
-      candidates.push({ message, event, prepared: prepareForStorage(event) });
+      let event = parsed.data as AuditEvent;
+      let content: StoredAuditContent | undefined;
+      if (event.content !== undefined) {
+        if (contentEnabled) {
+          content = {
+            workspaceId: event.workspaceId,
+            eventId: event.eventId,
+            occurredAt: new Date(event.occurredAt).toISOString(),
+            content: event.content,
+            contentDigest: digestAuditContent(event.content),
+          };
+        } else {
+          // Disabled: the text is not kept anywhere (no digest either, there is nothing to verify later).
+          const { content: _dropped, ...withoutContent } = event;
+          void _dropped;
+          event = withoutContent;
+          contentDropped += 1;
+        }
+      }
+      candidates.push({ message, event, prepared: prepareForStorage(event), ...(content ? { content } : {}) });
+    }
+    if (contentDropped > 0) {
+      logger.warn('raw text of audit events dropped: AUDIT_CONTENT_ENABLED is false for this consumer', { events: contentDropped });
     }
 
     // 2. Duplicates inside the batch: first wins.
@@ -326,6 +371,7 @@ export class AuditConsumer {
         logger.debug('duplicate event skipped', { traceId: c.event.traceId, eventId: c.event.eventId });
         duplicates += 1;
         toAck.push(c.message);
+        redelivered.push(c);
       } else {
         deadLetters.push(this.conflict(logger, c, contentHash(stored), 'already stored'));
       }
@@ -345,7 +391,16 @@ export class AuditConsumer {
       messageOf.set(stored.eventId, c.message);
     }
 
-    // 5. Durable write. If this throws nothing has been acknowledged.
+    // 5a. Raw text first (idempotent), then the events: if this throws nothing has been acknowledged and the retry writes both.
+    if (contentEnabled) {
+      const items = [...fresh, ...redelivered].flatMap((c) => (c.content ? [c.content] : []));
+      if (items.length > 0) {
+        await this.deps.contentStore!.put(items);
+        contentStored = items.length;
+      }
+    }
+
+    // 5b. Durable write. If this throws nothing has been acknowledged.
     const written = new Map<string, number>();
     if (chained.length > 0) {
       const result = await store.appendBatch(chained);
@@ -387,6 +442,8 @@ export class AuditConsumer {
       invalid: deadLetters.filter((d) => d.kind === 'invalid_event').length,
       conflicts: deadLetters.filter((d) => d.kind === 'conflict').length,
       workspaces: [...written.keys()],
+      contentStored,
+      contentDropped,
     };
     logger.info('batch processed', { ...result, durationMs: clock.now().getTime() - startedAt });
 
