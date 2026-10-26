@@ -1,10 +1,21 @@
 import { createClient, type ClickHouseClient } from '@clickhouse/client';
+import type { AppConfig, ClickHouseRole } from '@smallseedlabs/proba-audit-core';
 
 export interface ClickHouseOptions {
   url: string;
   username: string;
   password: string;
   database: string;
+}
+
+/**
+ * Connection options for a role: the role's own user (CLICKHOUSE_<ROLE>_USER) when set, otherwise the shared
+ * CLICKHOUSE_USER. Without a role the shared user is used.
+ */
+export function clickHouseOptionsFor(config: AppConfig, role?: ClickHouseRole): ClickHouseOptions {
+  const { url, database, username, password, roles } = config.clickhouse;
+  const credentials = role ? roles[role] : { username, password };
+  return { url, database, username: credentials.username, password: credentials.password };
 }
 
 /**

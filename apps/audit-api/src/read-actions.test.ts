@@ -3,7 +3,7 @@ import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { AUDIT_ACTION_INFO, AUDIT_READ_ACTIONS, buildAuditContent, getAuditActionInfo, type AuditEvent } from '@smallseedlabs/proba-audit-core';
-import { TOKENS, createHarness, makeEvent, makeObservation, seedWithContent, type Harness } from './harness.testing.js';
+import { TOKENS, WORKSPACE, createHarness, makeEvent, makeObservation, seedWithContent, type Harness } from './harness.testing.js';
 
 /**
  * The API records what it reads with the protocol's specific audit.* / analytics.* actions. This scans what it really emits,
@@ -18,9 +18,9 @@ describe('audit-api read actions are catalogued and specific', () => {
   beforeAll(async () => {
     h = await createHarness({ env: { AUDIT_CONTENT_ENABLED: 'true' } });
     const [e] = await seedWithContent(h, [{ event: { traceId }, content: buildAuditContent('user_message', 'hello') }]);
-    await h.metrics.upsertObservations([makeObservation()]);
-    await h.metrics.computeRollups({ bucket: 'hour', from: '2026-10-24T00:00:00.000Z', to: '2026-10-26T00:00:00.000Z' });
-    await h.metrics.computeRollups({ bucket: 'day', from: '2026-10-24T00:00:00.000Z', to: '2026-10-26T00:00:00.000Z' });
+    await h.metrics.upsertObservations(WORKSPACE, [makeObservation()]);
+    await h.metrics.computeRollups({ workspaceId: WORKSPACE, bucket: 'hour', from: '2026-10-24T00:00:00.000Z', to: '2026-10-26T00:00:00.000Z' });
+    await h.metrics.computeRollups({ workspaceId: WORKSPACE, bucket: 'day', from: '2026-10-24T00:00:00.000Z', to: '2026-10-26T00:00:00.000Z' });
     const day = 'from=2026-10-25T00:00:00Z&to=2026-10-26T00:00:00Z';
     const routes: [string, string][] = [
       ['/v1/session', TOKENS.viewer],

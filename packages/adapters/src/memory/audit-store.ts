@@ -236,11 +236,8 @@ export class InMemoryAuditStore implements AuditStore {
     return { facets, truncated };
   }
 
-  async getTrace(
-    traceId: string,
-    options: { workspaceId?: string; limit?: number } = {}
-  ): Promise<StoredAuditEvent[]> {
-    return this.query({ traceId, workspaceId: options.workspaceId, order: 'asc', limit: options.limit });
+  async getTrace(workspaceId: string, traceId: string, options: { limit?: number } = {}): Promise<StoredAuditEvent[]> {
+    return this.query({ traceId, workspaceId, order: 'asc', limit: options.limit });
   }
 
   async aggregate(query: AuditAggregateQuery): Promise<AuditAggregateRow[]> {

@@ -167,13 +167,13 @@ beforeAll(async () => {
       fetchedAt: new Date().toISOString(),
     })
   );
-  await metrics.upsertObservations([
+  await metrics.upsertObservations(WORKSPACE, [
     ...observations,
     makeObservation({ accountId: `act_foreign_${run}`, campaignId: 'cmp_foreign', periodStart: hourStart(2), periodEnd: hourStart(1), metrics: { impressions: 999999, clicks: 1, spend: 999, conversions: 1 } }),
   ]);
   const window = { from: new Date(base.getTime() - 48 * 3_600_000).toISOString(), to: new Date(base.getTime() + 3_600_000).toISOString() };
-  await metrics.computeRollups({ bucket: 'hour', ...window });
-  await metrics.computeRollups({ bucket: 'day', ...window });
+  await metrics.computeRollups({ workspaceId: WORKSPACE, bucket: 'hour', ...window });
+  await metrics.computeRollups({ workspaceId: WORKSPACE, bucket: 'day', ...window });
 
   app = await buildServer({
     config,

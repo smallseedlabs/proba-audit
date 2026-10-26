@@ -140,6 +140,14 @@ export const envSchema = z.object({
   CLICKHOUSE_PASSWORD: z.string().default(''),
   CLICKHOUSE_DATABASE: z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/).default('proba_audit'),
   CLICKHOUSE_MIGRATIONS_DIR: nonEmpty('migrations/clickhouse'),
+  // Least-privilege ClickHouse users (scripts/clickhouse-roles.sql). Each role falls back to CLICKHOUSE_USER /
+  // CLICKHOUSE_PASSWORD when its own user is not set, so a single-user local stack keeps working.
+  CLICKHOUSE_CONSUMER_USER: z.string().min(1).optional(),
+  CLICKHOUSE_CONSUMER_PASSWORD: z.string().min(1).optional(),
+  CLICKHOUSE_API_USER: z.string().min(1).optional(),
+  CLICKHOUSE_API_PASSWORD: z.string().min(1).optional(),
+  CLICKHOUSE_MIGRATOR_USER: z.string().min(1).optional(),
+  CLICKHOUSE_MIGRATOR_PASSWORD: z.string().min(1).optional(),
 });
 
 export type Env = z.infer<typeof envSchema>;
@@ -195,6 +203,17 @@ export function parseCorsOrigins(value: string): string[] {
     if (!origins.includes(origin)) origins.push(origin);
   }
   return origins;
+}
+
+/**
+ * The ClickHouse users a process connects as: `consumer` writes (audit-consumer, metrics-ingester, rollup: INSERT and SELECT),
+ * `api` only reads (audit-api: SELECT), `migrator` changes the schema (`npm run migrate`: DDL).
+ */
+export type ClickHouseRole = 'consumer' | 'api' | 'migrator';
+
+export interface ClickHouseCredentials {
+  username: string;
+  password: string;
 }
 
 export interface AppConfig {
@@ -284,6 +303,8 @@ export interface AppConfig {
     password: string;
     database: string;
     migrationsDir: string;
+    /** Credentials per role; each equals username/password above when the role has no user of its own. */
+    roles: Record<ClickHouseRole, ClickHouseCredentials>;
   };
 }
 
@@ -383,6 +404,19 @@ export function loadConfig(env: EnvSource = process.env, options: LoadConfigOpti
   } catch (err) {
     issues.push(`AUDIT_API_CORS_ORIGINS: ${(err as Error).message}`);
   }
+  const roleCredentials = (role: string, user: string | undefined, password: string | undefined): ClickHouseCredentials => {
+    if (user === undefined) {
+      if (password !== undefined) issues.push(`CLICKHOUSE_${role}_PASSWORD: set without CLICKHOUSE_${role}_USER`);
+      return { username: e.CLICKHOUSE_USER, password: e.CLICKHOUSE_PASSWORD };
+    }
+    if (password === undefined) issues.push(`CLICKHOUSE_${role}_PASSWORD: required when CLICKHOUSE_${role}_USER is set`);
+    return { username: user, password: password ?? '' };
+  };
+  const clickhouseRoles: Record<ClickHouseRole, ClickHouseCredentials> = {
+    consumer: roleCredentials('CONSUMER', e.CLICKHOUSE_CONSUMER_USER, e.CLICKHOUSE_CONSUMER_PASSWORD),
+    api: roleCredentials('API', e.CLICKHOUSE_API_USER, e.CLICKHOUSE_API_PASSWORD),
+    migrator: roleCredentials('MIGRATOR', e.CLICKHOUSE_MIGRATOR_USER, e.CLICKHOUSE_MIGRATOR_PASSWORD),
+  };
   if (issues.length > 0) throw new ConfigError(issues);
 
   return {
@@ -479,6 +513,7 @@ export function loadConfig(env: EnvSource = process.env, options: LoadConfigOpti
       password: e.CLICKHOUSE_PASSWORD,
       database: e.CLICKHOUSE_DATABASE,
       migrationsDir: e.CLICKHOUSE_MIGRATIONS_DIR,
+      roles: clickhouseRoles,
     },
   };
 }
@@ -511,6 +546,9 @@ export function redactConfig(config: AppConfig): Record<string, unknown> {
       ...config.clickhouse,
       url: redactUrl(config.clickhouse.url),
       password: config.clickhouse.password ? '[REDACTED]' : '',
+      roles: Object.fromEntries(
+        Object.entries(config.clickhouse.roles).map(([role, c]) => [role, { username: c.username, password: c.password ? '[REDACTED]' : '' }])
+      ),
     },
   };
 }

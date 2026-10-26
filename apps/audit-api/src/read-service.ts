@@ -385,7 +385,7 @@ export class ReadService {
 
   private async freshness(ctx: AccessContext): Promise<DataFreshness> {
     const scope = await this.d.scope(ctx);
-    const f = await this.d.metricsStore.getFreshness(scope.accounts);
+    const f = await this.d.metricsStore.getFreshness(ctx.workspaceId, scope.accounts);
     const asOf = f.rollupsComputedAt && f.observationsFetchedAt ? new Date(Math.min(Date.parse(f.rollupsComputedAt), Date.parse(f.observationsFetchedAt))).toISOString() : null;
     return { asOf, ...f };
   }

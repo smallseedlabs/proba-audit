@@ -5,7 +5,7 @@
 
 import { isAbsolute, resolve } from 'node:path';
 import { createLogger, loadConfigFromEnvironment } from '@smallseedlabs/proba-audit-core';
-import { createClickHouseClient, ensureDatabase } from './client.js';
+import { clickHouseOptionsFor, createClickHouseClient, ensureDatabase } from './client.js';
 import { clickHouseMigrationDb } from './migrate-db.js';
 import { loadMigrations, runMigrations } from './migrate.js';
 
@@ -16,9 +16,11 @@ async function main(): Promise<void> {
     ? config.clickhouse.migrationsDir
     : resolve(process.cwd(), config.clickhouse.migrationsDir);
 
-  logger.info('migration starting', { lifecycle: 'starting', database: config.clickhouse.database, dir });
-  await ensureDatabase(config.clickhouse);
-  const client = createClickHouseClient(config.clickhouse);
+  // The migrator user (CLICKHOUSE_MIGRATOR_USER, falling back to CLICKHOUSE_USER) is the only one that needs DDL.
+  const options = clickHouseOptionsFor(config, 'migrator');
+  logger.info('migration starting', { lifecycle: 'starting', database: options.database, user: options.username, dir });
+  await ensureDatabase(options);
+  const client = createClickHouseClient(options);
   try {
     const result = await runMigrations(clickHouseMigrationDb(client), loadMigrations(dir), logger);
     logger.info('migration finished', { lifecycle: 'finished', ...result });

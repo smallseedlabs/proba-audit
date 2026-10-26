@@ -13,7 +13,7 @@ runService({
   name: 'rollup',
   defaultPort: 3103,
   async onStart({ config, logger }) {
-    runtime = await createRuntime(config, { logger });
+    runtime = await createRuntime(config, { logger, clickhouseRole: 'consumer' });
     await Promise.all([runtime.metricsStore.ping(), runtime.checkpointStore.ping(), runtime.eventBus.ping()]);
     const emitter = createBusAuditEmitter({
       bus: runtime.eventBus,

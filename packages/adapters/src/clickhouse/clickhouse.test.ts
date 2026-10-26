@@ -62,10 +62,10 @@ describe('row mapping', () => {
 
   it('round-trips observations; campaign level rows use empty adset/ad ids', () => {
     const campaignLevel = makeObservation();
-    expect(toObservationRow(campaignLevel)).toMatchObject({ adset_id: '', ad_id: '', reach: null, timezone: null });
-    expect(fromObservationRow(toObservationRow(campaignLevel))).toEqual(campaignLevel);
+    expect(toObservationRow('ws_1', campaignLevel)).toMatchObject({ workspace_id: 'ws_1', adset_id: '', ad_id: '', reach: null, timezone: null });
+    expect(fromObservationRow(toObservationRow('ws_1', campaignLevel))).toEqual(campaignLevel);
     const full = makeObservation({ adsetId: 'as', adId: 'ad', timezone: 'Europe/London', sourceRef: 's', metrics: { impressions: 1, clicks: 1, spend: 1, conversions: 1, reach: 1, videoViews: 1, revenue: 1 } });
-    expect(fromObservationRow(toObservationRow(full))).toEqual(full);
+    expect(fromObservationRow(toObservationRow('ws_1', full))).toEqual(full);
   });
 });
 
@@ -109,13 +109,15 @@ describe('migration runner', () => {
       '0006_rollup_timezone.sql',
       '0007_audit_read_indexes.sql',
       '0008_audit_event_content.sql',
+      '0009_metrics_workspace.sql',
     ]);
-    expect(m.map((x) => x.statements.length)).toEqual([1, 1, 2, 1, 2, 2, 8, 2]);
-    expect(new Set(m.map((x) => x.checksum)).size).toBe(8);
+    expect(m.map((x) => x.statements.length)).toEqual([1, 1, 2, 1, 2, 2, 8, 2, 12]);
+    expect(new Set(m.map((x) => x.checksum)).size).toBe(9);
   });
 
   it('keeps every statement idempotent', () => {
-    for (const m of loadMigrations(migrationsDir)) {
+    // 0009 rebuilds tables (copy, swap, drop) and cannot be re-run after the swap; its header says how to recover.
+    for (const m of loadMigrations(migrationsDir).filter((x) => x.version !== 9)) {
       for (const s of m.statements) expect(s).toMatch(/^(CREATE (TABLE|DATABASE) IF NOT EXISTS|ALTER TABLE \w+ (MODIFY SETTING|ADD COLUMN IF NOT EXISTS|ADD INDEX IF NOT EXISTS|MATERIALIZE INDEX))/);
     }
   });
@@ -123,9 +125,9 @@ describe('migration runner', () => {
   it('applies pending migrations in order and records them', async () => {
     const { db, commands, recorded } = fakeDb();
     const result = await runMigrations(db, loadMigrations(migrationsDir));
-    expect(result.applied).toHaveLength(8);
-    expect(commands).toHaveLength(19);
-    expect(recorded.map((r) => r.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+    expect(result.applied).toHaveLength(9);
+    expect(commands).toHaveLength(31);
+    expect(recorded.map((r) => r.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
   });
 
   it('skips applied migrations and only runs new ones', async () => {
@@ -141,9 +143,10 @@ describe('migration runner', () => {
       '0006_rollup_timezone.sql',
       '0007_audit_read_indexes.sql',
       '0008_audit_event_content.sql',
+      '0009_metrics_workspace.sql',
     ]);
-    expect(commands).toHaveLength(18);
-    expect(recorded.map((r) => r.version)).toEqual([2, 3, 4, 5, 6, 7, 8]);
+    expect(commands).toHaveLength(30);
+    expect(recorded.map((r) => r.version)).toEqual([2, 3, 4, 5, 6, 7, 8, 9]);
   });
 
   it('refuses to continue when an applied migration was edited', async () => {
@@ -192,5 +195,28 @@ describe('migration 0008', () => {
     expect(sql).toMatch(/CREATE TABLE IF NOT EXISTS audit_event_content/);
     expect(sql).toMatch(/ORDER BY \(workspace_id, event_id\)/);
     expect(sql).toMatch(/PARTITION BY toYYYYMM\(occurred_at\)/);
+  });
+});
+
+describe('migration 0009', () => {
+  const sql = loadMigrations(migrationsDir).find((x) => x.filename === '0009_metrics_workspace.sql')!.statements.join('\n');
+
+  it.each(['metric_observations', 'metric_rollups_hourly', 'metric_rollups_daily'])('rebuilds %s with workspace_id leading the sorting key', (table) => {
+    expect(sql).toMatch(new RegExp(`CREATE TABLE IF NOT EXISTS ${table}_ws`));
+    expect(sql).toMatch(new RegExp(`INSERT INTO ${table}_ws[\\s\\S]*?SELECT 'seedbed'[\\s\\S]*?FROM ${table}`));
+    expect(sql).toMatch(new RegExp(`EXCHANGE TABLES ${table} AND ${table}_ws`));
+    expect(sql).toMatch(new RegExp(`DROP TABLE ${table}_ws`));
+  });
+
+  it('puts workspace_id first in every new sorting key and gives it no default', () => {
+    const keys = sql.match(/ORDER BY \([^)]*\)/g) ?? [];
+    expect(keys).toHaveLength(3);
+    for (const k of keys) expect(k).toMatch(/^ORDER BY \(workspace_id, platform,/);
+    expect(sql).not.toMatch(/workspace_id\s+String\s+DEFAULT/);
+  });
+
+  it('copies inserted_at and computed_at so the rollup watermark does not rewind', () => {
+    expect(sql).toMatch(/INSERT INTO metric_observations_ws[\s\S]*inserted_at\)[\s\S]*inserted_at\s+FROM metric_observations/);
+    expect(sql).toMatch(/computed_at(, timezone, bucket_date)?\s+FROM metric_rollups_hourly/);
   });
 });

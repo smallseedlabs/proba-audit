@@ -364,7 +364,7 @@ describe('audit pipeline: Postgres outbox -> relay -> Redis -> consumer -> Click
     await relay.stop();
     await waitFor(async () => (await outbox.pendingCount()) === 0);
 
-    const trace = await s.store.getTrace(traceId, { workspaceId: ws });
+    const trace = await s.store.getTrace(ws, traceId);
     expect(trace.map((e) => e.action)).toEqual(['command.accepted', 'command.processed']);
     expect(await count(s.store, ws)).toBe(2);
     expect(await verifyChain(s.store, ws)).toMatchObject({ ok: true, checked: 2 });

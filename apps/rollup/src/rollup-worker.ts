@@ -89,7 +89,7 @@ export class RollupWorker {
     let window: { from: string; to: string } | undefined;
     try {
       const previous = await checkpoints.get(this.key);
-      const changed = await metricsStore.changedSince(previous?.cursor);
+      const changed = await metricsStore.changedSince(options.workspaceId, previous?.cursor);
       if (!changed) {
         log.debug('rollup idle: nothing changed', { lifecycle: 'rollup_idle' });
         return { status: 'idle' };
@@ -104,7 +104,7 @@ export class RollupWorker {
       const end = Date.parse(changed.to);
       for (let from = Date.parse(changed.from); from < end; from += step) {
         const to = Math.min(from + step, end);
-        const request = { from: new Date(from).toISOString(), to: new Date(to).toISOString() };
+        const request = { workspaceId: options.workspaceId, from: new Date(from).toISOString(), to: new Date(to).toISOString() };
         hourRows += await metricsStore.computeRollups({ bucket: 'hour', ...request });
         dayRows += await metricsStore.computeRollups({ bucket: 'day', ...request });
         chunks += 1;

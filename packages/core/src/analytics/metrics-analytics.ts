@@ -212,7 +212,7 @@ export class MetricsAnalytics {
     this.checkScope(scope);
     const q = this.parseSummary(query);
     const accounts = scope.accounts;
-    const common = { bucket: q.granularity, from: q.from, to: q.to, accounts, sourceGranularity: this.source, ...(q.campaignId ? { campaignId: q.campaignId } : {}) } as const;
+    const common = { workspaceId: scope.workspaceId, bucket: q.granularity, from: q.from, to: q.to, accounts, sourceGranularity: this.source, ...(q.campaignId ? { campaignId: q.campaignId } : {}) } as const;
 
     const [total, series, byCampaign] = await Promise.all([
       this.store.aggregateRollups({ ...common, groupBy: [] }),

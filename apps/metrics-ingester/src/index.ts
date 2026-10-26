@@ -19,7 +19,7 @@ runService({
   name: 'metrics-ingester',
   defaultPort: 3102,
   async onStart({ config, logger }) {
-    runtime = await createRuntime(config, { logger });
+    runtime = await createRuntime(config, { logger, clickhouseRole: 'consumer' });
     await Promise.all([
       runtime.metricsStore.ping(),
       runtime.checkpointStore.ping(),

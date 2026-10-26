@@ -4,6 +4,7 @@ import {
   type AuditContentStore,
   type AuditStore,
   type CheckpointStore,
+  type ClickHouseRole,
   type Clock,
   type EventBus,
   type IdGenerator,
@@ -15,7 +16,7 @@ import {
   type RateLimiter,
   type TokenVerifier,
 } from '@smallseedlabs/proba-audit-core';
-import { createClickHouseClient } from '../clickhouse/client.js';
+import { clickHouseOptionsFor, createClickHouseClient, type ClickHouseOptions } from '../clickhouse/client.js';
 import { ClickHouseAuditStore } from '../clickhouse/audit-store.js';
 import { ClickHouseAuditContentStore } from '../clickhouse/audit-content-store.js';
 import { InMemoryAuditContentStore } from '../memory/audit-content-store.js';
@@ -41,6 +42,8 @@ export interface AdapterDeps {
   logger: Logger;
   clock: Clock;
   ids: IdGenerator;
+  /** ClickHouse connection for this process's role (CLICKHOUSE_<ROLE>_USER, falling back to CLICKHOUSE_USER). */
+  clickhouse: ClickHouseOptions;
 }
 
 /** What a PlatformConnector factory receives: the shared deps plus the platform it is created for. */
@@ -85,32 +88,32 @@ export function createDefaultRegistries(): Registries {
     .register('memory', ({ clock }) => new InMemoryEventBus(clock));
 
   const auditStore = new AdapterRegistry<AuditStore, AdapterDeps>('AuditStore')
-    .register('clickhouse', ({ config }) =>
-      new ClickHouseAuditStore({ client: createClickHouseClient(config.clickhouse), ownsClient: true })
+    .register('clickhouse', ({ clickhouse }) =>
+      new ClickHouseAuditStore({ client: createClickHouseClient(clickhouse), ownsClient: true })
     )
     .register('memory', () => new InMemoryAuditStore());
 
   const auditContentStore = new AdapterRegistry<AuditContentStore, AdapterDeps>('AuditContentStore')
-    .register('clickhouse', ({ config }) =>
-      new ClickHouseAuditContentStore({ client: createClickHouseClient(config.clickhouse), ownsClient: true })
+    .register('clickhouse', ({ clickhouse }) =>
+      new ClickHouseAuditContentStore({ client: createClickHouseClient(clickhouse), ownsClient: true })
     )
     .register('memory', () => new InMemoryAuditContentStore());
 
   const metricsStore = new AdapterRegistry<MetricsStore, AdapterDeps>('MetricsStore')
-    .register('clickhouse', ({ config, clock }) =>
-      new ClickHouseMetricsStore({ client: createClickHouseClient(config.clickhouse), clock, ownsClient: true })
+    .register('clickhouse', ({ clickhouse, clock }) =>
+      new ClickHouseMetricsStore({ client: createClickHouseClient(clickhouse), clock, ownsClient: true })
     )
     .register('memory', ({ clock }) => new InMemoryMetricsStore(clock));
 
   const checkpointStore = new AdapterRegistry<CheckpointStore, AdapterDeps>('CheckpointStore')
-    .register('clickhouse', ({ config, clock }) =>
-      new ClickHouseCheckpointStore({ client: createClickHouseClient(config.clickhouse), clock, ownsClient: true })
+    .register('clickhouse', ({ clickhouse, clock }) =>
+      new ClickHouseCheckpointStore({ client: createClickHouseClient(clickhouse), clock, ownsClient: true })
     )
     .register('memory', ({ clock }) => new InMemoryCheckpointStore(clock));
 
   const quarantineStore = new AdapterRegistry<QuarantineStore, AdapterDeps>('QuarantineStore')
-    .register('clickhouse', ({ config }) =>
-      new ClickHouseQuarantineStore({ client: createClickHouseClient(config.clickhouse), ownsClient: true })
+    .register('clickhouse', ({ clickhouse }) =>
+      new ClickHouseQuarantineStore({ client: createClickHouseClient(clickhouse), ownsClient: true })
     )
     .register('memory', () => new InMemoryQuarantineStore());
 
@@ -158,6 +161,7 @@ export async function createConnectors(
     logger: options.logger,
     clock: options.clock ?? new SystemClock(),
     ids: options.ids ?? new RandomIdGenerator(),
+    clickhouse: clickHouseOptionsFor(config),
   };
   const connectors = new Map<MetricPlatform, PlatformConnector>();
   for (const { platform, adapter } of config.connectors.pairs) {
@@ -200,6 +204,11 @@ export interface CreateRuntimeOptions {
   registries?: Registries;
   /** audit-api sets this: its rate limiter (AUDIT_API_RATE_LIMITER) counts for the in-memory production guard. */
   usesRateLimiter?: boolean;
+  /**
+   * The ClickHouse user this process connects as: `consumer` for the writers (audit-consumer, metrics-ingester, rollup),
+   * `api` for the read-only audit-api. Omitted: the shared CLICKHOUSE_USER.
+   */
+  clickhouseRole?: ClickHouseRole;
 }
 
 /**
@@ -214,6 +223,7 @@ export async function createRuntime(config: AppConfig, options: CreateRuntimeOpt
     logger: options.logger,
     clock: options.clock ?? new SystemClock(),
     ids: options.ids ?? new RandomIdGenerator(),
+    clickhouse: clickHouseOptionsFor(config, options.clickhouseRole),
   };
   const eventBus = await registries.eventBus.create(config.adapters.eventBus, deps);
   const auditStore = await registries.auditStore.create(config.adapters.auditStore, deps);

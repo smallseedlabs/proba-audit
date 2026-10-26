@@ -317,8 +317,12 @@ export class ClickHouseAuditStore implements AuditStore {
       `SELECT * FROM audit_events
        WHERE workspace_id IN {workspaces:Array(String)}
          AND occurred_at >= ${TS('min')} AND occurred_at <= ${TS('max')}
-         AND event_id IN {ids:Array(UUID)}`,
+         AND event_id IN {ids:Array(UUID)}
+         AND has(arrayZip({refWorkspaces:Array(String)}, {refIds:Array(UUID)}), (workspace_id, event_id))`,
       {
+        // The two IN lists narrow the scan; the pair check keeps an id from matching in a workspace it was not asked for.
+        refWorkspaces: refs.map((r) => r.workspaceId),
+        refIds: refs.map((r) => r.eventId),
         workspaces: [...new Set(refs.map((r) => r.workspaceId))],
         min: new Date(Math.min(...times)).toISOString(),
         max: new Date(Math.max(...times)).toISOString(),
@@ -509,11 +513,8 @@ export class ClickHouseAuditStore implements AuditStore {
     return { facets, truncated };
   }
 
-  getTrace(
-    traceId: string,
-    options: { workspaceId?: string; limit?: number } = {}
-  ): Promise<StoredAuditEvent[]> {
-    return this.query({ traceId, workspaceId: options.workspaceId, order: 'asc', limit: options.limit });
+  getTrace(workspaceId: string, traceId: string, options: { limit?: number } = {}): Promise<StoredAuditEvent[]> {
+    return this.query({ traceId, workspaceId, order: 'asc', limit: options.limit });
   }
 
   async aggregate(query: AuditAggregateQuery): Promise<AuditAggregateRow[]> {

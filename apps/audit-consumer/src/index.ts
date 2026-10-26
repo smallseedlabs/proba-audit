@@ -18,7 +18,7 @@ runService({
   name: 'audit-consumer',
   defaultPort: 3101,
   async onStart({ config, logger }) {
-    runtime = await createRuntime(config, { logger });
+    runtime = await createRuntime(config, { logger, clickhouseRole: 'consumer' });
     await runtime.auditStore.ping();
     if (config.content.enabled) await runtime.auditContentStore.ping();
     await runtime.eventBus.ping();

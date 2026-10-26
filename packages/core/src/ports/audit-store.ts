@@ -49,8 +49,11 @@ export interface AuditStore {
   listTraces(query: TraceListQuery): Promise<TraceListPage>;
   /** Distinct values (with counts) for the filter facets of one workspace, capped per facet. */
   facets(query: AuditFacetsQuery): Promise<AuditFacets>;
-  /** All events of one trace, oldest first. */
-  getTrace(traceId: string, options?: { workspaceId?: string; limit?: number }): Promise<StoredAuditEvent[]>;
+  /**
+   * All events of one trace of `workspaceId`, oldest first. The workspace is required (like getEvent): a trace id
+   * alone never reads across workspaces, and events of the same trace id in another workspace are not returned.
+   */
+  getTrace(workspaceId: string, traceId: string, options?: { limit?: number }): Promise<StoredAuditEvent[]>;
   aggregate(query: AuditAggregateQuery): Promise<AuditAggregateRow[]>;
   /** Most recently ingested event of a workspace, to continue its hash chain; null if none. */
   getChainHead(workspaceId: string): Promise<ChainHead | null>;

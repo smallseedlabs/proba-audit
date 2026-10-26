@@ -31,7 +31,7 @@ const hour = (iso: string, extra: Partial<MetricObservation> = {}): MetricObserv
 
 async function seeded() {
   const store = new InMemoryMetricsStore();
-  await store.upsertObservations([
+  await store.upsertObservations('ws_1', [
     hour('2026-10-26T10:00:00.000Z', { accountId: 'a1', campaignId: 'c1' }),
     hour('2026-10-26T11:00:00.000Z', { accountId: 'a1', campaignId: 'c1' }),
     hour('2026-10-26T11:00:00.000Z', { accountId: 'a1', campaignId: 'c2', metrics: { impressions: 500, clicks: 5, spend: 25, conversions: 0 } }),
@@ -39,8 +39,8 @@ async function seeded() {
     hour('2026-10-19T10:00:00.000Z', { accountId: 'a1', campaignId: 'c1', metrics: { impressions: 800, clicks: 40, spend: 8, conversions: 1 } }),
     hour('2026-10-26T10:00:00.000Z', { accountId: 'other', campaignId: 'secret', metrics: { impressions: 9_999_999, clicks: 1, spend: 1, conversions: 1 } }),
   ]);
-  await store.computeRollups({ bucket: 'hour', from: '2026-10-19T00:00:00.000Z', to: '2026-10-27T00:00:00.000Z' });
-  await store.computeRollups({ bucket: 'day', from: '2026-10-19T00:00:00.000Z', to: '2026-10-27T00:00:00.000Z' });
+  await store.computeRollups({ workspaceId: 'ws_1', bucket: 'hour', from: '2026-10-19T00:00:00.000Z', to: '2026-10-27T00:00:00.000Z' });
+  await store.computeRollups({ workspaceId: 'ws_1', bucket: 'day', from: '2026-10-19T00:00:00.000Z', to: '2026-10-27T00:00:00.000Z' });
   return { store, analytics: new MetricsAnalytics(store) };
 }
 
@@ -93,9 +93,9 @@ describe('getMetricsSummary', () => {
 
   it('reflects a restatement (latest revision, not a sum of revisions)', async () => {
     const { store, analytics } = await seeded();
-    await store.upsertObservations([hour('2026-10-26T10:00:00.000Z', { accountId: 'a1', campaignId: 'c1', revision: 1, metrics: { impressions: 1000, clicks: 50, spend: 14, conversions: 5 } })]);
-    await store.computeRollups({ bucket: 'hour', from: '2026-10-26T00:00:00.000Z', to: '2026-10-27T00:00:00.000Z' });
-    await store.computeRollups({ bucket: 'day', from: '2026-10-26T00:00:00.000Z', to: '2026-10-27T00:00:00.000Z' });
+    await store.upsertObservations('ws_1', [hour('2026-10-26T10:00:00.000Z', { accountId: 'a1', campaignId: 'c1', revision: 1, metrics: { impressions: 1000, clicks: 50, spend: 14, conversions: 5 } })]);
+    await store.computeRollups({ workspaceId: 'ws_1', bucket: 'hour', from: '2026-10-26T00:00:00.000Z', to: '2026-10-27T00:00:00.000Z' });
+    await store.computeRollups({ workspaceId: 'ws_1', bucket: 'day', from: '2026-10-26T00:00:00.000Z', to: '2026-10-27T00:00:00.000Z' });
     const s = await analytics.getMetricsSummary(scope(['a1']), { ...day, campaignId: 'c1' });
     expect(s.totals[0]).toMatchObject({ spend: 24, conversions: 7 }); // 14 + 10, 5 + 2
   });
@@ -103,19 +103,19 @@ describe('getMetricsSummary', () => {
   it('keeps daily buckets in the account timezone', async () => {
     const store = new InMemoryMetricsStore();
     // 20:00Z on the 26th is already the 27th in Sydney (UTC+11 in late October).
-    await store.upsertObservations([hour('2026-10-26T20:00:00.000Z', { accountId: 'syd', timezone: 'Australia/Sydney' })]);
-    await store.computeRollups({ bucket: 'day', from: '2026-10-26T00:00:00.000Z', to: '2026-10-28T00:00:00.000Z' });
+    await store.upsertObservations('ws_1', [hour('2026-10-26T20:00:00.000Z', { accountId: 'syd', timezone: 'Australia/Sydney' })]);
+    await store.computeRollups({ workspaceId: 'ws_1', bucket: 'day', from: '2026-10-26T00:00:00.000Z', to: '2026-10-28T00:00:00.000Z' });
     const s = await new MetricsAnalytics(store).getMetricsSummary(scope(['syd']), { granularity: 'day', from: '2026-10-26T00:00:00.000Z', to: '2026-10-28T00:00:00.000Z' });
     expect(s.series.map((p) => p.bucket)).toEqual(['2026-10-27']);
   });
 
   it('reads only the configured source granularity', async () => {
     const store = new InMemoryMetricsStore();
-    await store.upsertObservations([
+    await store.upsertObservations('ws_1', [
       hour('2026-10-26T10:00:00.000Z', { accountId: 'a', campaignId: 'c' }),
       makeObservation({ accountId: 'a', campaignId: 'c', granularity: 'day', periodStart: '2026-10-26T00:00:00.000Z', periodEnd: '2026-10-27T00:00:00.000Z', metrics: { impressions: 777, clicks: 7, spend: 7, conversions: 7 } }),
     ]);
-    await store.computeRollups({ bucket: 'day', from: '2026-10-26T00:00:00.000Z', to: '2026-10-27T00:00:00.000Z' });
+    await store.computeRollups({ workspaceId: 'ws_1', bucket: 'day', from: '2026-10-26T00:00:00.000Z', to: '2026-10-27T00:00:00.000Z' });
     const hourly = await new MetricsAnalytics(store).getMetricsSummary(scope(['a']), day);
     const daily = await new MetricsAnalytics(store, { sourceGranularity: 'day' }).getMetricsSummary(scope(['a']), day);
     expect(hourly.totals[0].impressions).toBe(1000);

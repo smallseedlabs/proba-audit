@@ -75,15 +75,15 @@ describe('ClickHouse migrations', () => {
       const migrations = loadMigrations(migrationsDir);
 
       const first = await runMigrations(db, migrations);
-      expect(first.applied).toHaveLength(8);
+      expect(first.applied).toHaveLength(9);
       const second = await runMigrations(db, migrations);
       expect(second.applied).toEqual([]);
-      expect(second.skipped).toHaveLength(8);
+      expect(second.skipped).toHaveLength(9);
 
       const rows = await (
         await client.query({ query: 'SELECT version, name FROM schema_migrations ORDER BY version', format: 'JSONEachRow' })
       ).json<{ version: number; name: string }>();
-      expect(rows.map((r) => r.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+      expect(rows.map((r) => r.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
 
       const tables = await (
         await client.query({
@@ -178,8 +178,8 @@ describe('ClickHouse storage details', () => {
     const client = createClickHouseClient(options(TEST_DB));
     const store = new ClickHouseMetricsStore({ client });
     const accountId = `merge-${Date.now()}`;
-    await store.upsertObservations([makeObservation({ accountId, revision: 0 })]);
-    await store.upsertObservations([makeObservation({ accountId, revision: 1 })]);
+    await store.upsertObservations(`ws-${accountId}`, [makeObservation({ accountId, revision: 0 })]);
+    await store.upsertObservations(`ws-${accountId}`, [makeObservation({ accountId, revision: 1 })]);
     await client.command({ query: 'OPTIMIZE TABLE metric_observations FINAL' });
     const rows = await (
       await client.query({

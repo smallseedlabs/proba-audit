@@ -279,6 +279,25 @@ describe('AuditedReader (self-audit of reads)', () => {
     expect(JSON.stringify(events[0])).not.toContain('command"'); // filter values are not recorded
   });
 
+  it('always reads the caller\'s workspace: the session decides, not the query', async () => {
+    const store = new InMemoryAuditStore();
+    const mine = buildChain('ws-a', 2);
+    const theirs = buildChain('ws-b', 3);
+    await store.appendBatch([...mine, ...theirs]);
+    const emitter = createBusAuditEmitter({ ...emitterDeps(), service: 'audit-api', bus: new InMemoryEventBus(), topic: 'audit' });
+    const reader = new AuditedReader(store, emitter, new ManualClock());
+    const ctx = { actor: { type: 'user' as const, id: 'u1' }, workspaceId: 'ws-a' };
+
+    expect(await reader.query(ctx, {})).toHaveLength(2);
+    expect(await reader.query(ctx, { workspaceId: 'ws-b' })).toHaveLength(2); // a request's workspace is overridden
+    const rows = await reader.aggregate(ctx, { filter: { workspaceId: 'ws-b' }, groupBy: [] });
+    expect(rows[0]?.count).toBe(2);
+    // The generators are deterministic, so only the third event of ws-b has a trace id that ws-a does not.
+    const foreignTrace = theirs[2]!.traceId;
+    expect(await reader.getTrace(ctx, foreignTrace)).toEqual([]);
+    expect(await reader.getTrace({ ...ctx, workspaceId: 'ws-b' }, foreignTrace)).toHaveLength(1);
+  });
+
   it('records a failed read and rethrows', async () => {
     const store = new InMemoryAuditStore();
     store.query = () => Promise.reject(new Error('store down'));

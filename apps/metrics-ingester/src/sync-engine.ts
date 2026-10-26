@@ -217,7 +217,7 @@ export class SyncEngine {
         const valid = await this.validate(page.observations, connector, account, runId, outcome, clock.isoNow());
         const toWrite = await withRetry(() => this.diff(valid, outcome, restatedPeriods), options.retry, retryHooks);
         if (toWrite.length > 0) {
-          await withRetry(() => this.deps.metricsStore.upsertObservations(toWrite), options.retry, retryHooks);
+          await withRetry(() => this.deps.metricsStore.upsertObservations(options.workspaceId, toWrite), options.retry, retryHooks);
         }
         pageToken = page.nextPageToken;
       } while (pageToken !== undefined);
@@ -409,6 +409,7 @@ export class SyncEngine {
     const to = new Date(Math.max(...starts) + 1).toISOString();
     const first = valid[0];
     const stored = await this.deps.metricsStore.queryObservations({
+      workspaceId: this.deps.options.workspaceId,
       platform: first.platform,
       accountId: first.accountId,
       granularity: first.granularity,

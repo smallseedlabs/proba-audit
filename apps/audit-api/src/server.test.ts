@@ -386,14 +386,14 @@ describe('analytics', () => {
           fetchedAt: '2026-10-25T09:00:00.000Z',
         })
       );
-    await h.metrics.upsertObservations([
+    await h.metrics.upsertObservations(WORKSPACE, [
       ...hours('cmp_big', 10, '2026-10-25'),
       ...hours('cmp_small', 1, '2026-10-25'),
       ...hours('cmp_big', 5, '2026-10-24'),
       makeObservation({ accountId: 'act_foreign', campaignId: 'cmp_foreign', periodStart: '2026-10-25T00:00:00.000Z', periodEnd: '2026-10-25T01:00:00.000Z', metrics: { impressions: 999999, clicks: 1, spend: 999, conversions: 1 } }),
     ]);
-    await h.metrics.computeRollups({ bucket: 'hour', from: '2026-10-24T00:00:00.000Z', to: '2026-10-26T00:00:00.000Z' });
-    await h.metrics.computeRollups({ bucket: 'day', from: '2026-10-24T00:00:00.000Z', to: '2026-10-26T00:00:00.000Z' });
+    await h.metrics.computeRollups({ workspaceId: WORKSPACE, bucket: 'hour', from: '2026-10-24T00:00:00.000Z', to: '2026-10-26T00:00:00.000Z' });
+    await h.metrics.computeRollups({ workspaceId: WORKSPACE, bucket: 'day', from: '2026-10-24T00:00:00.000Z', to: '2026-10-26T00:00:00.000Z' });
   });
 
   it('serves the summary with totals, a series and freshness, only for the workspace accounts', async () => {
