@@ -14,6 +14,8 @@ updates:
     ignore:
       - dependency-name: "*"
         update-types: ["version-update:semver-major"]
+      # proba-protocol is pinned by release tag and bumped by hand; Dependabot would propose an older tag.
+      - dependency-name: "@smallseedlabs/proba-protocol"
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
