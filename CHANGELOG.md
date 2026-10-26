@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Reads are recorded with the protocol's specific actions instead of `data_access.read` / `data_access.audit_*` / `data_access.metrics_*`: `audit.searched`, `audit.event_viewed`,
+  `audit.trace_viewed`, `audit.integrity_checked`, `analytics.queried`, `analytics.compared` (needs protocol 0.3.2+). `/v1/session` is no longer recorded. A test checks every emitted action against `AUDIT_ACTION_INFO`.
+
 ### Added
 
 - Raw text of audit events (protocol 0.3.3 `AuditEvent.content`), off by default (`AUDIT_CONTENT_ENABLED`, `AUDIT_CONTENT_STORE`): `AuditContentStore` port with ClickHouse (`audit_event_content`,

@@ -177,9 +177,13 @@ The consumer records its own activity through the same `AuditEmitter` and bus as
 These events come back through the consumer, so there is a loop guard: a batch consisting only of the consumer's own events (same `service`) produces
 no batch event, which stops the feedback after one hop.
 `AuditedReader` (`packages/core/src/audit/audited-reader.ts`) is the same idea for reads: audit-api routes call it instead of the store.
-The typed reads emit `data_access.audit_query`, `data_access.audit_trace` or `data_access.audit_aggregate`; every HTTP read uses
-`AuditedReader.read`, which emits the generic `data_access.read` with `details.operation` (`events.search`, `events.get`, `traces.get`,
-`traces.list`, `facets.list`, `chain.verify`, `session.get`) and the route and role. Filter names and result size are recorded, never values or data.
+The typed reads emit `audit.searched` (`query`, `aggregate`) or `audit.trace_viewed` (`getTrace`); every HTTP read uses `AuditedReader.read`, which maps the
+operation to the protocol's specific action (`AUDIT_READ_ACTIONS`): `events.search`, `traces.list` and `facets.list` → `audit.searched`, `events.get` →
+`audit.event_viewed` (target: the event), `traces.get` → `audit.trace_viewed` (target: the trace), `chain.verify` → `audit.integrity_checked`; `details.operation`,
+the route and the role are kept. Reads of raw text use `readContent` with `contentIncluded: true`. Analytics reads (`AuditedAnalyticsReader`) emit `analytics.queried`
+(summary, campaigns) and `analytics.compared`. All are `data_access` / low in the protocol catalog; the generic `data_access.read` and the old `data_access.audit_*` /
+`data_access.metrics_*` names are no longer emitted (`apps/audit-api/src/read-actions.test.ts` checks the emitted actions against `AUDIT_ACTION_INFO`).
+`GET /v1/session` is not recorded: it returns the caller's own token claims and reads nothing from the audit trail. Filter names and result size are recorded, never values or data.
 
 ### Logging
 
@@ -313,7 +317,7 @@ controlled data tools; the brain never queries metric tables itself.
   `previous` defaults to the period right before `current`.
 - **Scope is injected, not passed by the caller.** `AnalyticsScope { workspaceId, accounts[] }` is produced by trusted code. `AuditedAnalyticsReader`
   (the metrics counterpart of `AuditedReader`) takes a `ScopeResolver` and a caller's `AccessContext`, resolves the scope itself, refuses a scope of another
-  workspace, and records every read as `data_access.metrics_summary` / `data_access.metrics_compare` (filter names and result size only, never numbers; failures too).
+  workspace, and records every read as `analytics.queried` / `analytics.compared` (filter names and result size only, never numbers; failures too).
 - **Strict validation with caps:** unknown keys are rejected (so a query cannot smuggle in accounts), timestamps must be UTC ISO with `Z` and aligned
   to the bucket (hour: on the hour; day: UTC midnight, the date of the daily bucket), at most 14 days hourly and 366 days daily, campaign ids
   `[A-Za-z0-9_.:-]{1,128}`, at most 500 accounts in a scope, at most 200 campaign rows (`ANALYTICS_LIMITS`).
@@ -414,7 +418,7 @@ workspace to its accounts.
 - **Authorisation** (`apps/audit-api/src/authorization.ts`): the verified email must be present **and verified** by Firebase. It is `admin` when in `AUDIT_API_ADMIN_EMAILS`, `viewer`
   when in `AUDIT_API_ALLOWED_EMAILS` or its domain is in `AUDIT_API_ALLOWED_EMAIL_DOMAINS`, otherwise `403`. All lists come from configuration; an empty policy allows nobody
   (and logs a warning at start-up). Chain verification is admin-only.
-- **Audited**: every authenticated read emits a `data_access.*` event under the response's `X-Trace-Id` (see "Self-audit"), and the read is refused with `500` if that event cannot be
+- **Audited**: every authenticated read of data (all but `/v1/session`) emits an `audit.*` or `analytics.*` event under the response's `X-Trace-Id` (see "Self-audit"), and the read is refused with `500` if that event cannot be
   published (fail closed). Refusals are emitted as `auth.denied` (reason, never the token), throttled so a flood cannot flood the trail. Unexpected errors emit `system.error`.
 - **Rate limited** through the `RateLimiter` port (`memory`, `redis`; `AUDIT_API_RATE_LIMITER`): per signed-in user, a lower limit for chain verification, and per client address
   for rejected credentials. `429` carries `Retry-After`. The Redis adapter fails open (and logs) if Redis is unreachable.

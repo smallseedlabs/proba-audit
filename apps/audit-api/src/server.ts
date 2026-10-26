@@ -332,13 +332,14 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
       v1.get('/session', async (request) => {
         parseWith(noQuerySchema, request.query);
         const session = need(request);
-        // The caller's own identity and role; recorded like every other read.
-        return reader.read(contextOf(request, session), 'session.get', {}, () => 1, async () => ({
+        // The caller's own identity and role, taken from the token: nothing is read from the audit trail or
+        // the metrics, so there is no data-access event for it (the catalog has no action for it either).
+        return {
           subject: session.subject,
           email: session.email,
           role: session.role,
           workspaceId: session.workspaceId,
-        }), metaOf(request, session));
+        };
       });
 
       v1.get('/events', async (request) => {

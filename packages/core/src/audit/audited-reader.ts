@@ -9,6 +9,21 @@ import type { AuditEmitter } from '../ports/audit-emitter.js';
 import type { AuditStore } from '../ports/audit-store.js';
 import type { Clock } from '../ports/clock.js';
 
+/**
+ * Which catalogued audit action records each kind of read of the audit trail (protocol 0.3.2+, category
+ * `data_access`, risk low). The protocol's generic read action is not used (a test scans for it).
+ */
+export const AUDIT_READ_ACTIONS = {
+  'events.search': 'audit.searched',
+  'traces.list': 'audit.searched',
+  'facets.list': 'audit.searched',
+  'events.get': 'audit.event_viewed',
+  'traces.get': 'audit.trace_viewed',
+  'chain.verify': 'audit.integrity_checked',
+} as const;
+
+export type AuditReadOperation = keyof typeof AUDIT_READ_ACTIONS;
+
 /** Who is reading, and under which trace (the API request). */
 export interface AccessContext {
   actor: AuditActor;
@@ -20,7 +35,7 @@ export interface AccessContext {
 
 /**
  * Self-audit for reads: every query against the audit store is itself recorded
- * as a `data_access.audit_*` event through the AuditEmitter (so it travels over
+ * as an `audit.*` event (`audit.searched`, `audit.trace_viewed`) through the AuditEmitter (so it travels over
  * the same bus and is chained like any other event). audit-api routes call these
  * methods instead of the store directly. The event records which filters were used
  * (names only, not values) and the result size, never the returned data.
@@ -33,7 +48,7 @@ export class AuditedReader {
   ) {}
 
   query(ctx: AccessContext, query: AuditQuery): Promise<StoredAuditEvent[]> {
-    return this.audited(ctx, 'data_access.audit_query', query, (rows) => rows.length, () => this.store.query(query));
+    return this.audited(ctx, 'audit.searched', query, (rows) => rows.length, () => this.store.query(query), { operation: 'query' });
   }
 
   getTrace(
@@ -43,38 +58,46 @@ export class AuditedReader {
   ): Promise<StoredAuditEvent[]> {
     return this.audited(
       ctx,
-      'data_access.audit_trace',
+      'audit.trace_viewed',
       { traceId, ...options },
       (rows) => rows.length,
-      () => this.store.getTrace(traceId, options)
+      () => this.store.getTrace(traceId, options),
+      { operation: 'trace' },
+      { type: 'trace', id: traceId }
     );
   }
 
   aggregate(ctx: AccessContext, query: AuditAggregateQuery): Promise<AuditAggregateRow[]> {
     return this.audited(
       ctx,
-      'data_access.audit_aggregate',
+      'audit.searched',
       { ...query.filter, groupBy: query.groupBy },
       (rows) => rows.length,
-      () => this.store.aggregate(query)
+      () => this.store.aggregate(query),
+      { operation: 'aggregate' }
     );
   }
 
   /**
    * A read of any other shape (the HTTP read API: event search, one event, trace list, facets,
-   * chain verification) recorded as the generic `data_access.read`. `operation` says which read
-   * it was (for example `events.search`) and `details` adds non-sensitive context such as the
-   * route; neither may carry returned data, credentials or personal data.
+   * chain verification) recorded with the specific action for that operation (`AUDIT_READ_ACTIONS`:
+   * `audit.searched`, `audit.event_viewed`, `audit.trace_viewed`, `audit.integrity_checked`).
+   * `operation` is also kept in the details, and `details` adds non-sensitive context such as the
+   * route; neither may carry returned data, credentials or personal data. Reads of one event or
+   * trace name it as the target, as the catalog describes.
    */
   read<T>(
     ctx: AccessContext,
-    operation: string,
+    operation: AuditReadOperation,
     filters: object,
     size: (result: T) => number,
     run: () => Promise<T>,
     details: Record<string, unknown> = {}
   ): Promise<T> {
-    return this.audited(ctx, 'data_access.read', filters, size, run, { operation, ...details });
+    const f = filters as { eventId?: string; traceId?: string };
+    const target =
+      operation === 'events.get' && f.eventId ? { type: 'audit_event', id: f.eventId } : operation === 'traces.get' && f.traceId ? { type: 'trace', id: f.traceId } : undefined;
+    return this.audited(ctx, AUDIT_READ_ACTIONS[operation], filters, size, run, { operation, ...details }, target);
   }
 
   /**

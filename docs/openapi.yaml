@@ -16,7 +16,7 @@ info:
     Other routes never return text: events only say `hasContent`.
 
     Every response carries `X-Trace-Id` (also in error bodies). Every authenticated read is itself
-    recorded in the audit trail (`data_access.*`).
+    recorded in the audit trail (`audit.searched`, `audit.event_viewed`, `audit.trace_viewed`, `audit.integrity_checked`, `analytics.queried`, `analytics.compared`), except `/v1/session`.
 
     This file is kept in sync with the code by `apps/audit-api/src/openapi.test.ts`.
   license:

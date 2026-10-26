@@ -5,6 +5,8 @@
  */
 export {
   AUDIT_ACTIONS,
+  AUDIT_ACTION_INFO,
+  getAuditActionInfo,
   AUDIT_CONTENT_MAX_CHARS,
   buildAuditContent,
   buildAuditEvent,
