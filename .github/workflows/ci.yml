@@ -136,9 +136,10 @@ jobs:
       - name: Run migrations (builds first)
         run: npm run migrate
 
-      # Runs the adapter contract suites (Redis Streams event bus, ClickHouse audit
-      # and metrics stores, Postgres outbox), the migration tests, the default-adapter
-      # wiring test and the audit-consumer end-to-end tests.
+      # Runs the adapter contract suites (Redis Streams event bus, ClickHouse audit,
+      # metrics, checkpoint and quarantine stores, Postgres outbox), the migration tests,
+      # the default-adapter wiring test, the audit-consumer end-to-end tests and the
+      # metrics flow tests (stub -> ingest -> rollup -> read on ClickHouse and Redis).
       - name: Run integration tests (0 skipped)
         run: npm run test:integration:ci
 

@@ -42,6 +42,15 @@ docker compose --profile apps down
 Run one app locally: `npm run build && node apps/audit-api/dist/index.js` (or `npm run dev:api`).
 If a host port is taken, set `REDIS_HOST_PORT` / `CLICKHOUSE_HTTP_HOST_PORT` (and match `REDIS_URL` / `CLICKHOUSE_URL`).
 
+Metrics flow on the development data source (no ad platform needed): see
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#metrics-flow). In short:
+
+```bash
+docker compose --profile metrics-e2e up -d --build e2e-ingester e2e-rollup e2e-audit-consumer
+docker compose --profile metrics-e2e run --rm metrics-report    # prints totals, series, comparison and the audit trail
+docker compose --profile metrics-e2e down
+```
+
 ## Scripts
 
 | Script | What it does |
@@ -54,7 +63,9 @@ If a host port is taken, set `REDIS_HOST_PORT` / `CLICKHOUSE_HTTP_HOST_PORT` (an
 
 ## Swapping adapters
 
-Backends are chosen by config: `EVENT_BUS=redis-streams|memory`, `AUDIT_STORE=clickhouse|memory`, `METRICS_STORE=clickhouse|memory`.
+Backends are chosen by config: `EVENT_BUS=redis-streams|memory`, `AUDIT_STORE=clickhouse|memory`, `METRICS_STORE=clickhouse|memory`,
+`CHECKPOINT_STORE` and `QUARANTINE_STORE` (`clickhouse|memory`), and the connector per ad platform with
+`PLATFORM_CONNECTORS=meta:stub,google:stub` (swap `stub` for a real analytics library's adapter name when it exists).
 Adding one (for example Kafka) means one adapter, one registration and one config value; see
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#how-to-swap-or-add-an-adapter-for-example-kafka).
 Every adapter must pass its port's contract suite (`runEventBusContract(...)` etc. from `@smallseedlabs/proba-audit-core/testing`).
