@@ -3,7 +3,7 @@
 # Targets: audit-consumer, audit-api, metrics-ingester, rollup, migrate
 
 # Stage 1: build every workspace
-FROM node:20-alpine AS builder
+FROM node:26-alpine AS builder
 # The protocol package is installed from a git commit (see package.json), which needs git.
 RUN apk add --no-cache git
 WORKDIR /app
@@ -21,7 +21,7 @@ COPY apps ./apps
 RUN npm run build
 
 # Stage 2: production dependencies only
-FROM node:20-alpine AS prod-deps
+FROM node:26-alpine AS prod-deps
 RUN apk add --no-cache git
 WORKDIR /app
 COPY package*.json ./
@@ -34,7 +34,7 @@ COPY apps/rollup/package.json apps/rollup/
 RUN npm ci --omit=dev && npm cache clean --force
 
 # Stage 3: shared runtime base (no git, non-root user)
-FROM node:20-alpine AS runtime
+FROM node:26-alpine AS runtime
 RUN addgroup -g 1001 -S proba && adduser -u 1001 -S proba -G proba
 WORKDIR /app
 ENV NODE_ENV=production
