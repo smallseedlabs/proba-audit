@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Redis authentication, TLS and stream trimming (Brief 4, item 1).** `docker-compose.yml` starts Redis with an ACL user (`REDIS_USER`, `REDIS_PASSWORD` required, `default` user off, `@dangerous` commands denied) and builds `REDIS_URL`
+  from it. Every Redis adapter (event bus, rate limiter, lease store) accepts `rediss://` (TLS, certificates verified) through the shared `redisClientOptions`. With `NODE_ENV=production`, a service that uses Redis refuses to start
+  when `REDIS_URL` has no password (`RedisPasswordRequiredError`). The audit stream is now trimmed by `EventBus.trimAcknowledged` (called by the audit-consumer every `AUDIT_STREAM_TRIM_INTERVAL_MS`, default 60000) and only of
+  messages **every consumer group has acknowledged** and that are older than `AUDIT_STREAM_MAX_AGE_HOURS` (default 72, new); pending and undelivered messages are never removed. **Upgrade notes:** `REDIS_URL` needs a password in
+  production; publishing no longer applies `XADD MAXLEN ~` (it could drop unread messages), so `BUS_MAX_STREAM_LENGTH` is now a ceiling for acknowledged messages only; a consumer group nobody reads holds the trim back.
+- **Loopback ports and no default passwords in `docker-compose.yml` (item 2).** Every published port (ClickHouse, Redis, the test Postgres, audit-api, audit-consumer, metrics-ingester, rollup) is bound to `127.0.0.1`. Every password
+  is `${NAME:?set NAME}`: `CLICKHOUSE_PASSWORD`, `REDIS_PASSWORD`, `POSTGRES_PASSWORD`, `ANCHOR_DB_PASSWORD`, `ANCHOR_HMAC_KEY` and the three ClickHouse role passwords have no default (the old `proba` / `anchors` defaults are gone).
+  Each service receives only its own ClickHouse role password; the admin password goes to the `migrate` one-shot only. `scripts/generate-local-env.sh` writes a `.env` with random values. New CI job **Compose security**
+  (`scripts/check-compose-security.mjs`) fails if a port lacks `127.0.0.1` or a password has a default or a literal. The integration job now starts its services from this compose file (authenticated Redis, passworded ClickHouse and
+  Postgres) instead of unauthenticated service containers. **Upgrade note:** run `scripts/generate-local-env.sh` (or set the variables) before `docker compose up`; existing volumes keep their old passwords (`docker compose down -v` for a local stack).
+- **Append-only ClickHouse users are no longer opt-in (item 3).** `npm run migrate` creates the `consumer` (INSERT + SELECT), `api` (SELECT) and `migrator` (DDL) users, applies the migrations as the migrator, then grants every table
+  (`packages/adapters/src/clickhouse/roles.ts`; idempotent, rotates passwords). In production the three role passwords are required (default users `proba_consumer`, `proba_api`, `proba_migrator`), and `audit-consumer`,
+  `metrics-ingester`, `rollup`, `audit-api` and `metrics-report` refuse to start (`ClickHouseRoleError`) when their password is empty or when they connect as the admin or migrator user. Integration test: as the consumer,
+  `ALTER ... UPDATE/DELETE`, `DELETE FROM`, `TRUNCATE` and `DROP` on `audit_events` and `audit_event_content` are denied. Outside production a role without its own user still falls back to `CLICKHOUSE_USER`; a role password
+  without a role user is still an error there, while a role user without a password is now checked by the process that uses the role instead of at config load (a service only receives its own role's password).
+  **Upgrade note:** production needs `CLICKHOUSE_CONSUMER_PASSWORD`, `CLICKHOUSE_API_PASSWORD` and `CLICKHOUSE_MIGRATOR_PASSWORD`, then `npm run migrate` as the admin before starting the services.
+
 - **In-memory adapters are refused in production.** With `NODE_ENV=production`, any `memory` adapter selected for `EVENT_BUS`, `AUDIT_STORE`, `METRICS_STORE`, `CHECKPOINT_STORE`, `QUARANTINE_STORE`,
   `AUDIT_CONTENT_STORE` (and, per service, `AUDIT_API_RATE_LIMITER`, `ANCHOR_STORE`, `LEASE_STORE`) makes the process exit with `InMemoryAdaptersNotAllowedError`, listing the variables, before anything is created.
   `ALLOW_IN_MEMORY_ADAPTERS=true` is the deliberate opt-in (default `false`). **Upgrade note:** production deployments must select durable adapters (the compose `apps` profile now does).

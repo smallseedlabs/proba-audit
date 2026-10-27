@@ -11,15 +11,16 @@ import {
   type ReclaimOptions,
   type SubscribeOptions,
   type Subscription,
+  type TrimOptions,
 } from '@smallseedlabs/proba-audit-core';
 import { SystemClock } from '../runtime/system.js';
+import { redisClientOptions } from './connection.js';
 
 type RedisClient = ReturnType<typeof createClient>;
 
 export interface RedisStreamsOptions {
+  /** `redis://[user]:password@host:port`, or `rediss://` for TLS. */
   url: string;
-  /** Approximate max length per stream (XADD MAXLEN ~). Unset keeps everything. */
-  maxStreamLength?: number;
   /** Give up on the first connection after this long. Default 5000. Later outages reconnect forever. */
   connectTimeoutMs?: number;
   /** ping() fails if Redis does not answer within this time. Default 3000. */
@@ -38,6 +39,28 @@ function withTimeout<T>(promise: Promise<T>, ms: number, what: string): Promise<
 
 type StreamFields = Record<string, string>;
 
+interface StreamId {
+  ms: number;
+  seq: number;
+}
+
+const ZERO_ID: StreamId = { ms: 0, seq: 0 };
+/** One maxLength trim reads at most this many ids; a bigger excess is trimmed over several calls. */
+const MAX_LENGTH_TRIM_PAGE = 10_001;
+
+function parseStreamId(id: string): StreamId {
+  const [ms, seq] = id.split('-');
+  return { ms: Number(ms), seq: Number(seq ?? 0) };
+}
+
+function formatStreamId(id: StreamId): string {
+  return `${id.ms}-${id.seq}`;
+}
+
+function compareStreamIds(a: StreamId, b: StreamId): number {
+  return a.ms !== b.ms ? a.ms - b.ms : a.seq - b.seq;
+}
+
 function parseEntry<T>(topic: string, id: string, fields: StreamFields, deliveryCount: number): BusMessage<T> {
   return {
     id,
@@ -54,7 +77,8 @@ function parseEntry<T>(topic: string, id: string, fields: StreamFields, delivery
  * share work, XACK to acknowledge, XPENDING + XCLAIM to retry stuck messages,
  * and a `<topic>.dlq` stream for dead letters.
  *
- * Durability depends on Redis persistence (docker-compose runs it with AOF on).
+ * Durability depends on Redis persistence (docker-compose runs it with AOF on). Publishing never trims: the stream shrinks only
+ * through trimAcknowledged(), which removes nothing a consumer group has not acknowledged.
  * Each subscription uses its own connection because XREADGROUP BLOCK holds one.
  */
 export class RedisStreamsEventBus implements EventBus {
@@ -65,7 +89,7 @@ export class RedisStreamsEventBus implements EventBus {
 
   constructor(private readonly options: RedisStreamsOptions) {
     this.clock = options.clock ?? new SystemClock();
-    this.client = createClient({ url: options.url });
+    this.client = createClient(redisClientOptions(options.url));
     this.client.on('error', (err) => this.options.logger?.error('redis client error', { err }));
   }
 
@@ -132,6 +156,62 @@ export class RedisStreamsEventBus implements EventBus {
     }));
   }
 
+  /**
+   * Trims the stream of messages that EVERY consumer group has acknowledged (XTRIM MINID), never anything else.
+   *
+   * For each group the safe bound is the oldest id still in its pending list (delivered, not acked), or, with nothing pending,
+   * just past its last-delivered-id (so everything the group has read was acked). The smallest bound over all groups caps the
+   * trim: a message that is pending for, or not yet delivered to, any group is never removed. Messages are removed only if also
+   * older than `maxAgeMs` (by Redis server time), or beyond `maxLength`. A stream with no group is left alone.
+   * A group that stopped reading (a dead consumer group nobody deleted) holds the trim back: delete it with XGROUP DESTROY.
+   */
+  async trimAcknowledged(topic: string, options: TrimOptions): Promise<number> {
+    await this.connect();
+    let groups: Awaited<ReturnType<RedisClient['xInfoGroups']>>;
+    try {
+      groups = await this.client.xInfoGroups(topic);
+    } catch (err) {
+      if (err instanceof Error && /no such key/i.test(err.message)) return 0;
+      throw err;
+    }
+    if (groups.length === 0) return 0;
+
+    let safe: StreamId | undefined;
+    for (const g of groups) {
+      const name = String(g.name);
+      const last = parseStreamId(String(g.lastDeliveredId));
+      const summary = await this.client.xPending(topic, name);
+      const first = summary.pending > 0 && summary.firstId ? parseStreamId(String(summary.firstId)) : undefined;
+      // Nothing delivered yet: nothing is acknowledged. Otherwise everything up to and including the last delivered id is
+      // acknowledged, except what is still pending.
+      const bound: StreamId = first ?? (compareStreamIds(last, ZERO_ID) === 0 ? ZERO_ID : { ms: last.ms, seq: last.seq + 1 });
+      if (!safe || compareStreamIds(bound, safe) < 0) safe = bound;
+    }
+    if (!safe || compareStreamIds(safe, ZERO_ID) === 0) return 0;
+
+    const [serverSeconds, serverMicros] = await this.serverTime();
+    const nowMs = serverSeconds * 1000 + Math.floor(serverMicros / 1000);
+    // +1: a message published in the very millisecond of the cutoff counts as old enough for maxAgeMs 0.
+    let cutoff: StreamId = { ms: Math.max(0, nowMs - Math.max(0, options.maxAgeMs) + 1), seq: 0 };
+    if (options.maxLength !== undefined) {
+      const length = await this.client.xLen(topic);
+      const excess = length - options.maxLength;
+      if (excess > 0) {
+        // The first message to keep is the (excess + 1)th; read at most a bounded page per call, later calls continue.
+        const page = await this.client.xRange(topic, '-', '+', { COUNT: Math.min(excess + 1, MAX_LENGTH_TRIM_PAGE) });
+        const keep = page[page.length - 1];
+        if (keep) {
+          const keepId = parseStreamId(String(keep.id));
+          if (compareStreamIds(keepId, cutoff) > 0) cutoff = keepId;
+        }
+      }
+    }
+    const trimTo = compareStreamIds(cutoff, safe) < 0 ? cutoff : safe;
+    if (compareStreamIds(trimTo, ZERO_ID) === 0) return 0;
+    const removed = await this.client.sendCommand<number>(['XTRIM', topic, 'MINID', formatStreamId(trimTo)]);
+    return Number(removed);
+  }
+
   async ping(): Promise<void> {
     await this.connect();
     await withTimeout(this.client.ping(), this.options.pingTimeoutMs ?? 3000, 'Redis ping');
@@ -150,17 +230,17 @@ export class RedisStreamsEventBus implements EventBus {
     };
   }
 
-  private trim(): { TRIM: { strategy: 'MAXLEN'; strategyModifier: '~'; threshold: number } } | undefined {
-    const max = this.options.maxStreamLength;
-    return max ? { TRIM: { strategy: 'MAXLEN', strategyModifier: '~', threshold: max } } : undefined;
+  private async serverTime(): Promise<[number, number]> {
+    const reply = await this.client.sendCommand<[string, string]>(['TIME']);
+    return [Number(reply[0]), Number(reply[1])];
   }
 
   private xadd(client: RedisClient, topic: string, payload: unknown, options: PublishOptions): Promise<string> {
-    return client.xAdd(topic, '*', this.fields(payload, options), this.trim());
+    return client.xAdd(topic, '*', this.fields(payload, options));
   }
 
   private queueAdd(multi: ReturnType<RedisClient['multi']>, topic: string, payload: unknown, options: PublishOptions): void {
-    multi.xAdd(topic, '*', this.fields(payload, options), this.trim());
+    multi.xAdd(topic, '*', this.fields(payload, options));
   }
 }
 

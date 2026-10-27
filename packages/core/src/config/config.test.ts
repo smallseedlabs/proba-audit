@@ -148,9 +148,20 @@ describe('ClickHouse roles', () => {
     expect(c.clickhouse.roles.consumer).toEqual({ username: 'proba', password: 'shared' });
   });
 
-  it('rejects a role user without a password, and a password without a user', () => {
-    expect(() => loadConfig({ CLICKHOUSE_CONSUMER_USER: 'proba_consumer' })).toThrow(/CLICKHOUSE_CONSUMER_PASSWORD/);
+  it('rejects a role password without a user outside production; a role user without a password is left to the process that uses the role', () => {
     expect(() => loadConfig({ CLICKHOUSE_API_PASSWORD: 'x' })).toThrow(/CLICKHOUSE_API_USER/);
+    // A service only gets the password of its own role, so the others are legitimately empty here.
+    const c = loadConfig({ CLICKHOUSE_CONSUMER_USER: 'proba_consumer', CLICKHOUSE_API_USER: 'proba_api', CLICKHOUSE_API_PASSWORD: 'api-pw' });
+    expect(c.clickhouse.roles.consumer).toEqual({ username: 'proba_consumer', password: '' });
+    expect(c.clickhouse.roles.api).toEqual({ username: 'proba_api', password: 'api-pw' });
+  });
+
+  it('production gives every role its own default user, never the shared admin user', () => {
+    const c = loadConfig({ NODE_ENV: 'production', CLICKHOUSE_USER: 'proba', CLICKHOUSE_PASSWORD: 'admin-pw', CLICKHOUSE_CONSUMER_PASSWORD: 'c-pw' });
+    expect(c.clickhouse.roles.consumer).toEqual({ username: 'proba_consumer', password: 'c-pw' });
+    expect(c.clickhouse.roles.api).toEqual({ username: 'proba_api', password: '' });
+    expect(c.clickhouse.roles.migrator).toEqual({ username: 'proba_migrator', password: '' });
+    for (const role of ['consumer', 'api', 'migrator'] as const) expect(c.clickhouse.roles[role].username).not.toBe(c.clickhouse.username);
   });
 
   it('redacts the role passwords for logging', () => {
@@ -158,6 +169,21 @@ describe('ClickHouse roles', () => {
     const text = JSON.stringify(redactConfig(c));
     expect(text).not.toContain('api-secret-pw');
     expect(text).toContain('proba_api');
+  });
+});
+
+describe('audit stream trimming config', () => {
+  it('trims acknowledged messages older than 72 hours, every minute, by default', () => {
+    const c = loadConfig({});
+    expect(c.eventBus.streamMaxAgeHours).toBe(72);
+    expect(c.eventBus.streamTrimIntervalMs).toBe(60000);
+  });
+
+  it('reads AUDIT_STREAM_MAX_AGE_HOURS and AUDIT_STREAM_TRIM_INTERVAL_MS', () => {
+    const c = loadConfig({ AUDIT_STREAM_MAX_AGE_HOURS: '24', AUDIT_STREAM_TRIM_INTERVAL_MS: '0' });
+    expect(c.eventBus.streamMaxAgeHours).toBe(24);
+    expect(c.eventBus.streamTrimIntervalMs).toBe(0);
+    expect(() => loadConfig({ AUDIT_STREAM_MAX_AGE_HOURS: '0' })).toThrow(/AUDIT_STREAM_MAX_AGE_HOURS/);
   });
 });
 

@@ -5,3 +5,4 @@ export * from './audit-store.js';
 export * from './audit-content-store.js';
 export * from './metrics-store.js';
 export * from './ingest-state-stores.js';
+export * from './roles.js';

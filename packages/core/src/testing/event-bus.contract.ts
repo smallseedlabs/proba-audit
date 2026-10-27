@@ -183,6 +183,117 @@ export function runEventBusContract(name: string, factory: () => Promise<EventBu
       expect(dead[0]).toMatchObject({ reason: 'invalid audit event', payload: { bad: 'schema' }, originalId: msgs[0].id });
     });
 
+    describe('trimAcknowledged', () => {
+      const DAY = 86_400_000;
+      /** What a brand-new group still finds in the topic (payload.i of every remaining message). */
+      async function remaining(bus: EventBus, topic: string): Promise<number[]> {
+        const probe = await bus.subscribe({ topic, group: `probe-${uniqueName('g')}`, consumer: 'p' });
+        const msgs = await probe.read({ max: 1000, blockMs: 200 });
+        return msgs.map((m) => (m.payload as { i: number }).i);
+      }
+      const publish = (bus: EventBus, topic: string, n: number) =>
+        bus.publishBatch(topic, Array.from({ length: n }, (_, i) => ({ i })));
+
+      it('does not touch a topic without a consumer group', async () => {
+        const bus = await create();
+        const topic = uniqueName('t');
+        await publish(bus, topic, 3);
+        await sleep(5);
+        expect(await bus.trimAcknowledged(topic, { maxAgeMs: 0 })).toBe(0);
+        expect(await remaining(bus, topic)).toEqual([0, 1, 2]);
+      });
+
+      it('does not fail on a topic that does not exist', async () => {
+        const bus = await create();
+        expect(await bus.trimAcknowledged(uniqueName('missing'), { maxAgeMs: 0 })).toBe(0);
+      });
+
+      it('removes acknowledged messages and keeps the pending ones (still reclaimable)', async () => {
+        const bus = await create();
+        const topic = uniqueName('t');
+        const s = await sub(bus, topic);
+        await publish(bus, topic, 5);
+        const msgs = await s.read({ max: 10, blockMs: 500 });
+        expect(msgs).toHaveLength(5);
+        await s.ack(msgs.slice(0, 3).map((m) => m.id));
+        await sleep(5);
+        expect(await bus.trimAcknowledged(topic, { maxAgeMs: 0 })).toBe(3);
+        expect(await s.pendingCount()).toBe(2);
+        const retried = await s.reclaimPending({ minIdleMs: 0 });
+        expect(retried.map((m) => (m.payload as { i: number }).i)).toEqual([3, 4]);
+        expect(await remaining(bus, topic)).toEqual([3, 4]);
+      });
+
+      it('never removes a message that was not delivered yet, even when it is old', async () => {
+        const bus = await create();
+        const topic = uniqueName('t');
+        const s = await sub(bus, topic);
+        await publish(bus, topic, 5);
+        const first = await s.read({ max: 2, blockMs: 500 });
+        await s.ack(first.map((m) => m.id));
+        await sleep(5);
+        expect(await bus.trimAcknowledged(topic, { maxAgeMs: 0 })).toBe(2);
+        const rest = await s.read({ max: 10, blockMs: 500 });
+        expect(rest.map((m) => (m.payload as { i: number }).i)).toEqual([2, 3, 4]);
+      });
+
+      it('removes nothing while ANY consumer group has not acknowledged', async () => {
+        const bus = await create();
+        const topic = uniqueName('t');
+        const fast = await sub(bus, topic, { group: 'fast' });
+        const slow = await sub(bus, topic, { group: 'slow' });
+        await publish(bus, topic, 4);
+        const all = await fast.read({ max: 10, blockMs: 500 });
+        await fast.ack(all.map((m) => m.id));
+        await sleep(5);
+        // `slow` has not read a single message.
+        expect(await bus.trimAcknowledged(topic, { maxAgeMs: 0 })).toBe(0);
+        // `slow` reads everything and acks only the first.
+        const theirs = await slow.read({ max: 10, blockMs: 500 });
+        await slow.ack([theirs[0].id]);
+        expect(await bus.trimAcknowledged(topic, { maxAgeMs: 0 })).toBe(1);
+        await slow.ack(theirs.slice(1).map((m) => m.id));
+        expect(await bus.trimAcknowledged(topic, { maxAgeMs: 0 })).toBe(3);
+      });
+
+      it('keeps acknowledged messages younger than maxAgeMs', async () => {
+        const bus = await create();
+        const topic = uniqueName('t');
+        const s = await sub(bus, topic);
+        await publish(bus, topic, 3);
+        const msgs = await s.read({ max: 10, blockMs: 500 });
+        await s.ack(msgs.map((m) => m.id));
+        await sleep(5);
+        expect(await bus.trimAcknowledged(topic, { maxAgeMs: DAY })).toBe(0);
+        expect(await bus.trimAcknowledged(topic, { maxAgeMs: 0 })).toBe(3);
+      });
+
+      it('maxLength removes acknowledged messages beyond the ceiling, never an unacknowledged one', async () => {
+        const bus = await create();
+        const topic = uniqueName('t');
+        const s = await sub(bus, topic);
+        await publish(bus, topic, 6);
+        const msgs = await s.read({ max: 10, blockMs: 500 });
+        await s.ack(msgs.slice(0, 4).map((m) => m.id)); // 4 acked, 2 pending
+        // Too young for maxAgeMs, but beyond the ceiling of 2: only the acknowledged ones may go.
+        expect(await bus.trimAcknowledged(topic, { maxAgeMs: DAY, maxLength: 2 })).toBe(4);
+        expect(await s.pendingCount()).toBe(2);
+        expect(await bus.trimAcknowledged(topic, { maxAgeMs: DAY, maxLength: 0 })).toBe(0);
+      });
+
+      it('never trims the dead-letter store', async () => {
+        const bus = await create();
+        const topic = uniqueName('t');
+        const s = await sub(bus, topic);
+        await bus.publish(topic, { i: 0 });
+        const msgs = await s.read({ blockMs: 500 });
+        await s.deadLetter(msgs, 'poison');
+        await sleep(5);
+        expect(await bus.trimAcknowledged(topic, { maxAgeMs: 0 })).toBe(1);
+        expect(await bus.listDeadLetters(topic)).toHaveLength(1);
+      });
+    });
+
     it('exposes the dead-letter store name', () => {
       expect(dlqTopic('a.b')).toBe('a.b.dlq');
     });

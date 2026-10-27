@@ -9,6 +9,6 @@
       "@smallseedlabs/proba-audit-adapters": ["packages/adapters/src/index.ts"]
     }
   },
-  "include": ["packages/*/src/**/*", "apps/*/src/**/*", "vitest.config.ts", "vitest.integration.config.ts"],
+  "include": ["packages/*/src/**/*", "apps/*/src/**/*", "scripts/**/*.ts", "vitest.config.ts", "vitest.integration.config.ts"],
   "exclude": ["node_modules", "**/dist"]
 }

@@ -42,6 +42,7 @@ import { InMemoryRateLimiter } from '../ratelimit/memory-rate-limiter.js';
 import { RedisRateLimiter } from '../ratelimit/redis-rate-limiter.js';
 import { resolveAnchorHmacKey } from './anchor-key.js';
 import { assertInMemoryAdaptersAllowed } from './in-memory-guard.js';
+import { assertProductionGuards } from './production-guards.js';
 import { RandomIdGenerator, SystemClock } from './system.js';
 
 /** What every adapter factory receives. */
@@ -92,7 +93,6 @@ export function createDefaultRegistries(): Registries {
     .register('redis-streams', ({ config, clock, logger }) =>
       new RedisStreamsEventBus({
         url: config.eventBus.redisUrl,
-        maxStreamLength: config.eventBus.maxStreamLength,
         clock,
         logger,
       })
@@ -253,10 +253,13 @@ export interface CreateRuntimeOptions {
 
 /**
  * Build every port from config (EVENT_BUS, AUDIT_STORE, METRICS_STORE). In production it refuses in-memory
- * adapters unless ALLOW_IN_MEMORY_ADAPTERS=true (InMemoryAdaptersNotAllowedError), before anything is created.
+ * adapters unless ALLOW_IN_MEMORY_ADAPTERS=true (InMemoryAdaptersNotAllowedError), a Redis URL without a password
+ * (RedisPasswordRequiredError) and a consumer/api connecting as the admin or migrator ClickHouse user, or without a password
+ * (ClickHouseRoleError), all before anything is created.
  */
 export async function createRuntime(config: AppConfig, options: CreateRuntimeOptions): Promise<Runtime> {
   assertInMemoryAdaptersAllowed(config, { includeRateLimiter: options.usesRateLimiter, includeAnchorStore: options.usesAnchors, includeLeaseStore: options.usesLeases });
+  assertProductionGuards(config, { usesRateLimiter: options.usesRateLimiter, usesLeases: options.usesLeases, clickhouseRole: options.clickhouseRole });
   const registries = options.registries ?? createDefaultRegistries();
   const deps: AdapterDeps = {
     config,

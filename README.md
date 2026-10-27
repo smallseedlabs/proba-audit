@@ -23,9 +23,9 @@ Requires Node 20+ and Docker.
 
 ```bash
 npm install
-cp .env.example .env           # local placeholders; .env is gitignored
-docker compose up -d clickhouse redis
-npm run migrate                # creates the database and applies migrations
+scripts/generate-local-env.sh  # writes .env with random passwords (gitignored); docker compose has no default passwords
+docker compose up -d clickhouse redis   # ports are bound to 127.0.0.1; Redis needs the generated ACL user and password
+npm run migrate                # creates the database and the append-only users, then applies migrations
 npm test                       # unit tests (in-memory adapters)
 npm run test:integration       # contract + end-to-end tests against ClickHouse + Redis (+ Postgres for the outbox: docker compose --profile test up -d postgres)
 ```
@@ -33,7 +33,7 @@ npm run test:integration       # contract + end-to-end tests against ClickHouse 
 Run the whole stack in containers:
 
 ```bash
-docker compose --profile apps run --rm migrate
+docker compose --profile apps run --rm migrate    # also creates the consumer / api / migrator ClickHouse users
 docker compose --profile apps up -d --build
 curl localhost:3100/health     # audit-api   (3101 consumer, 3102 ingester, 3103 rollup)
 docker compose --profile apps down
@@ -54,7 +54,7 @@ Nobody is allowed until an allow-list is configured. For automated local use set
 (refused when `NODE_ENV=production`). See [Read API](docs/ARCHITECTURE.md#read-api).
 
 Run one app locally: `npm run build && node apps/audit-api/dist/index.js` (or `npm run dev:api`).
-If a host port is taken, set `REDIS_HOST_PORT` / `CLICKHOUSE_HTTP_HOST_PORT` (and match `REDIS_URL` / `CLICKHOUSE_URL`).
+If a host port is taken, set `REDIS_HOST_PORT` / `CLICKHOUSE_HTTP_HOST_PORT` (and match `REDIS_URL` / `CLICKHOUSE_URL`). Published ports are always bound to `127.0.0.1`.
 
 Metrics flow on the development data source (no ad platform needed): see
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#metrics-flow). In short:

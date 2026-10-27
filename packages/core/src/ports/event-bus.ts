@@ -12,6 +12,9 @@
  * - A message that reaches maxDeliveries without an ack is dead-lettered by
  *   reclaimPending(); consumers can also deadLetter() a poison message at once.
  *   Dead letters live in the topic's dead-letter store (see dlqTopic).
+ * - trimAcknowledged() is the ONLY way a topic shrinks: it removes messages that every
+ *   consumer group has acknowledged (and that are old enough). An unacknowledged
+ *   (pending or not yet delivered) message is never removed, whatever its age.
  */
 
 export interface PublishOptions {
@@ -91,6 +94,16 @@ export interface Subscription {
   close(): Promise<void>;
 }
 
+export interface TrimOptions {
+  /** Only messages published at least this long ago may be removed. */
+  maxAgeMs: number;
+  /**
+   * Optional ceiling on the topic length: acknowledged messages beyond it may be removed even when younger than maxAgeMs.
+   * It never removes an unacknowledged message, so the topic can stay longer than this while a group lags.
+   */
+  maxLength?: number;
+}
+
 export interface EventBus {
   publish(topic: string, payload: unknown, options?: PublishOptions): Promise<string>;
   /** Publishes in order; returns ids in the same order. */
@@ -98,6 +111,12 @@ export interface EventBus {
   /** Creates the consumer group if it does not exist. */
   subscribe(options: SubscribeOptions): Promise<Subscription>;
   listDeadLetters<T = unknown>(topic: string, options?: { max?: number }): Promise<DeadLetter<T>[]>;
+  /**
+   * Removes messages that EVERY consumer group of the topic has acknowledged and that are older than `maxAgeMs`
+   * (or beyond `maxLength`). Messages still pending for any group, or not yet delivered to it, stay. A topic with no
+   * consumer group is never trimmed. Dead letters (dlqTopic) are never trimmed. Returns the number of messages removed.
+   */
+  trimAcknowledged(topic: string, options: TrimOptions): Promise<number>;
   /** Throws if the backing service is unreachable. */
   ping(): Promise<void>;
   close(): Promise<void>;

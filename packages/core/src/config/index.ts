@@ -62,7 +62,13 @@ export const envSchema = z.object({
   BUS_BLOCK_MS: nonNegativeInt(2000),
   BUS_CLAIM_IDLE_MS: nonNegativeInt(60000),
   BUS_MAX_DELIVERIES: positiveInt(5),
+  // Optional ceiling on the audit stream length. The stream is trimmed by the audit-consumer, and ONLY of messages that every consumer
+  // group has acknowledged: this ceiling never drops an unacknowledged message (the stream can exceed it while a group lags).
   BUS_MAX_STREAM_LENGTH: z.coerce.number().int().positive().optional(),
+  // Acknowledged audit stream messages older than this are trimmed (audit-consumer). Unacknowledged ones stay however old they are.
+  AUDIT_STREAM_MAX_AGE_HOURS: z.coerce.number().positive().default(72),
+  // How often the audit-consumer trims the stream. 0 turns trimming off (the stream then grows without bound).
+  AUDIT_STREAM_TRIM_INTERVAL_MS: nonNegativeInt(60000),
 
   // Audit consumer
   CONSUMER_RECLAIM_INTERVAL_MS: positiveInt(30000),
@@ -222,6 +228,13 @@ export function parseCorsOrigins(value: string): string[] {
  */
 export type ClickHouseRole = 'consumer' | 'api' | 'migrator';
 
+/** The ClickHouse user each role has when CLICKHOUSE_<ROLE>_USER is not set in production (and the user the migrator creates). */
+export const DEFAULT_CLICKHOUSE_ROLE_USERS: Record<ClickHouseRole, string> = {
+  consumer: 'proba_consumer',
+  api: 'proba_api',
+  migrator: 'proba_migrator',
+};
+
 export interface ClickHouseCredentials {
   username: string;
   password: string;
@@ -260,7 +273,12 @@ export interface AppConfig {
     blockMs: number;
     claimIdleMs: number;
     maxDeliveries: number;
+    /** Ceiling on the stream length for acknowledged messages (never drops an unacknowledged one). */
     maxStreamLength?: number;
+    /** Acknowledged messages older than this many hours are trimmed from the audit stream. */
+    streamMaxAgeHours: number;
+    /** How often the audit-consumer trims the stream; 0 = never. */
+    streamTrimIntervalMs: number;
   };
   consumer: {
     /** How often the consumer reclaims pending messages of crashed consumers. */
@@ -421,18 +439,29 @@ export function loadConfig(env: EnvSource = process.env, options: LoadConfigOpti
   } catch (err) {
     issues.push(`AUDIT_API_CORS_ORIGINS: ${(err as Error).message}`);
   }
-  const roleCredentials = (role: string, user: string | undefined, password: string | undefined): ClickHouseCredentials => {
+  const isProduction = e.NODE_ENV === 'production';
+  // Production: every role has its own user (default proba_consumer / proba_api / proba_migrator), never the shared admin user.
+  // Development and test: a role without its own user falls back to CLICKHOUSE_USER so a single-user local stack keeps working.
+  const roleCredentials = (
+    role: ClickHouseRole,
+    user: string | undefined,
+    password: string | undefined
+  ): ClickHouseCredentials => {
+    const label = role.toUpperCase();
     if (user === undefined) {
-      if (password !== undefined) issues.push(`CLICKHOUSE_${role}_PASSWORD: set without CLICKHOUSE_${role}_USER`);
+      if (isProduction) return { username: DEFAULT_CLICKHOUSE_ROLE_USERS[role], password: password ?? '' };
+      if (password !== undefined) issues.push(`CLICKHOUSE_${label}_PASSWORD: set without CLICKHOUSE_${label}_USER`);
       return { username: e.CLICKHOUSE_USER, password: e.CLICKHOUSE_PASSWORD };
     }
-    if (password === undefined) issues.push(`CLICKHOUSE_${role}_PASSWORD: required when CLICKHOUSE_${role}_USER is set`);
+    // A role user without a password is not an error here: a service only needs the password of its OWN role (compose gives each service
+    // just that one). The process that connects as the role refuses to start without it (ClickHouseRoleError), and the migrator
+    // refuses to create the user without it (RoleProvisioningError).
     return { username: user, password: password ?? '' };
   };
   const clickhouseRoles: Record<ClickHouseRole, ClickHouseCredentials> = {
-    consumer: roleCredentials('CONSUMER', e.CLICKHOUSE_CONSUMER_USER, e.CLICKHOUSE_CONSUMER_PASSWORD),
-    api: roleCredentials('API', e.CLICKHOUSE_API_USER, e.CLICKHOUSE_API_PASSWORD),
-    migrator: roleCredentials('MIGRATOR', e.CLICKHOUSE_MIGRATOR_USER, e.CLICKHOUSE_MIGRATOR_PASSWORD),
+    consumer: roleCredentials('consumer', e.CLICKHOUSE_CONSUMER_USER, e.CLICKHOUSE_CONSUMER_PASSWORD),
+    api: roleCredentials('api', e.CLICKHOUSE_API_USER, e.CLICKHOUSE_API_PASSWORD),
+    migrator: roleCredentials('migrator', e.CLICKHOUSE_MIGRATOR_USER, e.CLICKHOUSE_MIGRATOR_PASSWORD),
   };
   if (issues.length > 0) throw new ConfigError(issues);
 
@@ -470,6 +499,8 @@ export function loadConfig(env: EnvSource = process.env, options: LoadConfigOpti
       claimIdleMs: e.BUS_CLAIM_IDLE_MS,
       maxDeliveries: e.BUS_MAX_DELIVERIES,
       maxStreamLength: e.BUS_MAX_STREAM_LENGTH,
+      streamMaxAgeHours: e.AUDIT_STREAM_MAX_AGE_HOURS,
+      streamTrimIntervalMs: e.AUDIT_STREAM_TRIM_INTERVAL_MS,
     },
     consumer: {
       reclaimIntervalMs: e.CONSUMER_RECLAIM_INTERVAL_MS,

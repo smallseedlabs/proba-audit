@@ -30,15 +30,63 @@ describe('RedisStreamsEventBus specifics', () => {
     }
   });
 
-  it('trims streams approximately when maxStreamLength is set', async () => {
-    const bus = new RedisStreamsEventBus({ url: config.eventBus.redisUrl, maxStreamLength: 10 });
+  it('publishing never trims: a long unread stream keeps every message', async () => {
+    const bus = new RedisStreamsEventBus({ url: config.eventBus.redisUrl });
     const raw = createClient({ url: config.eventBus.redisUrl });
     await raw.connect();
     try {
-      const topic = uniqueName('trim');
+      const topic = uniqueName('notrim');
       await bus.publishBatch(topic, Array.from({ length: 50 }, (_, i) => ({ i })));
-      expect(await raw.xLen(topic)).toBeGreaterThanOrEqual(10);
-      expect(await raw.xLen(topic)).toBeLessThanOrEqual(50);
+      expect(await raw.xLen(topic)).toBe(50);
+    } finally {
+      await raw.quit();
+      await bus.close();
+    }
+  });
+
+  it('trimAcknowledged: XTRIM never passes the oldest pending id of ANY group (checked against the raw stream)', async () => {
+    const bus = new RedisStreamsEventBus({ url: config.eventBus.redisUrl });
+    const raw = createClient({ url: config.eventBus.redisUrl });
+    await raw.connect();
+    try {
+      const topic = uniqueName('safe');
+      const a = await bus.subscribe({ topic, group: 'a', consumer: 'c' });
+      const b = await bus.subscribe({ topic, group: 'b', consumer: 'c' });
+      const ids = await bus.publishBatch(topic, Array.from({ length: 10 }, (_, i) => ({ i })));
+      const readA = await a.read({ max: 10, blockMs: 500 });
+      await a.ack(readA.map((m) => m.id)); // a: everything acknowledged
+      const readB = await b.read({ max: 6, blockMs: 500 }); // b: read 6 of 10
+      await b.ack([readB[0].id, readB[1].id, readB[3].id]); // b: acked 0, 1, 3; 2, 4, 5 pending; 6..9 undelivered
+      await new Promise((r) => setTimeout(r, 10));
+
+      expect(await bus.trimAcknowledged(topic, { maxAgeMs: 0 })).toBe(2); // only ids before b's oldest pending (index 2)
+      const left = (await raw.xRange(topic, '-', '+')).map((e) => e.id);
+      expect(left).toEqual(ids.slice(2));
+      expect(await raw.xLen(topic)).toBe(8);
+
+      // Everything pending for b is still there to be reclaimed, and the undelivered tail is still readable.
+      const reclaimed = await b.reclaimPending({ minIdleMs: 0 });
+      expect(reclaimed.map((m) => m.id)).toEqual([readB[2].id, readB[4].id, readB[5].id]);
+      expect((await b.read({ max: 10, blockMs: 500 })).map((m) => m.id)).toEqual(ids.slice(6));
+    } finally {
+      await raw.quit();
+      await bus.close();
+    }
+  });
+
+  it('trimAcknowledged: a group that never read blocks the trim', async () => {
+    const bus = new RedisStreamsEventBus({ url: config.eventBus.redisUrl });
+    const raw = createClient({ url: config.eventBus.redisUrl });
+    await raw.connect();
+    try {
+      const topic = uniqueName('idlegroup');
+      const a = await bus.subscribe({ topic, group: 'a', consumer: 'c' });
+      await bus.subscribe({ topic, group: 'idle', consumer: 'c' });
+      await bus.publishBatch(topic, [{ i: 0 }, { i: 1 }]);
+      await a.ack((await a.read({ blockMs: 500 })).map((m) => m.id));
+      await new Promise((r) => setTimeout(r, 10));
+      expect(await bus.trimAcknowledged(topic, { maxAgeMs: 0 })).toBe(0);
+      expect(await raw.xLen(topic)).toBe(2);
     } finally {
       await raw.quit();
       await bus.close();

@@ -1,5 +1,6 @@
 import { createClient } from 'redis';
 import type { LeaseStore, Logger } from '@smallseedlabs/proba-audit-core';
+import { redisClientOptions } from './connection.js';
 
 type RedisClient = ReturnType<typeof createClient>;
 
@@ -41,12 +42,11 @@ export class RedisLeaseStore implements LeaseStore {
 
   constructor(private readonly options: RedisLeaseStoreOptions) {
     const timeoutMs = options.connectTimeoutMs ?? 3000;
-    this.client = createClient({
-      url: options.url,
+    this.client = createClient(redisClientOptions(options.url, {
       // Answer immediately when Redis is away (the caller then does not start the work) instead of queueing commands.
       disableOfflineQueue: true,
       socket: { connectTimeout: timeoutMs, reconnectStrategy: (retries) => Math.min(retries * 200, 5000) },
-    });
+    }));
     this.client.on('error', (err) => options.logger?.error('lease store redis error', { err }));
   }
 
