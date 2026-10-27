@@ -584,6 +584,46 @@ describe('AuditConsumer: workspace write leases (several instances)', () => {
   });
 });
 
+describe('AuditConsumer: stream trimming', () => {
+  const trimming = { streamMaxAgeMs: 0, trimIntervalMs: 20 };
+
+  it('trimStream removes what the group acknowledged and never what it has not read yet', async () => {
+    const { h } = setup({ overrides: trimming });
+    await h.publish(makeEvent(), makeEvent());
+    await h.pump(); // both written and acknowledged
+    await h.publish(makeEvent()); // published, not read yet
+    await new Promise((r) => setTimeout(r, 5));
+    expect(await h.consumer.trimStream()).toBe(2);
+    expect(await h.consumer.trimStream()).toBe(0);
+    const { result } = await h.pump();
+    expect(result.written).toBe(1);
+  });
+
+  it('the running loop trims on its interval and keeps ingesting', async () => {
+    const { h, store } = setup({ overrides: trimming });
+    await h.publish(makeEvent(), makeEvent());
+    await h.consumer.start();
+    await waitFor(async () => (await stored(store, 'seedbed')).length === 2);
+    await waitFor(async () => h.logger.records.some((r) => r.fields.lifecycle === 'stream_trimmed'));
+    await h.publish(makeEvent());
+    await waitFor(async () => (await stored(store, 'seedbed')).length === 3);
+  });
+
+  it('a failing trim is logged and does not stop ingestion', async () => {
+    const bus = new InMemoryEventBus();
+    bus.trimAcknowledged = async () => {
+      throw new Error('redis away');
+    };
+    const { h, store } = setup({ bus, overrides: trimming });
+    await h.consumer.start();
+    await h.publish(makeEvent());
+    await waitFor(async () => (await stored(store, 'seedbed')).length === 1);
+    await waitFor(async () => h.logger.records.some((r) => r.fields.lifecycle === 'stream_trim_failed'));
+    await h.publish(makeEvent());
+    await waitFor(async () => (await stored(store, 'seedbed')).length === 2);
+  });
+});
+
 describe('chain compatibility', () => {
   it('produces the same chain as chainEvent applied by hand', async () => {
     const { h, store } = setup();

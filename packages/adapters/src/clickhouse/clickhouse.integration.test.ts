@@ -18,6 +18,7 @@ import { ClickHouseMetricsStore } from './metrics-store.js';
 import { ClickHouseCheckpointStore, ClickHouseQuarantineStore } from './ingest-state-stores.js';
 import { clickHouseMigrationDb } from './migrate-db.js';
 import { loadMigrations, runMigrations } from './migrate.js';
+import { createRoleUsers, grantTableAccess, type RoleProvisioningPlan } from './roles.js';
 
 const base = loadConfig(process.env).clickhouse;
 const options = (database: string): ClickHouseOptions => ({ ...base, database });
@@ -304,6 +305,163 @@ describe('ClickHouse roles (scripts/clickhouse-roles.sql)', () => {
       await client.command({ query: 'DROP TABLE migrator_probe' });
     } finally {
       await client.close();
+    }
+  });
+});
+
+describe('append-only ClickHouse users created by the migrator (roles.ts)', () => {
+  const DB = `${TEST_DB}_append_only`;
+  const names = { consumer: 'proba_ao_consumer', api: 'proba_ao_api', migrator: 'proba_ao_migrator' };
+  const passwords = { consumer: 'ao-consumer-pw', api: 'ao-api-pw', migrator: 'ao-migrator-pw' };
+  const plan: RoleProvisioningPlan = {
+    database: DB,
+    roles: {
+      consumer: { username: names.consumer, password: passwords.consumer },
+      api: { username: names.api, password: passwords.api },
+      migrator: { username: names.migrator, password: passwords.migrator },
+    },
+    skipped: [],
+  };
+  const as = (role: keyof typeof names, password = passwords[role]): ClickHouseOptions => ({ ...base, database: DB, username: names[role], password });
+  const admin = () => createClickHouseClient(options('default'));
+  const DENIED = /Not enough privileges|ACCESS_DENIED/;
+
+  beforeAll(async () => {
+    const c = admin();
+    await c.command({ query: `DROP DATABASE IF EXISTS ${DB}` });
+    await c.close();
+    await ensureDatabase(options(DB));
+    // The order `npm run migrate` uses: users first, the migrations as the migrator, then the table grants.
+    const adminClient = createClickHouseClient(options(DB));
+    await createRoleUsers(adminClient, plan);
+    const migrator = createClickHouseClient(as('migrator'));
+    await runMigrations(clickHouseMigrationDb(migrator), loadMigrations(migrationsDir));
+    await migrator.close();
+    await grantTableAccess(adminClient, plan);
+    await adminClient.close();
+  });
+
+  afterAll(async () => {
+    const c = admin();
+    await c.command({ query: `DROP DATABASE IF EXISTS ${DB}` });
+    for (const u of Object.values(names)) await c.command({ query: `DROP USER IF EXISTS ${u}` });
+    await c.close();
+  });
+
+  it('the migrator user created the schema', async () => {
+    const adminClient = createClickHouseClient(options(DB));
+    try {
+      const rs = await adminClient.query({ query: 'SELECT count() AS n FROM schema_migrations', format: 'JSONEachRow' });
+      expect(Number(((await rs.json()) as { n: number }[])[0].n)).toBe(loadMigrations(migrationsDir).length);
+    } finally {
+      await adminClient.close();
+    }
+  });
+
+  it.each(['audit_events', 'audit_event_content'])('the consumer cannot ALTER ... UPDATE, ALTER ... DELETE, DELETE FROM, TRUNCATE or DROP %s', async (table) => {
+    const client = createClickHouseClient(as('consumer'));
+    try {
+      for (const query of [
+        `ALTER TABLE ${table} UPDATE workspace_id = 'x' WHERE 1`,
+        `ALTER TABLE ${table} DELETE WHERE 1`,
+        `DELETE FROM ${table} WHERE 1`,
+        `ALTER TABLE ${table} DROP PARTITION tuple()`,
+        `ALTER TABLE ${table} MODIFY TTL toDateTime(0) + INTERVAL 1 SECOND`,
+        `TRUNCATE TABLE ${table}`,
+        `DROP TABLE ${table}`,
+      ]) {
+        await expect(client.command({ query }), query).rejects.toThrow(DENIED);
+      }
+    } finally {
+      await client.close();
+    }
+  });
+
+  it('the consumer can still append and read the audit trail', async () => {
+    const o = as('consumer');
+    const audit = new ClickHouseAuditStore({ client: createClickHouseClient(o), ownsClient: true });
+    const content = new ClickHouseAuditContentStore({ client: createClickHouseClient(o), ownsClient: true });
+    try {
+      const workspaceId = `ao-${Date.now()}`;
+      const event = makeStoredAuditEvent({ workspaceId });
+      await audit.appendBatch([event]);
+      expect((await audit.getChainHead(workspaceId))?.hash).toBe(event.hash);
+      await expect(content.ping()).resolves.toBeUndefined();
+    } finally {
+      await Promise.all([audit.close(), content.close()]);
+    }
+  });
+
+  it('the api user can read but cannot write, alter or delete', async () => {
+    const client = createClickHouseClient(as('api'));
+    try {
+      await expect(client.query({ query: 'SELECT count() FROM audit_events' })).resolves.toBeDefined();
+      for (const query of [
+        'INSERT INTO audit_events SELECT * FROM audit_events LIMIT 0',
+        "ALTER TABLE audit_events UPDATE workspace_id = 'x' WHERE 1",
+        'ALTER TABLE audit_events DELETE WHERE 1',
+        'DROP TABLE audit_events',
+      ]) {
+        await expect(client.command({ query }), query).rejects.toThrow(DENIED);
+      }
+    } finally {
+      await client.close();
+    }
+  });
+
+  it('neither service user can touch the migration bookkeeping, create users or grant rights', async () => {
+    for (const role of ['consumer', 'api'] as const) {
+      const client = createClickHouseClient(as(role));
+      try {
+        for (const query of [
+          'SELECT * FROM schema_migrations',
+          'INSERT INTO schema_migrations (version, name, checksum) VALUES (99, \'x\', \'y\')',
+          'CREATE USER intruder IDENTIFIED WITH sha256_password BY \'x\'',
+          `GRANT ALL ON ${DB}.* TO ${names[role]}`,
+        ]) {
+          await expect(client.command({ query }), `${role}: ${query}`).rejects.toThrow(DENIED);
+        }
+      } finally {
+        await client.close();
+      }
+    }
+  });
+
+  it('the migrator user has DDL on its database but no access management', async () => {
+    const client = createClickHouseClient(as('migrator'));
+    try {
+      await client.command({ query: 'CREATE TABLE migrator_probe (a UInt8) ENGINE = Memory' });
+      await client.command({ query: 'DROP TABLE migrator_probe' });
+      await expect(client.command({ query: "CREATE USER intruder2 IDENTIFIED WITH sha256_password BY 'x'" })).rejects.toThrow(DENIED);
+    } finally {
+      await client.close();
+    }
+  });
+
+  it('is idempotent, rotates a password, and grants a table that a later migration adds', async () => {
+    const adminClient = createClickHouseClient(options(DB));
+    try {
+      await adminClient.command({ query: 'CREATE TABLE IF NOT EXISTS later_table (a UInt8) ENGINE = MergeTree ORDER BY a' });
+      const rotated: RoleProvisioningPlan = {
+        ...plan,
+        roles: { ...plan.roles, consumer: { username: names.consumer, password: 'rotated-consumer-pw' } },
+      };
+      await createRoleUsers(adminClient, rotated);
+      await createRoleUsers(adminClient, rotated); // twice: no error
+      const tables = await grantTableAccess(adminClient, rotated);
+      expect(tables).toContain('later_table');
+      expect(tables).not.toContain('schema_migrations');
+
+      const old = createClickHouseClient(as('consumer'));
+      await expect(old.command({ query: 'SELECT 1' })).rejects.toThrow(/Authentication failed|password is incorrect|AUTHENTICATION_FAILED/i);
+      await old.close();
+
+      const fresh = createClickHouseClient(as('consumer', 'rotated-consumer-pw'));
+      await fresh.insert({ table: 'later_table', values: [{ a: 1 }], format: 'JSONEachRow' });
+      await expect(fresh.command({ query: 'ALTER TABLE later_table DELETE WHERE 1' })).rejects.toThrow(DENIED);
+      await fresh.close();
+    } finally {
+      await adminClient.close();
     }
   });
 });

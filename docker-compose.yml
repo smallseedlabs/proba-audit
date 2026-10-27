@@ -1,14 +1,57 @@
+# SECURITY (checked in CI by scripts/check-compose-security.mjs):
+#   * Every published port is bound to 127.0.0.1: nothing here is reachable from another machine. To expose a service, put a
+#     reverse proxy with TLS in front of it; do not widen the bind.
+#   * No password has a default. Each is `${NAME:?set NAME}`: compose refuses to start without it. Generate a local .env with
+#     `scripts/generate-local-env.sh` (random passwords, never committed), or set them in your secret manager for a real deployment.
+#     Use URL-safe passwords (hex): REDIS_PASSWORD and ANCHOR_DB_PASSWORD are placed inside URLs.
+# Environment every service shares. It holds NO ClickHouse password: each service adds only the one for its own role
+# (audit-consumer, metrics-ingester and rollup: the consumer user; audit-api and metrics-report: the api user).
+x-app-env: &app-env
+  NODE_ENV: production
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+  # An ACL user and password, never anonymous. Use rediss:// (TLS) for a Redis outside this compose network.
+  REDIS_URL: redis://${REDIS_USER:-proba}:${REDIS_PASSWORD:?set REDIS_PASSWORD}@redis:6379
+  CLICKHOUSE_URL: http://clickhouse:8123
+  CLICKHOUSE_USER: ${CLICKHOUSE_USER:-proba}
+  CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-proba_audit}
+  # Append-only users, created by `migrate` (not opt-in). Services refuse to start in production as the admin or migrator user.
+  CLICKHOUSE_CONSUMER_USER: ${CLICKHOUSE_CONSUMER_USER:-proba_consumer}
+  CLICKHOUSE_API_USER: ${CLICKHOUSE_API_USER:-proba_api}
+  CLICKHOUSE_MIGRATOR_USER: ${CLICKHOUSE_MIGRATOR_USER:-proba_migrator}
+  EVENT_BUS: ${EVENT_BUS:-redis-streams}
+  AUDIT_STORE: ${AUDIT_STORE:-clickhouse}
+  # Raw text of events (protocol 0.3.3 `content`): off unless set to true. Same value for audit-consumer and audit-api.
+  AUDIT_CONTENT_ENABLED: ${AUDIT_CONTENT_ENABLED:-false}
+  AUDIT_CONTENT_STORE: ${AUDIT_CONTENT_STORE:-clickhouse}
+  METRICS_STORE: ${METRICS_STORE:-clickhouse}
+  CHECKPOINT_STORE: ${CHECKPOINT_STORE:-clickhouse}
+  QUARANTINE_STORE: ${QUARANTINE_STORE:-clickhouse}
+  # Signed heads of the hash chains (audit-consumer and audit-api): kept in their own Postgres (anchor-db), outside ClickHouse.
+  # ANCHOR_HMAC_KEY has no default (>= 32 characters; `openssl rand -hex 32`): audit-consumer and audit-api refuse to start in production without one.
+  ANCHOR_STORE: ${ANCHOR_STORE:-postgres}
+  ANCHOR_HMAC_KEY: ${ANCHOR_HMAC_KEY:?set ANCHOR_HMAC_KEY}
+  ANCHOR_DATABASE_URL: ${ANCHOR_DATABASE_URL:-postgresql://anchors:${ANCHOR_DB_PASSWORD:?set ANCHOR_DB_PASSWORD}@anchor-db:5432/proba_audit_anchors}
+  # Leases between replicas (audit-consumer, metrics-ingester, rollup): shared through Redis.
+  LEASE_STORE: ${LEASE_STORE:-redis}
+  CONSUMER_LEASE_TTL_MS: ${CONSUMER_LEASE_TTL_MS:-30000}
+  # Which analytics library serves which ad platform. Empty: the ingester idles.
+  # The development data source is meta:stub (see the metrics-e2e profile).
+  PLATFORM_CONNECTORS: ${PLATFORM_CONNECTORS:-}
+  INGEST_WORKSPACE_ID: ${INGEST_WORKSPACE_ID:-seedbed}
+  # Acknowledged audit stream messages older than this are trimmed by the audit-consumer; unacknowledged ones are never removed.
+  AUDIT_STREAM_MAX_AGE_HOURS: ${AUDIT_STREAM_MAX_AGE_HOURS:-72}
+
 services:
   clickhouse:
     image: clickhouse/clickhouse-server:24.8-alpine
     container_name: proba-audit-clickhouse
     environment:
       CLICKHOUSE_USER: ${CLICKHOUSE_USER:-proba}
-      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-proba}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?set CLICKHOUSE_PASSWORD}
       CLICKHOUSE_DB: ${CLICKHOUSE_DATABASE:-proba_audit}
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
     ports:
-      - "${CLICKHOUSE_HTTP_HOST_PORT:-8123}:8123"
+      - "127.0.0.1:${CLICKHOUSE_HTTP_HOST_PORT:-8123}:8123"
     volumes:
       - clickhouse_data:/var/lib/clickhouse
     ulimits:
@@ -25,14 +68,26 @@ services:
   redis:
     image: redis:7-alpine
     container_name: proba-audit-redis
+    environment:
+      REDIS_USER: ${REDIS_USER:-proba}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD}
+    # An ACL user with a password; the `default` user (no password) is switched off. The ACL file is written at start from the
+    # environment so the password never appears in the process arguments. The user may do everything except the @dangerous
+    # commands (FLUSHALL, FLUSHDB, KEYS, CONFIG, DEBUG, SHUTDOWN, ...), which the audit services never need.
     # AOF persistence ON: the audit stream must survive a Redis restart.
-    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    command:
+      - sh
+      - -c
+      - >-
+        umask 077 &&
+        printf 'user default off\nuser %s on >%s ~* &* +@all -@dangerous\n' "$$REDIS_USER" "$$REDIS_PASSWORD" > /tmp/users.acl &&
+        exec redis-server --aclfile /tmp/users.acl --appendonly yes --appendfsync everysec
     ports:
-      - "${REDIS_HOST_PORT:-6379}:6379"
+      - "127.0.0.1:${REDIS_HOST_PORT:-6379}:6379"
     volumes:
       - redis_data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", 'REDISCLI_AUTH="$$REDIS_PASSWORD" redis-cli --user "$$REDIS_USER" ping | grep -q PONG']
       interval: 10s
       timeout: 3s
       retries: 5
@@ -46,10 +101,10 @@ services:
     container_name: proba-audit-postgres-test
     environment:
       POSTGRES_USER: proba
-      POSTGRES_PASSWORD: proba
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
       POSTGRES_DB: proba_audit_outbox_test
     ports:
-      - "${POSTGRES_HOST_PORT:-5432}:5432"
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5432}:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U proba -d proba_audit_outbox_test"]
       interval: 5s
@@ -66,41 +121,14 @@ services:
     depends_on:
       clickhouse:
         condition: service_healthy
-    environment: &app-env
-      NODE_ENV: production
-      LOG_LEVEL: ${LOG_LEVEL:-info}
-      REDIS_URL: redis://redis:6379
-      CLICKHOUSE_URL: http://clickhouse:8123
-      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-proba}
-      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-proba}
-      CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-proba_audit}
-      # Optional least-privilege users (scripts/clickhouse-roles.sql). Unset: every service uses CLICKHOUSE_USER above.
-      CLICKHOUSE_CONSUMER_USER: ${CLICKHOUSE_CONSUMER_USER:-}
-      CLICKHOUSE_CONSUMER_PASSWORD: ${CLICKHOUSE_CONSUMER_PASSWORD:-}
-      CLICKHOUSE_API_USER: ${CLICKHOUSE_API_USER:-}
-      CLICKHOUSE_API_PASSWORD: ${CLICKHOUSE_API_PASSWORD:-}
-      CLICKHOUSE_MIGRATOR_USER: ${CLICKHOUSE_MIGRATOR_USER:-}
-      CLICKHOUSE_MIGRATOR_PASSWORD: ${CLICKHOUSE_MIGRATOR_PASSWORD:-}
-      EVENT_BUS: ${EVENT_BUS:-redis-streams}
-      AUDIT_STORE: ${AUDIT_STORE:-clickhouse}
-      # Raw text of events (protocol 0.3.3 `content`): off unless set to true. Same value for audit-consumer and audit-api.
-      AUDIT_CONTENT_ENABLED: ${AUDIT_CONTENT_ENABLED:-false}
-      AUDIT_CONTENT_STORE: ${AUDIT_CONTENT_STORE:-clickhouse}
-      METRICS_STORE: ${METRICS_STORE:-clickhouse}
-      CHECKPOINT_STORE: ${CHECKPOINT_STORE:-clickhouse}
-      QUARANTINE_STORE: ${QUARANTINE_STORE:-clickhouse}
-      # Signed heads of the hash chains (audit-consumer and audit-api): kept in their own Postgres (anchor-db), outside ClickHouse.
-      # ANCHOR_HMAC_KEY has no default: with NODE_ENV=production audit-consumer and audit-api refuse to start without one (>= 32 characters).
-      ANCHOR_STORE: ${ANCHOR_STORE:-postgres}
-      ANCHOR_HMAC_KEY: ${ANCHOR_HMAC_KEY:-}
-      ANCHOR_DATABASE_URL: ${ANCHOR_DATABASE_URL:-postgresql://anchors:${ANCHOR_DB_PASSWORD:-anchors}@anchor-db:5432/proba_audit_anchors}
-      # Leases between replicas (audit-consumer, metrics-ingester, rollup): shared through Redis.
-      LEASE_STORE: ${LEASE_STORE:-redis}
-      CONSUMER_LEASE_TTL_MS: ${CONSUMER_LEASE_TTL_MS:-30000}
-      # Which analytics library serves which ad platform. Empty: the ingester idles.
-      # The development data source is meta:stub (see the metrics-e2e profile).
-      PLATFORM_CONNECTORS: ${PLATFORM_CONNECTORS:-}
-      INGEST_WORKSPACE_ID: ${INGEST_WORKSPACE_ID:-seedbed}
+    # The admin (CLICKHOUSE_USER) is the only one allowed to create users: only this one-shot gets its password, and the three
+    # role passwords, to create the users (consumer: INSERT+SELECT, api: SELECT, migrator: DDL) and apply the migrations.
+    environment:
+      <<: *app-env
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?set CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_CONSUMER_PASSWORD: ${CLICKHOUSE_CONSUMER_PASSWORD:?set CLICKHOUSE_CONSUMER_PASSWORD}
+      CLICKHOUSE_API_PASSWORD: ${CLICKHOUSE_API_PASSWORD:?set CLICKHOUSE_API_PASSWORD}
+      CLICKHOUSE_MIGRATOR_PASSWORD: ${CLICKHOUSE_MIGRATOR_PASSWORD:?set CLICKHOUSE_MIGRATOR_PASSWORD}
 
   # The anchor store: NOT the ClickHouse that holds the audit events, and with its own credentials, so that whoever can delete
   # audit events cannot also rewrite the signed chain heads. For anything real, use a managed Postgres and set ANCHOR_DATABASE_URL.
@@ -110,7 +138,7 @@ services:
     container_name: proba-audit-anchor-db
     environment:
       POSTGRES_USER: anchors
-      POSTGRES_PASSWORD: ${ANCHOR_DB_PASSWORD:-anchors}
+      POSTGRES_PASSWORD: ${ANCHOR_DB_PASSWORD:?set ANCHOR_DB_PASSWORD}
       POSTGRES_DB: proba_audit_anchors
     volumes:
       - anchor_data:/var/lib/postgresql/data
@@ -135,9 +163,10 @@ services:
         condition: service_healthy
     environment:
       <<: *app-env
+      CLICKHOUSE_CONSUMER_PASSWORD: ${CLICKHOUSE_CONSUMER_PASSWORD:?set CLICKHOUSE_CONSUMER_PASSWORD}
       PORT: 3101
     ports:
-      - "${AUDIT_CONSUMER_HOST_PORT:-3101}:3101"
+      - "127.0.0.1:${AUDIT_CONSUMER_HOST_PORT:-3101}:3101"
     restart: unless-stopped
 
   audit-api:
@@ -149,6 +178,7 @@ services:
     depends_on: *app-deps
     environment:
       <<: *app-env
+      CLICKHOUSE_API_PASSWORD: ${CLICKHOUSE_API_PASSWORD:?set CLICKHOUSE_API_PASSWORD}
       PORT: 3100
       # Sign-in: Firebase ID tokens of this project, verified with Google's public keys (no secret).
       AUDIT_API_TOKEN_VERIFIER: ${AUDIT_API_TOKEN_VERIFIER:-firebase}
@@ -166,7 +196,7 @@ services:
       AUDIT_API_ANALYTICS_ACCOUNTS: ${AUDIT_API_ANALYTICS_ACCOUNTS:-}
       AUDIT_API_TRUST_PROXY: ${AUDIT_API_TRUST_PROXY:-false}
     ports:
-      - "${AUDIT_API_HOST_PORT:-3100}:3100"
+      - "127.0.0.1:${AUDIT_API_HOST_PORT:-3100}:3100"
     restart: unless-stopped
 
   metrics-ingester:
@@ -178,9 +208,10 @@ services:
     depends_on: *app-deps
     environment:
       <<: *app-env
+      CLICKHOUSE_CONSUMER_PASSWORD: ${CLICKHOUSE_CONSUMER_PASSWORD:?set CLICKHOUSE_CONSUMER_PASSWORD}
       PORT: 3102
     ports:
-      - "${METRICS_INGESTER_HOST_PORT:-3102}:3102"
+      - "127.0.0.1:${METRICS_INGESTER_HOST_PORT:-3102}:3102"
     restart: unless-stopped
 
   rollup:
@@ -192,9 +223,10 @@ services:
     depends_on: *app-deps
     environment:
       <<: *app-env
+      CLICKHOUSE_CONSUMER_PASSWORD: ${CLICKHOUSE_CONSUMER_PASSWORD:?set CLICKHOUSE_CONSUMER_PASSWORD}
       PORT: 3103
     ports:
-      - "${ROLLUP_HOST_PORT:-3103}:3103"
+      - "127.0.0.1:${ROLLUP_HOST_PORT:-3103}:3103"
     restart: unless-stopped
 
   # ---------------------------------------------------------------------------
@@ -220,6 +252,8 @@ services:
         condition: service_healthy
     environment: &e2e-env
       <<: *app-env
+      CLICKHOUSE_CONSUMER_PASSWORD: ${CLICKHOUSE_CONSUMER_PASSWORD:?set CLICKHOUSE_CONSUMER_PASSWORD}
+      CLICKHOUSE_API_PASSWORD: ${CLICKHOUSE_API_PASSWORD:?set CLICKHOUSE_API_PASSWORD}
       NODE_ENV: development
       # Development run: anchors in memory with the development key (no anchor-db in this profile).
       ANCHOR_STORE: memory

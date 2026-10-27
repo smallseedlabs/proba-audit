@@ -66,6 +66,9 @@ runService({
         selfAuditWorkspaceId: config.consumer.selfAuditWorkspaceId,
         contentEnabled: config.content.enabled,
         leaseTtlMs: config.consumer.leaseTtlMs,
+        trimIntervalMs: config.eventBus.streamTrimIntervalMs,
+        streamMaxAgeMs: Math.round(config.eventBus.streamMaxAgeHours * 3_600_000),
+        ...(config.eventBus.maxStreamLength !== undefined ? { streamMaxLength: config.eventBus.maxStreamLength } : {}),
       },
     });
     await consumer.start();

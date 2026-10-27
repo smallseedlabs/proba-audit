@@ -106,28 +106,73 @@ throws `InMemoryAdaptersNotAllowedError` (listing the offending variables) befor
 is the deliberate opt-in (default `false`). Outside production nothing changes. The guard is keyed on the registry name `memory`; an adapter you register
 under another name is your responsibility.
 
-### ClickHouse privileges
+### ClickHouse privileges (append-only users)
 
-One ClickHouse user for everything would let the read API (internet-facing) rewrite or drop the audit trail. Three roles, each with the least it needs
-(`scripts/clickhouse-roles.sql` creates them; run it once per environment as an admin, after `npm run migrate`):
+One ClickHouse user for everything would let the read API (internet-facing) rewrite or drop the audit trail. Three users, each with the least it needs,
+**created by `npm run migrate` itself** (not an opt-in and not a script to remember): `packages/adapters/src/clickhouse/roles.ts`, called from `migrate-cli.ts`.
 
 | Role | Used by | Grants |
 |------|---------|--------|
-| `consumer` (`CLICKHOUSE_CONSUMER_USER` / `_PASSWORD`) | audit-consumer, metrics-ingester, rollup | `INSERT` + `SELECT` on the audit and metrics tables (`CheckpointStore.delete` is not granted: only tests and tools use it). No `UPDATE`, `DELETE`, `DROP`, `TRUNCATE` or DDL. |
-| `api` (`CLICKHOUSE_API_USER` / `_PASSWORD`) | audit-api, `metrics-report` | `SELECT` only. |
-| `migrator` (`CLICKHOUSE_MIGRATOR_USER` / `_PASSWORD`) | `npm run migrate` | DDL on the database. Nothing else uses it. |
+| `consumer` (`CLICKHOUSE_CONSUMER_USER` / `_PASSWORD`, default user `proba_consumer`) | audit-consumer, metrics-ingester, rollup | `INSERT` + `SELECT` on every data table (`CheckpointStore.delete` needs `ALTER DELETE` and is not granted: only tests and tools use it). No `ALTER UPDATE`, `ALTER DELETE`, `DELETE FROM`, `DROP`, `TRUNCATE` or DDL, on `audit_events` and `audit_event_content` in particular. |
+| `api` (`CLICKHOUSE_API_USER` / `_PASSWORD`, default `proba_api`) | audit-api, `metrics-report` | `SELECT` only. |
+| `migrator` (`CLICKHOUSE_MIGRATOR_USER` / `_PASSWORD`, default `proba_migrator`) | `npm run migrate` | `ALL` on the database (DDL), nothing global: it cannot create users or grant rights. |
 
-Each process picks its role through `createRuntime(config, { clickhouseRole })`; `clickHouseOptionsFor(config, role)` resolves the credentials. A role without its own
-user **falls back to `CLICKHOUSE_USER` / `CLICKHOUSE_PASSWORD`**, so the single-user local docker stack works without applying the SQL. A role user without a password (or the reverse) is a
-configuration error. Role passwords are redacted from the logged config. A migration that adds a table needs a matching `GRANT` in the roles script. This limits what a compromised
-process can do to the audit trail, but the consumer can still insert rows: the hash chain and the anchor (below) are what make tampering visible.
+What `npm run migrate` does, in this order, connecting as the **admin** (`CLICKHOUSE_USER` / `CLICKHOUSE_PASSWORD`, the only account with access management) for the user and grant statements:
+
+1. create the database; 2. `CREATE USER IF NOT EXISTS` + `ALTER USER ... IDENTIFIED` for each role (so a rotated password takes effect on the next run) and give the migrator its database rights;
+3. apply the pending migrations **as the migrator** (falling back to the admin where there is no migrator user); 4. grant the consumer `INSERT, SELECT` and the api `SELECT` on every table of the database
+(read from `system.tables`, `schema_migrations` excluded), so a table added by a later migration is covered without touching a script. All of it is idempotent.
+
+**Production (`NODE_ENV=production`)**
+
+- `CLICKHOUSE_CONSUMER_PASSWORD`, `CLICKHOUSE_API_PASSWORD` and `CLICKHOUSE_MIGRATOR_PASSWORD` are **required**: the migrator stops before changing anything (`RoleProvisioningError`) if one is empty,
+  or if a role user is the admin user. Without `CLICKHOUSE_<ROLE>_USER` the role uses its default name; there is no fallback to the shared user.
+- `audit-consumer`, `metrics-ingester`, `rollup` (consumer) and `audit-api`, `metrics-report` (api) refuse to start (`ClickHouseRoleError`, before any adapter is created) when their role password is empty, or when the role
+  user is the admin (`CLICKHOUSE_USER`), the migrator user, a ClickHouse administrator name (`default`, `admin`, `root`), or (for the api) the consumer user.
+- Compose gives each service only its own role's password; only the one-shot `migrate` service gets the admin and the three role passwords.
+
+**Other environments:** a role without its own user and password falls back to `CLICKHOUSE_USER` / `CLICKHOUSE_PASSWORD`, so a one-user local run still works; the migrator then creates only the roles that have a password.
+A role user with an empty password is refused everywhere (the connection could only fail). Role passwords are redacted from the logged config.
+`scripts/clickhouse-roles.sql` is the same set of statements for an operator who prefers to run them by hand. This limits what a compromised process can do to the audit trail, but the consumer can still insert
+rows: the hash chain and the anchor (below) are what make tampering visible. `clickhouse.integration.test.ts` proves it against a real server: as the consumer, `ALTER ... UPDATE`, `ALTER ... DELETE`,
+`DELETE FROM`, `DROP PARTITION`, `MODIFY TTL`, `TRUNCATE` and `DROP` on `audit_events` and `audit_event_content` are all `ACCESS_DENIED`, while appending and reading still work.
+
+### Redis: authentication, TLS and the production guard
+
+Redis carries the audit stream, the leases and the read API's rate limits, so it is never anonymous.
+
+- **docker-compose.yml** starts Redis with an ACL file written at start from `REDIS_USER` / `REDIS_PASSWORD` (`${REDIS_PASSWORD:?set REDIS_PASSWORD}`: there is no default and no `--requirepass` on the command line):
+  the `default` user is off, the audit user may run everything except the `@dangerous` commands (`FLUSHALL`, `FLUSHDB`, `KEYS`, `CONFIG`, `DEBUG`, `SHUTDOWN`, ...). `REDIS_URL` for the services is built from the same variables.
+- **TLS:** every Redis adapter (event bus, rate limiter, lease store) builds its client through `redisClientOptions` (`packages/adapters/src/redis/connection.ts`): `rediss://` turns TLS on with certificate and host name
+  verification always ON (a private CA goes in `NODE_EXTRA_CA_CERTS`); `redis://` is plain TCP; any other scheme is an error. Use `rediss://` for any Redis outside a private network.
+- **Production guard:** with `NODE_ENV=production`, a service that uses Redis (`EVENT_BUS=redis-streams`; `LEASE_STORE=redis` for the services that take leases; `AUDIT_API_RATE_LIMITER=redis` for audit-api) refuses to start
+  (`RedisPasswordRequiredError`, before any adapter is created) when `REDIS_URL` carries no password. The error names the settings that use Redis and never prints the URL.
+
+### Audit stream trimming
+
+The audit stream is a buffer, the audit store is the system of record. Publishing never trims (the old `XADD ... MAXLEN ~` could drop unread messages and is gone). The stream shrinks only through
+`EventBus.trimAcknowledged(topic, { maxAgeMs, maxLength? })`, which the audit-consumer calls every `AUDIT_STREAM_TRIM_INTERVAL_MS` (default 60 s; `0` turns it off):
+
+- For every consumer group of the stream the **safe bound** is the oldest id still in its pending list (delivered, not acknowledged), or, with nothing pending, just past its `last-delivered-id`. A group that has delivered
+  nothing yet bounds at the start of the stream. The trim is `XTRIM MINID <smallest bound over all groups, capped by age>`, so **a message that is pending for, or not yet delivered to, any group is never removed**, whatever its age.
+- A message is only removed if it is also older than `AUDIT_STREAM_MAX_AGE_HOURS` (default **72**, by Redis server time) or beyond the optional `BUS_MAX_STREAM_LENGTH` ceiling (acknowledged messages only; the stream can stay longer while a group lags).
+- A stream with no consumer group is not trimmed; the dead-letter stream (`<topic>.dlq`) is never trimmed. A failed trim is logged and retried; it never stops ingestion.
+- A consumer group nobody reads any more holds the trim back (the stream keeps growing): watch `XINFO GROUPS` lag and delete retired groups (`XGROUP DESTROY`). Size Redis for `AUDIT_STREAM_MAX_AGE_HOURS` of traffic plus the worst lag you tolerate.
+
+`runEventBusContract` (memory and Redis) and `redis-streams.integration.test.ts` cover: no group, missing stream, acknowledged vs pending, undelivered tail, two groups (the slowest wins), age, length ceiling and dead letters.
+
+### Compose hardening
+
+`docker-compose.yml` binds every published port (ClickHouse, Redis, the test Postgres, all four services) to `127.0.0.1` and has **no default password**: each is `${NAME:?set NAME}`, so compose refuses to start without it.
+`scripts/generate-local-env.sh` writes a `.env` with random values. `node scripts/check-compose-security.mjs` (CI job "Compose security") resolves the file for every profile and fails if a port is not on `127.0.0.1`, a
+password-like variable has a default or a literal (including inside URLs), or a required variable is not really required (compose must fail naming it when it is unset).
 
 ### EventBus delivery model
 
 At-least-once, with consumer groups. `read` delivers new messages, which stay *pending* until `ack`. `reclaimPending`
 re-delivers messages idle longer than `BUS_CLAIM_IDLE_MS` (each delivery bumps `deliveryCount`) and dead-letters
 those that reached `BUS_MAX_DELIVERIES`. `deadLetter` moves a poison message to the dead-letter store at once.
-On Redis Streams: `XADD`, `XREADGROUP`, `XACK`, `XPENDING`+`XCLAIM`, and the `<topic>.dlq` stream.
+On Redis Streams: `XADD`, `XREADGROUP`, `XACK`, `XPENDING`+`XCLAIM`, `XTRIM MINID` (`trimAcknowledged`, see "Audit stream trimming"), and the `<topic>.dlq` stream.
 Redis runs with AOF on in `docker-compose.yml` so the stream survives restarts.
 
 ## Audit pipeline

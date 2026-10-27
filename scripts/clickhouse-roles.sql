@@ -1,4 +1,9 @@
--- Least-privilege ClickHouse users for proba-audit. Run ONCE per environment as a ClickHouse admin (a user with access management),
+-- Least-privilege ClickHouse users for proba-audit.
+--
+-- `npm run migrate` now creates these users and grants every table ITSELF (packages/adapters/src/clickhouse/roles.ts), from
+-- CLICKHOUSE_CONSUMER_PASSWORD / CLICKHOUSE_API_PASSWORD / CLICKHOUSE_MIGRATOR_PASSWORD (required in production): you do not need this file.
+-- It stays as the equivalent statements for an operator who creates users by hand (for example on a managed ClickHouse where the
+-- migration job has no access management). Run it ONCE per environment as a ClickHouse admin (a user with access management),
 -- AFTER `npm run migrate` has created the tables (grants name the tables), and again after a migration that adds a table.
 --
 --   consumer  audit-consumer, metrics-ingester, rollup: INSERT + SELECT on the audit and metrics tables, nothing else.
@@ -11,7 +16,7 @@
 --   sed -e "s/__CONSUMER_PASSWORD__/$CONSUMER_PW/" -e "s/__API_PASSWORD__/$API_PW/" -e "s/__MIGRATOR_PASSWORD__/$MIGRATOR_PW/" \
 --       scripts/clickhouse-roles.sql | clickhouse-client --multiquery
 -- Then set CLICKHOUSE_CONSUMER_USER/PASSWORD, CLICKHOUSE_API_USER/PASSWORD and CLICKHOUSE_MIGRATOR_USER/PASSWORD (see .env.example).
--- Without them every process keeps using CLICKHOUSE_USER/PASSWORD, which is what the local docker stack does.
+-- In production the services refuse to start without them (and as the admin or migrator user).
 -- Never commit real passwords.
 
 CREATE USER IF NOT EXISTS proba_consumer IDENTIFIED WITH sha256_password BY '__CONSUMER_PASSWORD__';

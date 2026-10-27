@@ -1,5 +1,6 @@
 import { createClient } from 'redis';
 import type { Logger, RateLimitDecision, RateLimiter } from '@smallseedlabs/proba-audit-core';
+import { redisClientOptions } from '../redis/connection.js';
 
 type RedisClient = ReturnType<typeof createClient>;
 
@@ -34,13 +35,12 @@ export class RedisRateLimiter implements RateLimiter {
 
   constructor(private readonly options: RedisRateLimiterOptions) {
     const timeoutMs = options.connectTimeoutMs ?? 3000;
-    this.client = createClient({
-      url: options.url,
+    this.client = createClient(redisClientOptions(options.url, {
       // Never queue commands while disconnected and never retry in a tight loop: a limiter that cannot
       // reach Redis must answer immediately (fail open), not hold the request.
       disableOfflineQueue: true,
       socket: { connectTimeout: timeoutMs, reconnectStrategy: (retries) => Math.min(retries * 200, 5000) },
-    });
+    }));
     this.client.on('error', (err) => options.logger?.error('rate limiter redis error', { err }));
   }
 

@@ -46,6 +46,26 @@ jobs:
       - name: Build all workspaces
         run: npm run build
 
+  compose-security:
+    name: Compose security (loopback ports, no default passwords)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Resolves docker-compose.yml for every profile and fails if a published port is not bound to 127.0.0.1,
+      # a password has a default (or a literal), or a required password variable is not really required.
+      - name: Check docker-compose.yml
+        run: node scripts/check-compose-security.mjs
+
   test:
     name: Unit Tests (in-memory)
     runs-on: ubuntu-latest
@@ -67,59 +87,11 @@ jobs:
   integration-test:
     name: Integration Tests (ClickHouse + Redis + Postgres)
     runs-on: ubuntu-latest
-    services:
-      clickhouse:
-        image: clickhouse/clickhouse-server:24.8-alpine
-        env:
-          CLICKHOUSE_USER: proba
-          CLICKHOUSE_PASSWORD: proba
-          CLICKHOUSE_DB: proba_audit
-          CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: '1'
-        options: >-
-          --health-cmd "wget --no-verbose --tries=1 --spider http://127.0.0.1:8123/ping"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 10
-          --ulimit nofile=262144:262144
-        ports:
-          - 8123:8123
-
-      redis:
-        image: redis:7-alpine
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-        ports:
-          - 6379:6379
-
-      # Only for the PostgresOutboxStore tests (the outbox lives in the emitting service's database).
-      postgres:
-        image: postgres:16-alpine
-        env:
-          # Throwaway credentials of this CI-only service container.
-          POSTGRES_USER: proba
-          POSTGRES_PASSWORD: proba
-          POSTGRES_DB: proba_audit_outbox_test
-        options: >-
-          --health-cmd "pg_isready -U proba -d proba_audit_outbox_test"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 10
-        ports:
-          - 5432:5432
-
+    # The services come from docker-compose.yml itself (authenticated Redis with an ACL user, passworded ClickHouse and Postgres,
+    # ports on 127.0.0.1), so the tests run against the same configuration as the local and production stacks.
     env:
       NODE_ENV: test
       LOG_LEVEL: warn
-      REDIS_URL: redis://localhost:6379
-      CLICKHOUSE_URL: http://localhost:8123
-      # Throwaway credentials of the CI-only service container above.
-      CLICKHOUSE_USER: proba
-      CLICKHOUSE_PASSWORD: proba
-      CLICKHOUSE_DATABASE: proba_audit
-      OUTBOX_TEST_DATABASE_URL: postgresql://proba:proba@localhost:5432/proba_audit_outbox_test
 
     steps:
       - uses: actions/checkout@v4
@@ -133,6 +105,46 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # Throwaway passwords for this run. Written to .env so every `docker compose` command (up, down, config)
+      # can interpolate ${VAR:?...} for ALL services — Compose parses the whole file even when only the test
+      # profile runs, so CLICKHOUSE_CONSUMER_PASSWORD and the other role secrets must be present. Also exported
+      # to GITHUB_ENV (with ::add-mask::) for migrate and the host-side tests. generate-local-env.sh sets each
+      # role USER together with its PASSWORD, so loadConfig does not reject a role password without a user.
+      - name: Generate throwaway credentials
+        run: |
+          set -euo pipefail
+          scripts/generate-local-env.sh --force
+          while IFS= read -r line || [ -n "$line" ]; do
+            case "$line" in
+              ''|\#*) continue ;;
+            esac
+            value="${line#*=}"
+            echo "::add-mask::$value"
+            echo "$line" >> "$GITHUB_ENV"
+          done < .env
+
+      - name: Start ClickHouse, Redis and Postgres (docker compose)
+        run: docker compose --profile test up -d --wait clickhouse redis postgres
+
+      # The ClickHouse image restarts its server once after creating the user, and /ping can answer during that window.
+      # Wait for an authenticated query to succeed several times in a row before migrating.
+      - name: Wait for ClickHouse to accept the configured user
+        run: |
+          set -euo pipefail
+          ok=0
+          for i in $(seq 1 60); do
+            if curl -fsS --max-time 3 --user "proba:${CLICKHOUSE_PASSWORD}" "http://127.0.0.1:8123/?query=SELECT%201" >/dev/null 2>&1; then
+              ok=$((ok + 1))
+              [ "$ok" -ge 3 ] && exit 0
+            else
+              ok=0
+            fi
+            sleep 1
+          done
+          echo "ClickHouse did not become ready" >&2
+          exit 1
+
+      # Also creates the append-only users (consumer INSERT+SELECT, api SELECT, migrator DDL) from the role passwords in .env.
       - name: Run migrations (builds first)
         run: npm run migrate
 
@@ -142,6 +154,12 @@ jobs:
       # metrics flow tests (stub -> ingest -> rollup -> read on ClickHouse and Redis).
       - name: Run integration tests (0 skipped)
         run: npm run test:integration:ci
+
+      # .env (from generate-local-env.sh) supplies every ${VAR:?...} so Compose can parse apps-profile
+      # services that are not started under --profile test.
+      - name: Stop the services
+        if: always()
+        run: docker compose --profile test down -v
 
       - name: Upload test reports
         if: always()

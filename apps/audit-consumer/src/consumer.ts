@@ -68,6 +68,15 @@ export interface AuditConsumerOptions {
   maxDeliveries: number;
   /** Reclaim pending messages of crashed consumers this often. */
   reclaimIntervalMs: number;
+  /**
+   * Trim the stream of acknowledged messages this often (EventBus.trimAcknowledged: only what EVERY consumer group acknowledged,
+   * and older than `streamMaxAgeMs`). 0 or omitted: never trim.
+   */
+  trimIntervalMs?: number;
+  /** Acknowledged messages older than this may be trimmed. Default 72 hours. */
+  streamMaxAgeMs?: number;
+  /** Optional ceiling on the stream length for acknowledged messages. */
+  streamMaxLength?: number;
   /** Backoff after a failed batch (store down): starts here, doubles up to the max. */
   retryBaseMs: number;
   retryMaxMs: number;
@@ -253,9 +262,14 @@ export class AuditConsumer {
 
   private async run(): Promise<void> {
     let lastReclaim = 0;
+    let lastTrim = Date.now();
     let idleBackoff = this.o.retryBaseMs;
     while (this.running) {
       try {
+        if (this.o.trimIntervalMs && Date.now() - lastTrim >= this.o.trimIntervalMs) {
+          lastTrim = Date.now();
+          await this.trimStream();
+        }
         const sub = this.subscription as Subscription;
         let messages: BusMessage[] = [];
         if (Date.now() - lastReclaim >= this.o.reclaimIntervalMs) {
@@ -287,6 +301,24 @@ export class AuditConsumer {
         await this.sleep(idleBackoff);
         idleBackoff = Math.min(idleBackoff * 2, this.o.retryMaxMs);
       }
+    }
+  }
+
+  /**
+   * Remove acknowledged messages from the stream (never an unacknowledged one: see EventBus.trimAcknowledged).
+   * A failure here must not stop ingestion, so it is only logged.
+   */
+  async trimStream(): Promise<number> {
+    try {
+      const removed = await this.deps.bus.trimAcknowledged(this.o.topic, {
+        maxAgeMs: this.o.streamMaxAgeMs ?? 72 * 3_600_000,
+        ...(this.o.streamMaxLength !== undefined ? { maxLength: this.o.streamMaxLength } : {}),
+      });
+      if (removed > 0) this.deps.logger.info('trimmed acknowledged messages from the audit stream', { lifecycle: 'stream_trimmed', topic: this.o.topic, removed });
+      return removed;
+    } catch (err) {
+      this.deps.logger.warn('could not trim the audit stream; will retry', { lifecycle: 'stream_trim_failed', topic: this.o.topic, err });
+      return 0;
     }
   }
 

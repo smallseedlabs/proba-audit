@@ -8,6 +8,7 @@ import type {
   ReclaimOptions,
   SubscribeOptions,
   Subscription,
+  TrimOptions,
 } from '@smallseedlabs/proba-audit-core';
 import { SystemClock } from '../runtime/system.js';
 
@@ -79,6 +80,31 @@ export class InMemoryEventBus implements EventBus {
 
   async listDeadLetters<T = unknown>(topic: string, options: { max?: number } = {}): Promise<DeadLetter<T>[]> {
     return (this.topics.get(topic)?.dead ?? []).slice(0, options.max ?? 100) as DeadLetter<T>[];
+  }
+
+  async trimAcknowledged(topic: string, options: TrimOptions): Promise<number> {
+    const t = this.topics.get(topic);
+    if (!t || t.groups.size === 0) return 0;
+    // A message may go only if every group has read it and acknowledged it: the prefix before every group's cursor and oldest pending message.
+    let safe = t.entries.length;
+    for (const g of t.groups.values()) {
+      let bound = g.cursor;
+      if (g.pending.size > 0) {
+        const firstSeq = Math.min(...[...g.pending.values()].map((p) => p.entry.seq));
+        const index = t.entries.findIndex((e) => e.seq === firstSeq);
+        if (index >= 0) bound = Math.min(bound, index);
+      }
+      safe = Math.min(safe, bound);
+    }
+    const cutoffMs = this.clock.now().getTime() - Math.max(0, options.maxAgeMs);
+    let old = 0;
+    while (old < t.entries.length && Date.parse(t.entries[old].publishedAt) <= cutoffMs) old += 1;
+    const beyondLength = options.maxLength !== undefined ? Math.max(0, t.entries.length - options.maxLength) : 0;
+    const count = Math.min(safe, Math.max(old, beyondLength));
+    if (count <= 0) return 0;
+    t.entries.splice(0, count);
+    for (const g of t.groups.values()) g.cursor = Math.max(0, g.cursor - count);
+    return count;
   }
 
   async ping(): Promise<void> {
