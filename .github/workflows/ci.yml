@@ -105,15 +105,23 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      # Throwaway passwords, generated for this run only (masked in the log).
+      # Throwaway passwords for this run. Written to .env so every `docker compose` command (up, down, config)
+      # can interpolate ${VAR:?...} for ALL services — Compose parses the whole file even when only the test
+      # profile runs, so CLICKHOUSE_CONSUMER_PASSWORD and the other role secrets must be present. Also exported
+      # to GITHUB_ENV (with ::add-mask::) for migrate and the host-side tests. generate-local-env.sh sets each
+      # role USER together with its PASSWORD, so loadConfig does not reject a role password without a user.
       - name: Generate throwaway credentials
         run: |
           set -euo pipefail
-          for name in CLICKHOUSE_PASSWORD REDIS_PASSWORD POSTGRES_PASSWORD ANCHOR_DB_PASSWORD ANCHOR_HMAC_KEY; do
-            value="$(openssl rand -hex 24)"
+          scripts/generate-local-env.sh --force
+          while IFS= read -r line || [ -n "$line" ]; do
+            case "$line" in
+              ''|\#*) continue ;;
+            esac
+            value="${line#*=}"
             echo "::add-mask::$value"
-            echo "$name=$value" >> "$GITHUB_ENV"
-          done
+            echo "$line" >> "$GITHUB_ENV"
+          done < .env
 
       - name: Start ClickHouse, Redis and Postgres (docker compose)
         run: docker compose --profile test up -d --wait clickhouse redis postgres
@@ -136,33 +144,9 @@ jobs:
           echo "ClickHouse did not become ready" >&2
           exit 1
 
-      - name: Point the tests at them
-        run: |
-          set -euo pipefail
-          {
-            echo "REDIS_URL=redis://proba:${REDIS_PASSWORD}@127.0.0.1:6379"
-            echo "CLICKHOUSE_URL=http://127.0.0.1:8123"
-            echo "CLICKHOUSE_USER=proba"
-            echo "CLICKHOUSE_DATABASE=proba_audit"
-            echo "OUTBOX_TEST_DATABASE_URL=postgresql://proba:${POSTGRES_PASSWORD}@127.0.0.1:5432/proba_audit_outbox_test"
-          } >> "$GITHUB_ENV"
-
-      # Also creates the append-only users (consumer INSERT+SELECT, api SELECT, migrator DDL) from three role passwords.
-      # The role passwords are generated here and only given to this step: the test step must not see a role password without a
-      # role user (the config rejects that), and the integration test provisions its own users.
+      # Also creates the append-only users (consumer INSERT+SELECT, api SELECT, migrator DDL) from the role passwords in .env.
       - name: Run migrations (builds first)
-        run: |
-          set -euo pipefail
-          for name in CLICKHOUSE_CONSUMER_PASSWORD CLICKHOUSE_API_PASSWORD CLICKHOUSE_MIGRATOR_PASSWORD; do
-            value="$(openssl rand -hex 24)"
-            echo "::add-mask::$value"
-            export "$name=$value"
-          done
-          npm run migrate
-        env:
-          CLICKHOUSE_CONSUMER_USER: proba_consumer
-          CLICKHOUSE_API_USER: proba_api
-          CLICKHOUSE_MIGRATOR_USER: proba_migrator
+        run: npm run migrate
 
       # Runs the adapter contract suites (Redis Streams event bus, ClickHouse audit,
       # metrics, checkpoint and quarantine stores, Postgres outbox), the migration tests,
@@ -171,6 +155,8 @@ jobs:
       - name: Run integration tests (0 skipped)
         run: npm run test:integration:ci
 
+      # .env (from generate-local-env.sh) supplies every ${VAR:?...} so Compose can parse apps-profile
+      # services that are not started under --profile test.
       - name: Stop the services
         if: always()
         run: docker compose --profile test down -v
