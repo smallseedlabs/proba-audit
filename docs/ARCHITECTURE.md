@@ -503,6 +503,8 @@ or the real response bodies drift apart.
 
 **Raw text is admin-only and audited.** Event and trace routes never contain text: an event only says `hasContent: true` (and administrators also see `contentDigest`; viewers never do, since a short guessable message could be confirmed from its digest). The two `/content` routes require the admin role (a viewer gets 403, recorded as `auth.denied`) and are served only when `AUDIT_CONTENT_ENABLED=true`. Every content read is itself an audit event, `audit.event_viewed` or `audit.trace_viewed`, with `details.contentIncluded: true`, the operation, the number of texts and the target, but never the text; if that audit event cannot be sent the read fails, so there is no unaudited read of text.
 
+**Actor ids are role-filtered.** Administrators see the real `actor.id`. Viewers see a stable pseudonymous hash (`actor_<16 hex chars>`, derived from workspace + id) on events, traces and the `actorId` facet, so they can still correlate activity without learning other users' identifiers. A future `AUDIT_API_VIEWER_OWN_EVENTS_ONLY` flag could further restrict viewers to their own events; it is not enabled today.
+
 **No free SQL.** Every route parses its query with a zod schema (`apps/audit-api/src/http/schemas.ts`): unknown parameters are rejected (a `workspaceId`
 parameter is a 400), strings are bounded, page sizes are capped (events 200, traces 100, facets 100 values, campaigns 100 rows), time ranges are
 capped (events 90 days, traces 7 days) and the default range is the last 24 hours. Free text is matched literally (`positionCaseInsensitive`), never as a pattern.
