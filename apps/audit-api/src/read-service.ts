@@ -25,6 +25,7 @@ import {
   type CampaignTotals,
 } from '@smallseedlabs/proba-audit-core';
 import { ApiError } from './http/errors.js';
+import { applyActorVisibility, pseudonymizeActorId } from './http/actor-visibility.js';
 import {
   API_LIMITS,
   eventCursor,
@@ -140,12 +141,17 @@ export interface FacetsResponse extends AuditFacets {
 export class ReadService {
   constructor(private readonly d: ReadServiceDeps) {}
 
-  /** Strip raw text and (for non-admins) the digest, flag text that exists. */
-  private expose(event: StoredAuditEvent, role: string): ApiEvent {
+  /** Strip raw text and (for non-admins) the digest and real actor ids; flag text that exists. */
+  private expose(event: StoredAuditEvent, role: string, workspaceId: string): ApiEvent {
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
     const { content: _content, contentDigest, ...rest } = event;
     const has = this.d.contentEnabled === true && contentDigest !== undefined;
-    return { ...rest, ...(has ? { hasContent: true as const } : {}), ...(has && role === 'admin' ? { contentDigest } : {}) };
+    const visible = applyActorVisibility(
+      { ...rest, ...(has ? { hasContent: true as const } : {}), ...(has && role === 'admin' ? { contentDigest } : {}) },
+      role,
+      workspaceId
+    );
+    return visible;
   }
 
   async searchEvents(ctx: AccessContext, q: EventsQuery, meta: ReadMeta): Promise<EventsPage> {
@@ -181,7 +187,7 @@ export class ReadService {
       meta
     );
     return {
-      events: page.events.map((e) => this.expose(e, meta.role)),
+      events: page.events.map((e) => this.expose(e, meta.role, ctx.workspaceId)),
       nextCursor: page.nextCursor ? eventCursor.encode(page.nextCursor, q.order) : null,
       from: window.from ?? null,
       to: window.to ?? null,
@@ -193,7 +199,7 @@ export class ReadService {
   async getEvent(ctx: AccessContext, eventId: string, meta: ReadMeta): Promise<ApiEvent> {
     const event = await this.d.reader.read(ctx, 'events.get', { eventId }, (e) => (e ? 1 : 0), () => this.d.auditStore.getEvent(ctx.workspaceId, eventId), meta);
     if (!event) throw new ApiError(404, 'not_found', 'There is no event with this id.');
-    return this.expose(event, meta.role);
+    return this.expose(event, meta.role, ctx.workspaceId);
   }
 
   private requireContentEnabled(): AuditContentStore {
@@ -280,7 +286,14 @@ export class ReadService {
       meta
     );
     if (page.events.length === 0) throw new ApiError(404, 'not_found', 'There is no trace with this id.');
-    return buildTraceTree(traceId, page.events, { truncated: page.nextCursor !== null });
+    const tree = buildTraceTree(traceId, page.events, { truncated: page.nextCursor !== null });
+    if (meta.role === 'admin') return tree;
+    const maskNode = (node: (typeof tree.roots)[number]): typeof node => ({
+      ...node,
+      actor: { ...node.actor, id: pseudonymizeActorId(ctx.workspaceId, node.actor.id) },
+      children: node.children.map(maskNode),
+    });
+    return { ...tree, roots: tree.roots.map(maskNode) };
   }
 
   async listTraces(ctx: AccessContext, q: TracesQuery, meta: ReadMeta): Promise<TracesPage> {
@@ -320,7 +333,22 @@ export class ReadService {
       () => this.d.auditStore.facets({ workspaceId: ctx.workspaceId, ...window, limit: q.limit }),
       meta
     );
-    return { ...facets, from: window.from ?? null, to: window.to ?? null, limit: q.limit };
+    if (meta.role === 'admin' || !facets.facets.actorId) {
+      return { ...facets, from: window.from ?? null, to: window.to ?? null, limit: q.limit };
+    }
+    return {
+      ...facets,
+      facets: {
+        ...facets.facets,
+        actorId: facets.facets.actorId.map((v) => ({
+          ...v,
+          value: pseudonymizeActorId(ctx.workspaceId, v.value),
+        })),
+      },
+      from: window.from ?? null,
+      to: window.to ?? null,
+      limit: q.limit,
+    };
   }
 
   /** Verify the caller's workspace chain over a bounded ingestion range. */

@@ -153,6 +153,21 @@ describe('GET /v1/events', () => {
     h = await createHarness();
   });
 
+  it('shows administrators the real actor id and viewers a stable pseudonym', async () => {
+    const { pseudonymizeActorId } = await import('./http/actor-visibility.js');
+    const event = makeEvent({ actor: { type: 'user', id: 'uid-alice' }, occurredAt: '2026-10-25T10:00:00.000Z' });
+    await seed([event]);
+    const admin = await h.get(`/v1/events/${event.eventId}`, TOKENS.admin);
+    const viewer = await h.get(`/v1/events/${event.eventId}`, TOKENS.viewer);
+    expect(admin.body.actor).toEqual({ type: 'user', id: 'uid-alice' });
+    expect(viewer.body.actor).toEqual({ type: 'user', id: pseudonymizeActorId(WORKSPACE, 'uid-alice') });
+    expect(JSON.stringify(viewer.body)).not.toContain('uid-alice');
+    const facets = await h.get(`/v1/facets?${day}`, TOKENS.viewer);
+    expect(facets.body.facets.actorId.map((v: { value: string }) => v.value)).toEqual([
+      pseudonymizeActorId(WORKSPACE, 'uid-alice'),
+    ]);
+  });
+
   it('filters by every supported field and combines them with AND', async () => {
     const goalId = randomUUID();
     const threadId = randomUUID();
