@@ -7,6 +7,7 @@ import {
   AUDIT_QUERY_MAX_LIMIT,
   AUDIT_SEARCH_DEFAULT_LIMIT,
   AUDIT_SEARCH_MAX_LIMIT,
+  OWNED_CAMPAIGNS_MAX_LIMIT,
   TRACE_LIST_DEFAULT_LIMIT,
   TRACE_LIST_MAX_LIMIT,
   type AppendResult,
@@ -24,6 +25,7 @@ import {
   type AuditSearchQuery,
   type AuditStore,
   type ChainHead,
+  type OwnedCampaignsQuery,
   type ReadChainOptions,
   type StoredAuditEvent,
   type TraceListPage,
@@ -183,6 +185,10 @@ export function buildAuditWhere(f: AuditFilter): WhereClause {
   eq('service', 'service', 'String', f.service);
   eq('category', 'category', 'String', f.category);
   eq('action', 'action', 'String', f.action);
+  if (f.actionPrefix !== undefined) {
+    clauses.push('startsWith(toString(action), {actionPrefix:String})');
+    params.actionPrefix = f.actionPrefix;
+  }
   eq('outcome', 'outcome', 'String', f.outcome);
   eq('risk_level', 'riskLevel', 'String', f.riskLevel);
   if (f.from !== undefined) {
@@ -420,6 +426,18 @@ export class ClickHouseAuditStore implements AuditStore {
       clauses.push(`occurred_at < ${TS('to')}`);
       params.to = query.to;
     }
+    if (query.rootActorId !== undefined) {
+      // The root of a trace is its earliest event without a parent span (pickRootEvent). It may lie before the window, so the
+      // root is decided over the whole trace; the inner IN only narrows that to traces the actor appears in.
+      clauses.push(
+        `trace_id IN (SELECT trace_id FROM audit_events
+                      WHERE workspace_id = {workspaceId:String}
+                        AND trace_id IN (SELECT trace_id FROM audit_events WHERE workspace_id = {workspaceId:String} AND actor_id = {rootActorId:String})
+                      GROUP BY trace_id
+                      HAVING argMin(actor_id, tuple(isNotNull(parent_span_id), occurred_at, event_id)) = {rootActorId:String})`
+      );
+      params.rootActorId = query.rootActorId;
+    }
     const having = query.after ? `HAVING (last_at, trace_id) < (${TS('afterAt')}, {afterId:UUID})` : '';
     if (query.after) {
       params.afterAt = query.after.lastEventAt;
@@ -486,6 +504,25 @@ export class ClickHouseAuditStore implements AuditStore {
       traces,
       nextCursor: active.length > limit && tail ? { lastEventAt: tail.last_at, traceId: tail.trace_id } : null,
     };
+  }
+
+  async listOwnedCampaignIds(query: OwnedCampaignsQuery): Promise<string[]> {
+    const limit = Math.min(query.limit ?? OWNED_CAMPAIGNS_MAX_LIMIT, OWNED_CAMPAIGNS_MAX_LIMIT);
+    // goal_id and campaign_id both live on the audit events (idx_goal_id skips granules); the workspace leads the sorting key.
+    const rows = await this.rows<{ campaign_id: string }>(
+      `SELECT DISTINCT campaign_id FROM audit_events
+       WHERE workspace_id = {workspaceId:String}
+         AND campaign_id IS NOT NULL
+         AND goal_id IN (
+           SELECT goal_id FROM audit_events
+           WHERE workspace_id = {workspaceId:String} AND action = 'goal.created' AND goal_id IS NOT NULL
+             AND (actor_id = {ownerId:String} OR toString(user_id) = {ownerId:String})
+         )
+       ORDER BY campaign_id ASC
+       LIMIT {limit:UInt32}`,
+      { workspaceId: query.workspaceId, ownerId: query.ownerId, limit }
+    );
+    return rows.map((r) => r.campaign_id);
   }
 
   async facets(query: AuditFacetsQuery): Promise<AuditFacets> {

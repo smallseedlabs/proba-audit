@@ -38,6 +38,8 @@ export interface AuditFilter {
   service?: string;
   category?: AuditCategory;
   action?: string;
+  /** Actions that start with this text (for example `goal.` for the goal domain). Literal, not a pattern. */
+  actionPrefix?: string;
   outcome?: AuditOutcome;
   riskLevel?: AuditRiskLevel;
   from?: string;

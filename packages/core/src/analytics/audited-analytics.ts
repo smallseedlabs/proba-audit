@@ -74,6 +74,7 @@ export class AuditedAnalyticsReader {
         durationMs: this.clock.now().getTime() - started,
         errorMessage: error?.message.slice(0, 500),
         details: {
+          ...ctx.auditDetails,
           filters: Object.entries(filters)
             .filter(([, v]) => v !== undefined)
             .map(([k]) => k)

@@ -411,6 +411,7 @@ export class ClickHouseMetricsStore implements MetricsStore {
 
   async aggregateRollups(filter: RollupAggregateFilter): Promise<MetricAggregate[]> {
     if (filter.accounts !== undefined && filter.accounts.length === 0) return [];
+    if (filter.campaignIds !== undefined && filter.campaignIds.length === 0) return [];
     const table = filter.bucket === 'hour' ? 'metric_rollups_hourly' : 'metric_rollups_daily';
     const dims = new Set(filter.groupBy);
     const params: Record<string, unknown> = {
@@ -433,6 +434,10 @@ export class ClickHouseMetricsStore implements MetricsStore {
     if (filter.campaignId !== undefined) {
       clauses.push('campaign_id = {campaignId:String}');
       params.campaignId = filter.campaignId;
+    }
+    if (filter.campaignIds !== undefined) {
+      clauses.push('campaign_id IN {campaignIds:Array(String)}');
+      params.campaignIds = [...filter.campaignIds];
     }
     if (filter.sourceGranularity !== undefined) {
       clauses.push('source_granularity = {sourceGranularity:String}');

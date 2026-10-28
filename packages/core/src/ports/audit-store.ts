@@ -18,6 +18,7 @@ import type {
   AuditFacetsQuery,
   AuditSearchPage,
   AuditSearchQuery,
+  OwnedCampaignsQuery,
   TraceListPage,
   TraceListQuery,
 } from '../domain/audit-read.js';
@@ -47,6 +48,12 @@ export interface AuditStore {
    * summary always covers all of the trace's events.
    */
   listTraces(query: TraceListQuery): Promise<TraceListPage>;
+  /**
+   * Campaign ids of the goals `ownerId` owns in `workspaceId`, ascending, at most `limit`. This is the
+   * link between a user and the ad metrics (which carry no goal): audit events carry both a goal id
+   * and a campaign id. A goal is owned by the actor or user of its `goal.created` event.
+   */
+  listOwnedCampaignIds(query: OwnedCampaignsQuery): Promise<string[]>;
   /** Distinct values (with counts) for the filter facets of one workspace, capped per facet. */
   facets(query: AuditFacetsQuery): Promise<AuditFacets>;
   /**
