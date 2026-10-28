@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import cors from '@fastify/cors';
+import rateLimit from '@fastify/rate-limit';
 import {
   ACT_AS_HEADER,
   ANALYTICS_LIMITS,
@@ -252,6 +253,16 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
   // -- Everything under /v1: authenticated, authorised, rate limited, read-only.
   await app.register(
     async (v1) => {
+      // Coarse per-IP ceiling so CodeQL and scanners see a framework rate limit on authorised routes.
+      // Per-user / per-bridge limits below (deps.limiter) remain the primary control.
+      await v1.register(rateLimit, {
+        global: true,
+        max: api.rateLimit.max,
+        timeWindow: api.rateLimit.windowMs,
+        addHeadersOnExceeding: { 'x-ratelimit-limit': true, 'x-ratelimit-remaining': true, 'x-ratelimit-reset': true },
+        addHeaders: { 'x-ratelimit-limit': true, 'x-ratelimit-remaining': true, 'x-ratelimit-reset': true, 'retry-after': true },
+      });
+
       const deny = async (
         request: FastifyRequest,
         reason: string,
@@ -300,7 +311,7 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
        * and the `actorId` / `workspaceId` of the request must say the same. The order is deliberate: the route is checked before
        * anything about the user, so the content, chain and admin routes answer 403 to this role whatever else is sent.
        */
-      const authenticateBridge = async (request: FastifyRequest, reply: FastifyReply, token: string, bridge: ContextBridgeAuth): Promise<FastifyReply | void> => {
+      const admitBridgeCall = async (request: FastifyRequest, reply: FastifyReply, token: string, bridge: ContextBridgeAuth): Promise<FastifyReply | void> => {
         const caller = { type: 'service' as const, id: CONTEXT_READER_ROLE };
         const verifier = bridge.service.name;
         let service;
@@ -377,7 +388,7 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
           return failAuth(request, reply, 401, 'missing_token', 'Sign in to continue.', 'failure');
         }
         const presented = header.replace(/^Bearer\s+/i, '');
-        if (deps.contextBridge?.service.claimsToBeBridge(presented)) return authenticateBridge(request, reply, presented, deps.contextBridge);
+        if (deps.contextBridge?.service.claimsToBeBridge(presented)) return admitBridgeCall(request, reply, presented, deps.contextBridge);
         let identity;
         try {
           identity = await deps.verifier.verify(presented);
