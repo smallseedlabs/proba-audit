@@ -533,6 +533,14 @@ workspace to its accounts.
 - Every response has `X-Trace-Id` (a fresh id; a client-supplied one is ignored), `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`. Logs are structured JSON with the
   `traceId`, the route pattern and query parameter *names* only.
 
+### The `context-reader` service role
+
+The context bridge reads for one user at a time with two credentials: its own EdDSA service token (`Authorization`) and the Hub's EdDSA act-as assertion (`X-Act-As`), with `actorId` and `workspaceId`
+query parameters that must equal the assertion. The role is checked against an allow-list of seven read routes before any other rule (`CONTEXT_READER_ROUTES`), so content, chain verification and administration stay closed to it.
+Reads are scoped in the store query (workspace and actor are mandatory; traces by their root actor; analytics by the campaigns of the goals the user owns, via `AuditStore.listOwnedCampaignIds` and `AnalyticsScope.campaignIds`),
+never filtered after the fact, and carry no raw text or digest. Verification lives behind the `ContextServiceVerifier` and `ActAsVerifier` ports (`packages/core/src/ports/context-bridge-auth.ts`; jose adapters in `packages/adapters/src/auth`),
+with public keys read from files at start-up. Setup, key generation and the exact behaviour are in [`CONTEXT_READER.md`](CONTEXT_READER.md).
+
 ### Store reads (ports)
 
 The `AuditStore` port gained `search` (keyset, `ORDER BY occurred_at, event_id` which is the table's sorting key), `getEvent`, `listTraces` (two steps: the newest trace ids in the window, then

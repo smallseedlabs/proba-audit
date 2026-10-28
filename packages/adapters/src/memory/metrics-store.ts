@@ -181,6 +181,7 @@ export class InMemoryMetricsStore implements MetricsStore {
 
   async aggregateRollups(filter: RollupAggregateFilter): Promise<MetricAggregate[]> {
     const limit = Math.min(filter.limit ?? METRIC_QUERY_DEFAULT_LIMIT, METRIC_QUERY_MAX_LIMIT);
+    const campaignIds = filter.campaignIds === undefined ? undefined : new Set(filter.campaignIds);
     const accounts = filter.accounts === undefined ? undefined : new Set(filter.accounts.map((a) => `${a.platform}|${a.accountId}`));
     const dims = new Set(filter.groupBy);
     const groups = new Map<string, MetricAggregate & { hasVideo: boolean; hasRevenue: boolean }>();
@@ -194,6 +195,7 @@ export class InMemoryMetricsStore implements MetricsStore {
       }
       if (accounts && !accounts.has(`${r.platform}|${r.accountId}`)) continue;
       if (filter.campaignId !== undefined && r.campaignId !== filter.campaignId) continue;
+      if (campaignIds && !campaignIds.has(r.campaignId)) continue;
       if (filter.sourceGranularity !== undefined && r.sourceGranularity !== filter.sourceGranularity) continue;
       const bucket = dims.has('bucket') ? (filter.bucket === 'day' ? (r.bucketDate ?? r.bucketStart.slice(0, 10)) : r.bucketStart) : undefined;
       const id = [

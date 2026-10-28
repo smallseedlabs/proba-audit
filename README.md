@@ -41,7 +41,7 @@ docker compose --profile apps down
 
 ### Read API
 
-`audit-api` serves versioned, read-only routes under `/v1` (events, traces, chain verification, analytics, facets); the contract is
+`audit-api` serves versioned, read-only routes under `/v1` (events, traces, chain verification, analytics, facets), and, behind a flag, a narrow service role for the context bridge ([docs/CONTEXT_READER.md](docs/CONTEXT_READER.md)); the contract is
 [docs/openapi.yaml](docs/openapi.yaml). Callers sign in with the same Firebase ID token as the Proba Hub:
 
 ```bash

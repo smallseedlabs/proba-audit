@@ -30,11 +30,14 @@ import {
   SystemClock,
   clickHouseMigrationDb,
   createClickHouseClient,
+  createContextBridgeAuth,
+  createContextBridgeSigners,
   createFakeFirebaseIssuer,
   ensureDatabase,
   loadMigrations,
   runMigrations,
   type ClickHouseOptions,
+  type ContextBridgeSigners,
   type FakeFirebaseIssuer,
 } from '@smallseedlabs/proba-audit-adapters';
 import { buildServer } from './server.js';
@@ -73,6 +76,19 @@ const config = loadConfig(
   { serviceName: 'audit-api' }
 );
 
+// The context-reader role: two users of one workspace, each with a goal, a campaign and a trace.
+const BRIDGE_WORKSPACE = `ws-bridge-${run}`;
+const USER_A = randomUUID();
+const USER_B = randomUUID();
+const GOAL_OF_A = randomUUID();
+const GOAL_OF_B = randomUUID();
+const TRACE_OF_A = randomUUID();
+const TRACE_OF_B = randomUUID();
+const CANARY = `canary-${run}`;
+const bridgeEvents = { ownA: randomUUID(), ownB: randomUUID() };
+
+let signers: ContextBridgeSigners;
+let bridgeApp: FastifyInstance;
 let issuer: FakeFirebaseIssuer;
 let app: FastifyInstance;
 let bus: RedisStreamsEventBus;
@@ -192,9 +208,87 @@ beforeAll(async () => {
       { name: 'eventBus', check: () => bus.ping() },
     ],
   });
+
+  // The same stores, read through the context bridge's two credentials. The bridge workspace owns the ad account too, and its
+  // goals tie each user to their campaigns: A to cmp_big, B to cmp_small.
+  const person = (id: string) => ({ type: 'user' as const, id });
+  await store.appendBatch(
+    chainAll([
+      ev({ workspaceId: BRIDGE_WORKSPACE, eventId: bridgeEvents.ownA, traceId: TRACE_OF_A, spanId: span(1), actor: person(USER_A), userId: USER_A, action: 'goal.created', goalId: GOAL_OF_A, occurredAt: minutesAgo(50) }),
+      ev({ workspaceId: BRIDGE_WORKSPACE, traceId: TRACE_OF_A, spanId: span(2), parentSpanId: span(1), actor: { type: 'brain', id: 'brain' }, action: 'campaign.created', category: 'brain', goalId: GOAL_OF_A, campaignId: 'cmp_big', occurredAt: minutesAgo(49) }),
+      ev({ workspaceId: BRIDGE_WORKSPACE, traceId: randomUUID(), spanId: span(1), actor: person(USER_A), action: 'thread.message_received', goalId: GOAL_OF_A, occurredAt: minutesAgo(48) }),
+      ev({ workspaceId: BRIDGE_WORKSPACE, eventId: bridgeEvents.ownB, traceId: TRACE_OF_B, spanId: span(1), actor: person(USER_B), userId: USER_B, action: 'goal.created', goalId: GOAL_OF_B, occurredAt: minutesAgo(47), details: { note: CANARY } }),
+      ev({ workspaceId: BRIDGE_WORKSPACE, traceId: TRACE_OF_B, spanId: span(2), parentSpanId: span(1), actor: { type: 'brain', id: 'brain' }, action: 'campaign.created', category: 'brain', goalId: GOAL_OF_B, campaignId: 'cmp_small', occurredAt: minutesAgo(46) }),
+    ])
+  );
+  await metrics.upsertObservations(BRIDGE_WORKSPACE, [
+    ...observations,
+    makeObservation({ accountId: `act_foreign_${run}`, campaignId: 'cmp_foreign', periodStart: hourStart(2), periodEnd: hourStart(1), metrics: { impressions: 999999, clicks: 1, spend: 999, conversions: 1 } }),
+  ]);
+  await metrics.computeRollups({ workspaceId: BRIDGE_WORKSPACE, bucket: 'hour', ...window });
+  signers = await createContextBridgeSigners();
+  const bridgeConfig = loadConfig(
+    {
+      ...env,
+      NODE_ENV: 'test',
+      LOG_LEVEL: 'silent',
+      FIREBASE_PROJECT_ID: PROJECT,
+      AUDIT_API_ALLOWED_EMAILS: 'viewer@insights.example',
+      AUDIT_API_WORKSPACE_ID: BRIDGE_WORKSPACE,
+      AUDIT_API_SCOPE_SOURCE: 'static',
+      AUDIT_API_ANALYTICS_ACCOUNTS: `meta:${ACCOUNT}`,
+      AUDIT_API_RATE_LIMIT_MAX: '1000',
+      AUDIT_API_AUTH_FAILURE_LIMIT_MAX: '1000',
+      AUDIT_API_CONTEXT_READER_ENABLED: 'true',
+      CONTEXT_SERVICE_PUBLIC_KEY_FILE: await signers.service.writeJwks(),
+      HUB_ASSERTION_PUBLIC_KEY_FILE: await signers.hub.writeJwks(),
+      AUDIT_TOPIC: topic,
+    },
+    { serviceName: 'audit-api' }
+  );
+  const contextBridge = await createContextBridgeAuth(bridgeConfig);
+  if (!contextBridge) throw new Error('the context-reader role is not enabled');
+  bridgeApp = await buildServer({
+    config: bridgeConfig,
+    logger,
+    clock,
+    verifier: new FirebaseTokenVerifier({ projectId: PROJECT, keys: issuer.keys }),
+    contextBridge,
+    limiter: new RedisRateLimiter({ url: redisUrl, keyPrefix: `api-it-bridge:${run}:` }),
+    auditStore: store,
+    metricsStore: metrics,
+    scope: createStaticScope(BRIDGE_WORKSPACE, bridgeConfig.api.analyticsAccounts).resolve,
+    emitter: createBusAuditEmitter({ ...emitterDeps, defaultWorkspaceId: BRIDGE_WORKSPACE, failureMode: 'throw' }),
+    bestEffortEmitter: createBusAuditEmitter({ ...emitterDeps, defaultWorkspaceId: BRIDGE_WORKSPACE, failureMode: 'swallow' }),
+    readiness: [],
+  });
 });
 
+/** A call as the context bridge, acting for `actorId` in the bridge workspace unless said otherwise. */
+async function asContextReader(
+  path: string,
+  actorId: string,
+  over: { query?: string; assertion?: Record<string, unknown> | null; workspaceId?: string } = {}
+): Promise<{ status: number; body: any; headers: Record<string, any> }> {
+  const workspaceId = over.workspaceId ?? BRIDGE_WORKSPACE;
+  const assertion = over.assertion === null ? null : await signers.mintAssertion({ sub: actorId, workspaceId, ...over.assertion });
+  const query = over.query ?? `actorId=${actorId}&workspaceId=${workspaceId}`;
+  const res = await bridgeApp.inject({
+    method: 'GET',
+    url: `${path}${path.includes('?') ? '&' : '?'}${query}`,
+    headers: { authorization: `Bearer ${await signers.mintServiceToken()}`, ...(assertion ? { 'x-act-as': assertion } : {}) },
+  });
+  let body: unknown;
+  try {
+    body = res.json();
+  } catch {
+    body = res.body;
+  }
+  return { status: res.statusCode, body, headers: res.headers as Record<string, any> };
+}
+
 afterAll(async () => {
+  await bridgeApp?.close();
   await app?.close();
   await Promise.allSettled([limiter?.close(), store?.close(), metrics?.close(), bus?.close()]);
 });
@@ -360,6 +454,103 @@ describe('audit API on ClickHouse and Redis', () => {
       expect(Number(retryAfter)).toBeGreaterThanOrEqual(1);
     } finally {
       await limited.close();
+    }
+  });
+});
+
+describe('context-reader role on ClickHouse and Redis', () => {
+  it('returns only the acting user`s events, never another user`s, text or digest', async () => {
+    const a = await asContextReader('/v1/events', USER_A);
+    expect(a.status).toBe(200);
+    expect(a.body.events.map((e: any) => e.actor.id)).toEqual([USER_A, USER_A]);
+    expect(new Set(a.body.events.map((e: any) => e.workspaceId))).toEqual(new Set([BRIDGE_WORKSPACE]));
+    const text = JSON.stringify(a.body);
+    for (const absent of [USER_B, GOAL_OF_B, CANARY, 'contentDigest', 'hasContent']) expect(text).not.toContain(absent);
+
+    const b = await asContextReader('/v1/events', USER_B);
+    expect(b.body.events.map((e: any) => e.eventId)).toEqual([bridgeEvents.ownB]);
+    expect(JSON.stringify(b.body)).not.toContain(USER_A);
+  });
+
+  it('filters by goal and action prefix, and caps the page size', async () => {
+    const byGoal = await asContextReader(`/v1/events?goalId=${GOAL_OF_A}&actionPrefix=goal.`, USER_A);
+    expect(byGoal.body.events.map((e: any) => e.eventId)).toEqual([bridgeEvents.ownA]);
+    expect((await asContextReader(`/v1/events?goalId=${GOAL_OF_B}`, USER_A)).body.events).toEqual([]);
+    expect((await asContextReader('/v1/events?limit=1', USER_A)).body.events).toHaveLength(1);
+    expect((await asContextReader('/v1/events?limit=101', USER_A)).status).toBe(400);
+  });
+
+  it('answers 404 for another user`s event and for another workspace`s, and 200 for the user`s own', async () => {
+    expect((await asContextReader(`/v1/events/${bridgeEvents.ownA}`, USER_A)).status).toBe(200);
+    expect((await asContextReader(`/v1/events/${bridgeEvents.ownB}`, USER_A)).status).toBe(404);
+    const elsewhere = (await store.search({ workspaceId: WORKSPACE, limit: 1 })).events[0] as StoredAuditEvent;
+    expect((await asContextReader(`/v1/events/${elsewhere.eventId}`, USER_A)).status).toBe(404);
+  });
+
+  it('lists and opens only traces the user started', async () => {
+    const list = await asContextReader('/v1/traces', USER_A);
+    expect(list.status).toBe(200);
+    expect(list.body.traces.map((t: any) => t.traceId)).toEqual(expect.arrayContaining([TRACE_OF_A]));
+    expect(list.body.traces.map((t: any) => t.traceId)).not.toContain(TRACE_OF_B);
+    expect((await asContextReader(`/v1/traces/${TRACE_OF_A}`, USER_A)).status).toBe(200);
+    expect((await asContextReader(`/v1/traces/${TRACE_OF_B}`, USER_A)).status).toBe(404);
+    expect(JSON.stringify((await asContextReader('/v1/traces', USER_A)).body)).not.toContain(USER_B);
+  });
+
+  it('serves analytics for the campaigns of the user`s goals only', async () => {
+    const hour = new Date();
+    hour.setUTCMinutes(0, 0, 0);
+    const range = `from=${new Date(hour.getTime() - 24 * 3_600_000).toISOString()}&to=${new Date(hour.getTime() + 3_600_000).toISOString()}&granularity=hour`;
+    const a = await asContextReader(`/v1/analytics/summary?${range}`, USER_A);
+    expect(a.status).toBe(200);
+    expect(a.body.campaigns.map((c: any) => c.campaignId)).toEqual(['cmp_big']);
+    expect(a.body.totals).toEqual([expect.objectContaining({ impressions: 5000, spend: 25 })]);
+    const b = await asContextReader(`/v1/analytics/campaigns?${range}`, USER_B);
+    expect(b.body.campaigns.map((c: any) => c.campaignId)).toEqual(['cmp_small']);
+    for (const res of [a, b]) expect(JSON.stringify(res.body)).not.toContain('cmp_foreign');
+    expect((await asContextReader(`/v1/analytics/compare?granularity=hour&currentFrom=${new Date(hour.getTime() - 4 * 3_600_000).toISOString()}&currentTo=${new Date(hour.getTime() + 3_600_000).toISOString()}`, USER_A)).status).toBe(200);
+  });
+
+  it('sees nothing of a user who owns no goal, and nothing from another workspace', async () => {
+    const stranger = randomUUID();
+    const hour = new Date();
+    hour.setUTCMinutes(0, 0, 0);
+    const range = `from=${new Date(hour.getTime() - 24 * 3_600_000).toISOString()}&to=${new Date(hour.getTime() + 3_600_000).toISOString()}&granularity=hour`;
+    expect((await asContextReader('/v1/events', stranger)).body.events).toEqual([]);
+    expect((await asContextReader(`/v1/analytics/campaigns?${range}`, stranger)).body.campaigns).toEqual([]);
+    // The main workspace's events belong to nobody who acts here.
+    expect((await asContextReader('/v1/events', USER_A, { workspaceId: WORKSPACE })).body.events).toEqual([]);
+  });
+
+  it('refuses missing and mismatched parameters, a wrong assertion and routes outside its allow-list', async () => {
+    expect((await asContextReader('/v1/events', USER_A, { query: 'limit=5' })).status).toBe(400);
+    expect((await asContextReader('/v1/events', USER_A, { assertion: null })).status).toBe(400);
+    expect((await asContextReader('/v1/events', USER_A, { query: `actorId=${USER_B}&workspaceId=${BRIDGE_WORKSPACE}` })).status).toBe(403);
+    expect((await asContextReader('/v1/events', USER_A, { query: `actorId=${USER_A}&workspaceId=${WORKSPACE}` })).status).toBe(403);
+    expect((await asContextReader('/v1/events', USER_A, { assertion: { aud: ['proba-context'] } })).status).toBe(403);
+    expect((await asContextReader('/v1/events', USER_A, { assertion: { expOffset: -120, iatOffset: -240 } })).status).toBe(403);
+    for (const path of [`/v1/events/${bridgeEvents.ownA}/content`, '/v1/chain/verify', '/v1/facets', '/v1/session']) {
+      expect((await asContextReader(path, USER_A)).status, path).toBe(403);
+    }
+  });
+
+  it('records each read with the caller and the assertion`s jti, and nothing of the data', async () => {
+    const sub = await bus.subscribe({ topic, group: uniqueName('bridge-reader'), consumer: 'c1', startFrom: 'earliest' });
+    try {
+      const jti = randomUUID();
+      const res = await asContextReader(`/v1/events/${bridgeEvents.ownA}`, USER_A, { assertion: { jti } });
+      const traceId = res.headers['x-trace-id'];
+      let mine: AuditEvent | undefined;
+      for (let i = 0; i < 20 && !mine; i += 1) {
+        const messages = await sub.read<AuditEvent>({ max: 100, blockMs: 100 });
+        mine = messages.map((m) => m.payload).find((e) => e.traceId === traceId);
+        await sub.ack(messages.map((m) => m.id));
+      }
+      expect(mine).toMatchObject({ action: 'audit.event_viewed', workspaceId: BRIDGE_WORKSPACE, service: 'audit-api', actor: { type: 'service', id: 'context-reader' }, userId: USER_A });
+      expect((mine as AuditEvent).details).toMatchObject({ caller: 'context-reader', assertionJti: jti });
+      expect(JSON.stringify(mine)).not.toContain(CANARY);
+    } finally {
+      await sub.close();
     }
   });
 });

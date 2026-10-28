@@ -151,3 +151,6 @@ vite.config.ts.timestamp-*
 # Test reports
 test-reports/
 *.tsbuildinfo
+
+# Private signing keys (the context bridge's and the Hub's); only public key sets are ever shared
+*.private.pem

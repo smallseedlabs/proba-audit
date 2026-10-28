@@ -1,0 +1,94 @@
+{
+  "description": "The user's own events whose action starts with goal., newest first. Never raw text, contentDigest or hasContent.",
+  "request": {
+    "method": "GET",
+    "path": "/v1/events",
+    "query": {
+      "actorId": "660e8400-e29b-41d4-a716-446655440001",
+      "workspaceId": "seedbed",
+      "actionPrefix": "goal.",
+      "limit": "10",
+      "since": "2026-10-25T00:00:00Z"
+    },
+    "headers": {
+      "Authorization": "Bearer <service token>",
+      "X-Act-As": "<act-as assertion>"
+    }
+  },
+  "response": {
+    "status": 200,
+    "body": {
+      "events": [
+        {
+          "eventId": "aa0e8400-e29b-41d4-a716-000000000003",
+          "traceId": "990e8400-e29b-41d4-a716-446655440004",
+          "workspaceId": "seedbed",
+          "actor": {
+            "type": "user",
+            "id": "660e8400-e29b-41d4-a716-446655440001"
+          },
+          "service": "hub",
+          "action": "goal.updated",
+          "category": "command",
+          "outcome": "success",
+          "occurredAt": "2026-10-25T10:03:00.000Z",
+          "details": {},
+          "spanId": "c000000000000001",
+          "goalId": "770e8400-e29b-41d4-a716-446655440002",
+          "threadId": "880e8400-e29b-41d4-a716-446655440003",
+          "durationMs": 12,
+          "version": 1,
+          "tags": [
+            "category:command",
+            "outcome:success",
+            "service:hub"
+          ],
+          "prevHash": "ef2985b1eb49d53811790389a2b1af3298fbe9341aec23d925018659f367c1de",
+          "ingestedAt": "2026-10-25T10:00:02.000Z",
+          "schemaVersion": 1,
+          "hash": "1b2ac8c7fb095bdd7b38f9f31868426e43e4b215e471e1ceb99e0ad4ec58672a"
+        },
+        {
+          "eventId": "aa0e8400-e29b-41d4-a716-000000000001",
+          "traceId": "aa0e8400-e29b-41d4-a716-000000000065",
+          "workspaceId": "seedbed",
+          "actor": {
+            "type": "user",
+            "id": "660e8400-e29b-41d4-a716-446655440001"
+          },
+          "service": "hub",
+          "action": "goal.created",
+          "category": "command",
+          "outcome": "success",
+          "occurredAt": "2026-10-25T10:00:00.000Z",
+          "details": {
+            "source": "portal"
+          },
+          "spanId": "c000000000000001",
+          "userId": "660e8400-e29b-41d4-a716-446655440001",
+          "goalId": "770e8400-e29b-41d4-a716-446655440002",
+          "threadId": "880e8400-e29b-41d4-a716-446655440003",
+          "target": {
+            "type": "goal",
+            "id": "770e8400-e29b-41d4-a716-446655440002"
+          },
+          "version": 1,
+          "tags": [
+            "category:command",
+            "outcome:success",
+            "service:hub"
+          ],
+          "prevHash": null,
+          "ingestedAt": "2026-10-25T10:00:00.000Z",
+          "schemaVersion": 1,
+          "hash": "efa7b10fa1af4021be807b45bbf096c9f689cd11d7f424a5dcbcff309c7095e3"
+        }
+      ],
+      "nextCursor": null,
+      "from": "2026-10-25T00:00:00.000Z",
+      "to": null,
+      "order": "desc",
+      "limit": 10
+    }
+  }
+}

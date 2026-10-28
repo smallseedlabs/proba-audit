@@ -1,0 +1,77 @@
+{
+  "description": "A trace the user started, as a span tree. Actors other than the user have pseudonymous ids.",
+  "request": {
+    "method": "GET",
+    "path": "/v1/traces/990e8400-e29b-41d4-a716-446655440004",
+    "query": {
+      "actorId": "660e8400-e29b-41d4-a716-446655440001",
+      "workspaceId": "seedbed"
+    },
+    "headers": {
+      "Authorization": "Bearer <service token>",
+      "X-Act-As": "<act-as assertion>"
+    }
+  },
+  "response": {
+    "status": 200,
+    "body": {
+      "traceId": "990e8400-e29b-41d4-a716-446655440004",
+      "startedAt": "2026-10-25T10:03:00.000Z",
+      "endedAt": "2026-10-25T10:04:00.850Z",
+      "durationMs": 60850,
+      "eventCount": 2,
+      "outcome": "success",
+      "truncated": false,
+      "roots": [
+        {
+          "eventId": "aa0e8400-e29b-41d4-a716-000000000003",
+          "spanId": "c000000000000001",
+          "action": "goal.updated",
+          "service": "hub",
+          "category": "command",
+          "outcome": "success",
+          "actor": {
+            "type": "user",
+            "id": "660e8400-e29b-41d4-a716-446655440001"
+          },
+          "goalId": "770e8400-e29b-41d4-a716-446655440002",
+          "threadId": "880e8400-e29b-41d4-a716-446655440003",
+          "startedAt": "2026-10-25T10:03:00.000Z",
+          "offsetMs": 0,
+          "durationMs": 12,
+          "subtreeOutcome": "success",
+          "children": [
+            {
+              "eventId": "aa0e8400-e29b-41d4-a716-000000000004",
+              "spanId": "c000000000000002",
+              "parentSpanId": "c000000000000001",
+              "action": "brain.reply_generated",
+              "service": "hub",
+              "category": "brain",
+              "outcome": "success",
+              "actor": {
+                "type": "brain",
+                "id": "actor_517747cafb08b6e0"
+              },
+              "goalId": "770e8400-e29b-41d4-a716-446655440002",
+              "startedAt": "2026-10-25T10:04:00.000Z",
+              "offsetMs": 60000,
+              "durationMs": 850,
+              "subtreeOutcome": "success",
+              "children": []
+            }
+          ]
+        }
+      ],
+      "related": {
+        "goalIds": [
+          "770e8400-e29b-41d4-a716-446655440002"
+        ],
+        "threadIds": [
+          "880e8400-e29b-41d4-a716-446655440003"
+        ],
+        "campaignIds": []
+      }
+    }
+  }
+}

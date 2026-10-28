@@ -23,6 +23,11 @@ export interface AnalyticsScope {
   readonly workspaceId: string;
   /** The ad accounts that belong to the workspace. An empty list sees nothing. */
   readonly accounts: readonly AccountRef[];
+  /**
+   * Narrows the accounts to these campaigns (the campaigns of the goals one user owns). Omitted: every campaign of the
+   * accounts. An empty list sees nothing. A query that names another campaign finds nothing.
+   */
+  readonly campaignIds?: readonly string[];
 }
 
 /** Caps that keep one read bounded. Exported so docs, UIs and tests agree with the code. */
@@ -30,6 +35,7 @@ export const ANALYTICS_LIMITS = {
   /** Longest range per granularity, in days (hourly: 14 days = 336 buckets, daily: 366 buckets). */
   maxRangeDays: { hour: 14, day: 366 },
   maxAccountsInScope: 500,
+  maxCampaignsInScope: 500,
   maxCampaignIdLength: 128,
   /** Campaign rows returned by getMetricsSummary (highest spend first). */
   maxCampaignRows: 200,
@@ -212,7 +218,7 @@ export class MetricsAnalytics {
     this.checkScope(scope);
     const q = this.parseSummary(query);
     const accounts = scope.accounts;
-    const common = { workspaceId: scope.workspaceId, bucket: q.granularity, from: q.from, to: q.to, accounts, sourceGranularity: this.source, ...(q.campaignId ? { campaignId: q.campaignId } : {}) } as const;
+    const common = { workspaceId: scope.workspaceId, bucket: q.granularity, from: q.from, to: q.to, accounts, sourceGranularity: this.source, ...(q.campaignId ? { campaignId: q.campaignId } : {}), ...(scope.campaignIds ? { campaignIds: scope.campaignIds } : {}) } as const;
 
     const [total, series, byCampaign] = await Promise.all([
       this.store.aggregateRollups({ ...common, groupBy: [] }),
@@ -281,6 +287,9 @@ export class MetricsAnalytics {
 
   private checkScope(scope: AnalyticsScope): void {
     if (!scope.workspaceId) throw new AnalyticsValidationError([{ path: 'scope.workspaceId', message: 'required' }]);
+    if (scope.campaignIds && scope.campaignIds.length > ANALYTICS_LIMITS.maxCampaignsInScope) {
+      throw new AnalyticsValidationError([{ path: 'scope.campaignIds', message: `at most ${ANALYTICS_LIMITS.maxCampaignsInScope} campaigns` }]);
+    }
     if (scope.accounts.length > ANALYTICS_LIMITS.maxAccountsInScope) {
       throw new AnalyticsValidationError([{ path: 'scope.accounts', message: `at most ${ANALYTICS_LIMITS.maxAccountsInScope} accounts` }]);
     }

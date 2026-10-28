@@ -21,6 +21,9 @@ export const API_LIMITS = {
   traces: { defaultPageSize: 25, maxPageSize: 100, maxRangeDays: 7, defaultRangeHours: 24 },
   facets: { defaultValues: 50, maxValues: 100, maxRangeDays: 90, defaultRangeHours: 24 * 7 },
   campaigns: { defaultRows: 20, maxRows: 100 },
+  /** The `context-reader` role: smaller pages, shorter default look-back. */
+  contextReader: { defaultPageSize: 25, maxPageSize: 100, maxRangeDays: 90, defaultRangeHours: 24 * 7 },
+  contextReaderTraces: { defaultPageSize: 25, maxPageSize: 50, maxRangeDays: 7, defaultRangeHours: 24 },
   text: { min: 2, max: 100 },
   idMaxLength: 128,
   cursorMaxLength: 512,
@@ -67,6 +70,36 @@ export const eventsQuerySchema = z
   })
   .strict();
 export type EventsQuery = z.output<typeof eventsQuerySchema>;
+
+/**
+ * The `context-reader` role's own parameters (its `actorId` and `workspaceId` are taken off the query before it is parsed:
+ * they are checked against the assertion, see `readActAsParams`). Text is never searched, and the actor is not a filter:
+ * it is always the user the call acts for.
+ */
+export const contextEventsQuerySchema = z
+  .object({
+    goalId: uuid.optional(),
+    /** Only actions that start with this, for example `goal.` or `campaign.`. */
+    actionPrefix: z.string().min(1).max(64).regex(/^[a-z0-9_.-]+$/, 'lower-case dotted action name prefix').optional(),
+    /** Events at or after this moment. Without it, the last 7 days (a goal lookup needs no range). */
+    since: isoUtc.optional(),
+    limit: limit(API_LIMITS.contextReader.defaultPageSize, API_LIMITS.contextReader.maxPageSize),
+    cursor: cursor.optional(),
+  })
+  .strict();
+export type ContextEventsQuery = z.output<typeof contextEventsQuerySchema>;
+
+export const contextTracesQuerySchema = z
+  .object({
+    since: isoUtc.optional(),
+    limit: limit(API_LIMITS.contextReaderTraces.defaultPageSize, API_LIMITS.contextReaderTraces.maxPageSize),
+    cursor: cursor.optional(),
+  })
+  .strict();
+export type ContextTracesQuery = z.output<typeof contextTracesQuerySchema>;
+
+/** The two parameters every `context-reader` call carries; checked against the assertion before any route runs. */
+export const actAsParamsSchema = z.object({ actorId: z.string().min(1).max(API_LIMITS.idMaxLength), workspaceId: z.string().min(1).max(API_LIMITS.idMaxLength) });
 
 export const tracesQuerySchema = z
   .object({

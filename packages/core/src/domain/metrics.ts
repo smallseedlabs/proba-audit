@@ -124,6 +124,8 @@ export interface RollupAggregateFilter {
   /** Only these accounts. Omit for all (internal use); an empty list matches nothing. */
   accounts?: readonly AccountRef[];
   campaignId?: string;
+  /** Only these campaigns. Omit for all; an empty list matches nothing. Combines with `campaignId` (both must hold). */
+  campaignIds?: readonly string[];
   /** Only rollups summed from observations of this granularity (avoids mixing hourly and daily sources). */
   sourceGranularity?: MetricGranularity;
   /** Default 1000, maximum 10000. */

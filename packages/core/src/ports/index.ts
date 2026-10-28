@@ -14,3 +14,4 @@ export * from './checkpoint-store.js';
 export * from './quarantine-store.js';
 export * from './token-verifier.js';
 export * from './rate-limiter.js';
+export * from './context-bridge-auth.js';

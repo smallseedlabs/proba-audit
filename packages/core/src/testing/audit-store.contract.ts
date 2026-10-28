@@ -361,6 +361,108 @@ export function runAuditStoreContract(name: string, factory: () => Promise<Audit
         expect(await q({ to: t(2) })).toEqual(['campaign.launched']);
       });
 
+      it('searches by action prefix, literally, inside the workspace', async () => {
+        const store = await create();
+        const workspaceId = uniqueName('ws');
+        await store.appendBatch([
+          makeStoredAuditEvent({ workspaceId, occurredAt: t(1), action: 'goal.created', category: 'command' }),
+          makeStoredAuditEvent({ workspaceId, occurredAt: t(2), action: 'goal.updated', category: 'command' }),
+          makeStoredAuditEvent({ workspaceId, occurredAt: t(3), action: 'goals.listed', category: 'command' }),
+          makeStoredAuditEvent({ workspaceId, occurredAt: t(4), action: 'campaign.created', category: 'command' }),
+          makeStoredAuditEvent({ workspaceId: uniqueName('ws'), occurredAt: t(5), action: 'goal.created', category: 'command' }),
+        ]);
+        const q = async (actionPrefix: string) => (await store.search({ workspaceId, actionPrefix, order: 'asc' })).events.map((e) => e.action);
+        expect(await q('goal.')).toEqual(['goal.created', 'goal.updated']);
+        expect(await q('goal')).toEqual(['goal.created', 'goal.updated', 'goals.listed']);
+        expect(await q('oal.')).toEqual([]);
+        expect(await q('goal._')).toEqual([]);
+        expect(await q('%')).toEqual([]);
+      });
+
+      it('searches the events of one actor in one workspace only', async () => {
+        const store = await create();
+        const workspaceId = uniqueName('ws');
+        const other = uniqueName('ws');
+        const user = { type: 'user' as const, id: uniqueName('user') };
+        await store.appendBatch([
+          makeStoredAuditEvent({ workspaceId, occurredAt: t(1), actor: user }),
+          makeStoredAuditEvent({ workspaceId, occurredAt: t(2), actor: { type: 'user', id: uniqueName('user') } }),
+          makeStoredAuditEvent({ workspaceId: other, occurredAt: t(3), actor: user }),
+        ]);
+        const page = await store.search({ workspaceId, actorId: user.id });
+        expect(page.events).toHaveLength(1);
+        expect(page.events[0].workspaceId).toBe(workspaceId);
+        expect((await store.search({ workspaceId: uniqueName('ws'), actorId: user.id })).events).toEqual([]);
+      });
+
+      it('lists only the traces whose root event was written by the actor, wherever the actor appears', async () => {
+        const store = await create();
+        const workspaceId = uniqueName('ws');
+        const ana = uniqueName('user');
+        const bo = uniqueName('user');
+        const own = randomUUID();
+        const joined = randomUUID();
+        const early = randomUUID();
+        const foreign = randomUUID();
+        await store.appendBatch([
+          makeStoredAuditEvent({ workspaceId, traceId: own, spanId: '1000000000000001', occurredAt: t(1), actor: { type: 'user', id: ana } }),
+          makeStoredAuditEvent({ workspaceId, traceId: own, spanId: '1000000000000002', parentSpanId: '1000000000000001', occurredAt: t(2), actor: { type: 'brain', id: 'b-1' } }),
+          // Bo started it; Ana only answered.
+          makeStoredAuditEvent({ workspaceId, traceId: joined, spanId: '2000000000000001', occurredAt: t(3), actor: { type: 'user', id: bo } }),
+          makeStoredAuditEvent({ workspaceId, traceId: joined, spanId: '2000000000000002', parentSpanId: '2000000000000001', occurredAt: t(4), actor: { type: 'user', id: ana } }),
+          // Ana started it before the window; the event inside the window is somebody else's.
+          makeStoredAuditEvent({ workspaceId, traceId: early, spanId: '3000000000000001', occurredAt: t(0), actor: { type: 'user', id: ana } }),
+          makeStoredAuditEvent({ workspaceId, traceId: early, spanId: '3000000000000002', parentSpanId: '3000000000000001', occurredAt: t(6), actor: { type: 'brain', id: 'b-1' } }),
+          // Ana's trace in another workspace.
+          makeStoredAuditEvent({ workspaceId: uniqueName('ws'), traceId: foreign, spanId: '4000000000000001', occurredAt: t(5), actor: { type: 'user', id: ana } }),
+        ]);
+        const ids = async (rootActorId: string) => (await store.listTraces({ workspaceId, rootActorId, from: t(1), to: t(10) })).traces.map((x) => x.traceId);
+        expect(await ids(ana)).toEqual([early, own]);
+        expect(await ids(bo)).toEqual([joined]);
+        expect(await ids(uniqueName('user'))).toEqual([]);
+        const paged = await store.listTraces({ workspaceId, rootActorId: ana, from: t(1), to: t(10), limit: 1 });
+        expect(paged.traces.map((x) => x.traceId)).toEqual([early]);
+        expect(paged.nextCursor).not.toBeNull();
+        const next = await store.listTraces({ workspaceId, rootActorId: ana, from: t(1), to: t(10), limit: 1, after: paged.nextCursor! });
+        expect(next.traces.map((x) => x.traceId)).toEqual([own]);
+        expect(next.nextCursor).toBeNull();
+      });
+
+      it('lists the campaigns of the goals a user owns, in their workspace only', async () => {
+        const store = await create();
+        const workspaceId = uniqueName('ws');
+        const other = uniqueName('ws');
+        const ana = uniqueName('user');
+        const bo = uniqueName('user');
+        const userUuid = randomUUID();
+        const [g1, g2, g3, g4, g5] = [randomUUID(), randomUUID(), randomUUID(), randomUUID(), randomUUID()];
+        await store.appendBatch([
+          // Ana owns g1 (as actor) and g4 (as user of the event); Bo owns g2; g3 has no creation event.
+          makeStoredAuditEvent({ workspaceId, occurredAt: t(1), action: 'goal.created', actor: { type: 'user', id: ana }, goalId: g1 }),
+          makeStoredAuditEvent({ workspaceId, occurredAt: t(1, 1), action: 'goal.created', actor: { type: 'brain', id: 'brain' }, userId: userUuid, goalId: g4 }),
+          makeStoredAuditEvent({ workspaceId, occurredAt: t(2), action: 'goal.created', actor: { type: 'user', id: bo }, goalId: g2 }),
+          makeStoredAuditEvent({ workspaceId, occurredAt: t(3), action: 'campaign.created', actor: { type: 'brain', id: 'brain' }, goalId: g1, campaignId: 'cmp_b' }),
+          makeStoredAuditEvent({ workspaceId, occurredAt: t(4), action: 'campaign.synced', actor: { type: 'system', id: 'sync' }, goalId: g1, campaignId: 'cmp_a' }),
+          makeStoredAuditEvent({ workspaceId, occurredAt: t(4, 1), action: 'campaign.synced', actor: { type: 'system', id: 'sync' }, goalId: g1, campaignId: 'cmp_a' }),
+          makeStoredAuditEvent({ workspaceId, occurredAt: t(5), action: 'campaign.created', actor: { type: 'brain', id: 'brain' }, goalId: g4, campaignId: 'cmp_u' }),
+          makeStoredAuditEvent({ workspaceId, occurredAt: t(6), action: 'campaign.created', actor: { type: 'brain', id: 'brain' }, goalId: g2, campaignId: 'cmp_bo' }),
+          makeStoredAuditEvent({ workspaceId, occurredAt: t(7), action: 'campaign.created', actor: { type: 'brain', id: 'brain' }, goalId: g3, campaignId: 'cmp_nobody' }),
+          makeStoredAuditEvent({ workspaceId, occurredAt: t(8), action: 'campaign.synced', actor: { type: 'system', id: 'sync' }, campaignId: 'cmp_nogoal' }),
+          // Ana created a goal that only this other workspace has campaigns for.
+          makeStoredAuditEvent({ workspaceId: other, occurredAt: t(1), action: 'goal.created', actor: { type: 'user', id: ana }, goalId: g5 }),
+          makeStoredAuditEvent({ workspaceId: other, occurredAt: t(2), action: 'campaign.created', actor: { type: 'brain', id: 'brain' }, goalId: g5, campaignId: 'cmp_elsewhere' }),
+          // Ana's id on a goal in this workspace that she did not create (an update is not ownership).
+          makeStoredAuditEvent({ workspaceId, occurredAt: t(9), action: 'goal.updated', actor: { type: 'user', id: ana }, goalId: g2 }),
+        ]);
+        expect(await store.listOwnedCampaignIds({ workspaceId, ownerId: ana })).toEqual(['cmp_a', 'cmp_b']);
+        expect(await store.listOwnedCampaignIds({ workspaceId, ownerId: userUuid })).toEqual(['cmp_u']);
+        expect(await store.listOwnedCampaignIds({ workspaceId, ownerId: bo })).toEqual(['cmp_bo']);
+        expect(await store.listOwnedCampaignIds({ workspaceId: other, ownerId: ana })).toEqual(['cmp_elsewhere']);
+        expect(await store.listOwnedCampaignIds({ workspaceId, ownerId: uniqueName('user') })).toEqual([]);
+        expect(await store.listOwnedCampaignIds({ workspaceId: uniqueName('ws'), ownerId: ana })).toEqual([]);
+        expect(await store.listOwnedCampaignIds({ workspaceId, ownerId: ana, limit: 1 })).toEqual(['cmp_a']);
+      });
+
       it('searches free text on action and target, ignoring case and treating wildcards literally', async () => {
         const store = await create();
         const workspaceId = uniqueName('ws');

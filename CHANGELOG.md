@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`context-reader` service role for the context bridge (Brief 03).** `audit-api` accepts the bridge's EdDSA service token (`iss` `proba-context`, `aud` `proba-audit`, `sub` `context-reader`, `jti`, at most 2 minutes) together with the Hub's
+  `X-Act-As` assertion (`ActAsAssertionClaims`, `iss` `proba-hub`, 30 seconds of clock skew) and `actorId` / `workspaceId` query parameters that must equal the assertion (missing: `400`, different: `403`, both audited). The role
+  reaches only `GET /v1/events[/{id}]`, `GET /v1/traces[/{id}]` and the three analytics reads; content, chain verification and everything else answer `403`. It reads only what the acting user did: events where they are the actor in the
+  workspace (filters `goalId`, `actionPrefix`, `since`, a hard page cap, never text, digest or `hasContent`), traces whose root actor is the user, and analytics of the campaigns of goals the user owns. Each read is audited with the caller
+  and the assertion's `jti`, never the data. New `AuditFilter.actionPrefix`, `TraceListQuery.rootActorId`, `AuditStore.listOwnedCampaignIds` and `AnalyticsScope.campaignIds` (memory and ClickHouse). **No migration:** the user-to-campaign
+  link is derived from `goal.created` events and the `goalId` / `campaignId` that events already carry. Enabled by `AUDIT_API_CONTEXT_READER_ENABLED`, `CONTEXT_SERVICE_PUBLIC_KEY_FILE` and `HUB_ASSERTION_PUBLIC_KEY_FILE` (JWKS of public
+  keys; `scripts/generate-service-keypair.mjs` creates a pair). The role cannot be enabled without both files; with `NODE_ENV=production` the paths must be absolute, the files different and not group/world-writable, and the static
+  token verifier is refused. OpenAPI 1.1.0 documents the role; request/response examples are in `docs/contracts/context-reader/`; setup is in `docs/CONTEXT_READER.md`.
+
+### Changed
+
+- `@smallseedlabs/proba-protocol` is now `v0.4.0` (git tag).
+
 ### Security
 
 - **Redis authentication, TLS and stream trimming (Brief 4, item 1).** `docker-compose.yml` starts Redis with an ACL user (`REDIS_USER`, `REDIS_PASSWORD` required, `default` user off, `@dangerous` commands denied) and builds `REDIS_URL`

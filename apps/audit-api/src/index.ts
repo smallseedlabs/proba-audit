@@ -6,7 +6,7 @@ import {
   redactConfig,
   type AuditEmitter,
 } from '@smallseedlabs/proba-audit-core';
-import { clickHouseOptionsFor, createDefaultRegistries, createRuntime } from '@smallseedlabs/proba-audit-adapters';
+import { clickHouseOptionsFor, createContextBridgeAuth, createDefaultRegistries, createRuntime } from '@smallseedlabs/proba-audit-adapters';
 import { buildServer } from './server.js';
 import { createScopeRegistry } from './scope.js';
 
@@ -31,6 +31,9 @@ async function main(): Promise<void> {
     });
   }
 
+  // Before any connection is opened: a role that cannot verify its callers (missing, unreadable or unsafe key files) stops the process.
+  const contextBridge = await createContextBridgeAuth(config);
+
   const runtime = await createRuntime(config, { logger, usesRateLimiter: true, usesAnchors: true, clickhouseRole: 'api' });
   const registries = createDefaultRegistries();
   const deps = { config, logger, clock: runtime.clock, ids: runtime.ids, clickhouse: clickHouseOptionsFor(config, 'api') };
@@ -43,6 +46,7 @@ async function main(): Promise<void> {
     tokenVerifier: verifier.name,
     rateLimiter: config.api.adapters.rateLimiter,
     scopeSource: config.api.adapters.scopeSource,
+    contextReader: contextBridge !== null,
   });
 
   const emitterFor = (failureMode: 'throw' | 'swallow'): AuditEmitter =>
@@ -65,6 +69,7 @@ async function main(): Promise<void> {
     logger,
     clock: runtime.clock,
     verifier,
+    ...(contextBridge ? { contextBridge } : {}),
     limiter,
     auditStore: runtime.auditStore,
     auditContentStore: runtime.auditContentStore,
@@ -117,7 +122,7 @@ async function main(): Promise<void> {
     action: 'system.started',
     category: 'system',
     outcome: 'success',
-    details: { tokenVerifier: verifier.name, rateLimiter: config.api.adapters.rateLimiter, scopeSource: config.api.adapters.scopeSource },
+    details: { tokenVerifier: verifier.name, rateLimiter: config.api.adapters.rateLimiter, scopeSource: config.api.adapters.scopeSource, contextReader: contextBridge !== null },
   });
   logger.info('service started', { lifecycle: 'started' });
 }

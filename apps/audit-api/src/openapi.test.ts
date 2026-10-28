@@ -10,11 +10,14 @@ import { createRequire } from 'node:module';
 import yaml from 'js-yaml';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { buildAuditContent, validateStoredAuditEvent } from '@smallseedlabs/proba-audit-core';
+import { CONTEXT_READER_ROUTES } from './authorization.js';
 import {
   API_LIMITS,
   campaignsQuerySchema,
   chainQuerySchema,
   compareQuerySchema,
+  contextEventsQuerySchema,
+  contextTracesQuerySchema,
   eventsQuerySchema,
   facetsQuerySchema,
   summaryQuerySchema,
@@ -58,7 +61,14 @@ describe('docs/openapi.yaml', () => {
     const ids = operations.map((o) => o.op.operationId);
     expect(new Set(ids).size).toBe(ids.length);
     expect(doc.components.securitySchemes.firebaseIdToken).toMatchObject({ type: 'http', scheme: 'bearer' });
+    expect(doc.components.securitySchemes.contextServiceToken).toMatchObject({ type: 'http', scheme: 'bearer' });
+    expect(doc.components.securitySchemes.actAsAssertion).toMatchObject({ type: 'apiKey', in: 'header', name: 'X-Act-As' });
     expect(doc.security).toEqual([{ firebaseIdToken: [] }]);
+  });
+
+  it('lists the context-reader routes the server allows, and no others', () => {
+    const documented = operations.filter((o) => o.op.security?.some((s: object) => 'contextServiceToken' in s)).map((o) => `GET ${o.path.replace(/\{(\w+)\}/g, ':$1')}`);
+    expect(new Set(documented)).toEqual(new Set(CONTEXT_READER_ROUTES));
   });
 
   it('describes read-only routes only', () => {
@@ -87,7 +97,12 @@ describe('docs/openapi.yaml', () => {
   it('keeps public routes public and every /v1 route authenticated', () => {
     for (const { path, op } of operations) {
       if (path.startsWith('/v1')) {
-        expect(op.security, path).toBeUndefined();
+        // The routes the context-reader role may call say so: the bridge's two credentials are an alternative to the ID token.
+        if (CONTEXT_READER_ROUTES.has(`GET ${path.replace(/\{(\w+)\}/g, ':$1')}`)) {
+          expect(op.security, path).toEqual([{ firebaseIdToken: [] }, { contextServiceToken: [], actAsAssertion: [] }]);
+        } else {
+          expect(op.security, path).toBeUndefined();
+        }
         expect(Object.keys(op.responses), path).toEqual(expect.arrayContaining(['401', '403', '429']));
       } else {
         expect(op.security, path).toEqual([]);
@@ -111,7 +126,7 @@ describe('query parameters match the validation schemas', () => {
   for (const [path, schema] of Object.entries(schemas)) {
     it(`${path}: same names, required flags and defaults`, () => {
       const shape = shapeOf(schema);
-      const spec = doc.paths[path].get.parameters.map(resolveRef);
+      const spec = doc.paths[path].get.parameters.map(resolveRef).filter((p: any) => !p['x-roles']);
       expect(spec.map((p: any) => p.name).sort()).toEqual(Object.keys(shape).sort());
       for (const p of spec) {
         expect(p.in).toBe('query');
@@ -124,6 +139,42 @@ describe('query parameters match the validation schemas', () => {
       }
     });
   }
+
+  describe('the context-reader role', () => {
+    const contextSchemas: Record<string, any> = { '/v1/events': contextEventsQuerySchema, '/v1/traces': contextTracesQuerySchema };
+    const forRole = (path: string) => doc.paths[path].get.parameters.map(resolveRef);
+    const roleOnly = (path: string) => forRole(path).filter((p: any) => p['x-roles']?.includes('context-reader'));
+
+    for (const [path, schema] of Object.entries(contextSchemas)) {
+      it(`${path}: its parameters are the shared ones plus its own, with its own limits`, () => {
+        const shape = shapeOf(schema);
+        const shared = forRole(path).filter((p: any) => !p['x-roles'] && p.name in shape).map((p: any) => p.name);
+        const own = roleOnly(path).map((p: any) => p.name).filter((n: string) => n in shape);
+        expect([...shared, ...own].sort()).toEqual(Object.keys(shape).sort());
+        for (const p of roleOnly(path)) expect(['actorId', 'workspaceId', ...Object.keys(shape)], `${path} ${p.name}`).toContain(p.name);
+        const limit = forRole(path).find((p: any) => p.name === 'limit');
+        expect(limit['x-context-reader']).toEqual({ default: shape.limit.parse(undefined), maximum: path === '/v1/events' ? API_LIMITS.contextReader.maxPageSize : API_LIMITS.contextReaderTraces.maxPageSize });
+        expect(shape.limit.safeParse(String(limit['x-context-reader'].maximum)).success).toBe(true);
+        expect(shape.limit.safeParse(String(limit['x-context-reader'].maximum + 1)).success).toBe(false);
+      });
+    }
+
+    it('every context-reader route documents actorId and workspaceId, and only those routes do', () => {
+      for (const { path, op } of operations) {
+        const names = (op.parameters ?? []).map(resolveRef).filter((p: any) => p['x-roles']).map((p: any) => p.name);
+        const reader = CONTEXT_READER_ROUTES.has(`GET ${path.replace(/\{(\w+)\}/g, ':$1')}`);
+        if (reader) expect(names, path).toEqual(expect.arrayContaining(['actorId', 'workspaceId']));
+        else expect(names, path).toEqual([]);
+      }
+    });
+
+    it('the extra parameters are exactly the ones the server pulls off the query or its own schema accepts', () => {
+      expect(roleOnly('/v1/events').map((p: any) => p.name).sort()).toEqual(['actionPrefix', 'actorId', 'since', 'workspaceId']);
+      expect(roleOnly('/v1/traces').map((p: any) => p.name).sort()).toEqual(['actorId', 'since', 'workspaceId']);
+      expect(contextEventsQuerySchema.safeParse({ actionPrefix: 'goal.', since: '2026-10-25T10:00:00Z' }).success).toBe(true);
+      expect(contextEventsQuerySchema.safeParse({ actor: 'x' }).success).toBe(false);
+    });
+  });
 
   it('enumerations in the document are the ones the schemas accept', () => {
     const enumsOf = (name: string): string[] => resolveRef(doc.paths['/v1/events'].get.parameters.find((p: any) => p.name === name).schema).enum;
@@ -143,8 +194,13 @@ describe('query parameters match the validation schemas', () => {
     expect(limitOf('/v1/analytics/campaigns')).toMatchObject({ default: API_LIMITS.campaigns.defaultRows, maximum: API_LIMITS.campaigns.maxRows });
   });
 
-  it('has no workspace parameter anywhere', () => {
-    for (const { op } of operations) for (const p of (op.parameters ?? []).map(resolveRef)) expect(p.name.toLowerCase()).not.toContain('workspace');
+  it('has no workspace parameter for the viewer and admin roles', () => {
+    // The context-reader role names its workspace, but only to say the same as its assertion; it is marked as that role's.
+    for (const { op } of operations) {
+      for (const p of (op.parameters ?? []).map(resolveRef)) {
+        if (p.name.toLowerCase().includes('workspace')) expect(p['x-roles'], p.name).toEqual(['context-reader']);
+      }
+    }
   });
 });
 

@@ -195,6 +195,10 @@ services:
       AUDIT_API_SCOPE_SOURCE: ${AUDIT_API_SCOPE_SOURCE:-connectors}
       AUDIT_API_ANALYTICS_ACCOUNTS: ${AUDIT_API_ANALYTICS_ACCOUNTS:-}
       AUDIT_API_TRUST_PROXY: ${AUDIT_API_TRUST_PROXY:-false}
+      # Service role for the context bridge (docs/CONTEXT_READER.md). The key files are paths inside the container: mount them read-only.
+      AUDIT_API_CONTEXT_READER_ENABLED: ${AUDIT_API_CONTEXT_READER_ENABLED:-false}
+      CONTEXT_SERVICE_PUBLIC_KEY_FILE: ${CONTEXT_SERVICE_PUBLIC_KEY_FILE:-}
+      HUB_ASSERTION_PUBLIC_KEY_FILE: ${HUB_ASSERTION_PUBLIC_KEY_FILE:-}
     ports:
       - "127.0.0.1:${AUDIT_API_HOST_PORT:-3100}:3100"
     restart: unless-stopped

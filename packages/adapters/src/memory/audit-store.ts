@@ -6,6 +6,7 @@ import {
   AUDIT_QUERY_MAX_LIMIT,
   AUDIT_SEARCH_DEFAULT_LIMIT,
   AUDIT_SEARCH_MAX_LIMIT,
+  OWNED_CAMPAIGNS_MAX_LIMIT,
   TRACE_LIST_DEFAULT_LIMIT,
   TRACE_LIST_MAX_LIMIT,
   summarizeTrace,
@@ -21,6 +22,8 @@ import {
   type AuditFilter,
   type AuditSearchPage,
   type AuditSearchQuery,
+  type OwnedCampaignsQuery,
+  pickRootEvent,
   type TraceListPage,
   type TraceListQuery,
   type TraceSummary,
@@ -48,6 +51,7 @@ export function matchesAuditFilter(e: StoredAuditEvent, f: AuditFilter): boolean
     (f.service === undefined || e.service === f.service) &&
     (f.category === undefined || e.category === f.category) &&
     (f.action === undefined || e.action === f.action) &&
+    (f.actionPrefix === undefined || e.action.startsWith(f.actionPrefix)) &&
     (f.outcome === undefined || e.outcome === f.outcome) &&
     (f.riskLevel === undefined || e.riskLevel === f.riskLevel) &&
     (f.from === undefined || Date.parse(e.occurredAt) >= Date.parse(f.from)) &&
@@ -204,6 +208,7 @@ export class InMemoryAuditStore implements AuditStore {
     }
     const after = query.after;
     const ranked = [...active.entries()]
+      .filter(([traceId]) => query.rootActorId === undefined || pickRootEvent(byTrace.get(traceId) ?? [])?.actor.id === query.rootActorId)
       .map(([traceId, last]) => ({ traceId, last }))
       .sort((a, b) => b.last - a.last || b.traceId.localeCompare(a.traceId))
       .filter((r) => after === undefined || r.last < Date.parse(after.lastEventAt) || (r.last === Date.parse(after.lastEventAt) && r.traceId.localeCompare(after.traceId) < 0))
@@ -216,6 +221,20 @@ export class InMemoryAuditStore implements AuditStore {
       traces,
       nextCursor: ranked.length > limit && tail ? { lastEventAt: new Date(tail.last).toISOString(), traceId: tail.traceId } : null,
     };
+  }
+
+  async listOwnedCampaignIds(query: OwnedCampaignsQuery): Promise<string[]> {
+    const limit = Math.min(query.limit ?? OWNED_CAMPAIGNS_MAX_LIMIT, OWNED_CAMPAIGNS_MAX_LIMIT);
+    const goals = new Set<string>();
+    for (const e of this.events.values()) {
+      if (e.workspaceId !== query.workspaceId || e.action !== 'goal.created' || e.goalId === undefined) continue;
+      if (e.actor.id === query.ownerId || e.userId === query.ownerId) goals.add(e.goalId);
+    }
+    const campaigns = new Set<string>();
+    for (const e of this.events.values()) {
+      if (e.workspaceId === query.workspaceId && e.goalId !== undefined && goals.has(e.goalId) && e.campaignId !== undefined) campaigns.add(e.campaignId);
+    }
+    return [...campaigns].sort().slice(0, limit);
   }
 
   async facets(query: AuditFacetsQuery): Promise<AuditFacets> {

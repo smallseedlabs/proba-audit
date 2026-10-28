@@ -1,0 +1,58 @@
+{
+  "description": "Traces the user started (their root event is theirs).",
+  "request": {
+    "method": "GET",
+    "path": "/v1/traces",
+    "query": {
+      "actorId": "660e8400-e29b-41d4-a716-446655440001",
+      "workspaceId": "seedbed",
+      "since": "2026-10-25T00:00:00Z",
+      "limit": "10"
+    },
+    "headers": {
+      "Authorization": "Bearer <service token>",
+      "X-Act-As": "<act-as assertion>"
+    }
+  },
+  "response": {
+    "status": 200,
+    "body": {
+      "traces": [
+        {
+          "traceId": "aa0e8400-e29b-41d4-a716-00000000006c",
+          "rootAction": "thread.message_received",
+          "rootService": "hub",
+          "startedAt": "2026-10-25T10:08:00.000Z",
+          "lastEventAt": "2026-10-25T10:08:00.000Z",
+          "eventCount": 1,
+          "outcome": "success",
+          "durationMs": 0
+        },
+        {
+          "traceId": "990e8400-e29b-41d4-a716-446655440004",
+          "rootAction": "goal.updated",
+          "rootService": "hub",
+          "startedAt": "2026-10-25T10:03:00.000Z",
+          "lastEventAt": "2026-10-25T10:04:00.000Z",
+          "eventCount": 2,
+          "outcome": "success",
+          "durationMs": 60850
+        },
+        {
+          "traceId": "aa0e8400-e29b-41d4-a716-000000000065",
+          "rootAction": "goal.created",
+          "rootService": "hub",
+          "startedAt": "2026-10-25T10:00:00.000Z",
+          "lastEventAt": "2026-10-25T10:00:00.000Z",
+          "eventCount": 1,
+          "outcome": "success",
+          "durationMs": 0
+        }
+      ],
+      "nextCursor": null,
+      "from": "2026-10-25T00:00:00.000Z",
+      "to": null,
+      "limit": 10
+    }
+  }
+}

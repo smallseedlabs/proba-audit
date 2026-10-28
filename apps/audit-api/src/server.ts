@@ -1,12 +1,17 @@
 import { randomUUID } from 'node:crypto';
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import cors from '@fastify/cors';
+import rateLimit from '@fastify/rate-limit';
 import {
+  ACT_AS_HEADER,
+  ANALYTICS_LIMITS,
   AuditedAnalyticsReader,
   AuditedReader,
+  CONTEXT_READER_ROLE,
   MetricsAnalytics,
   TokenVerificationError,
   type AccessContext,
+  type ContextBridgeAuth,
   type AppConfig,
   type AuditEmitter,
   type AnchorStore,
@@ -19,12 +24,15 @@ import {
   type ScopeResolver,
   type TokenVerifier,
 } from '@smallseedlabs/proba-audit-core';
-import { authorize, type Role, type Session } from './authorization.js';
+import { CONTEXT_READER_ROUTES, authorize, sessionFromAssertion, type Role, type Session } from './authorization.js';
 import { ApiError } from './http/errors.js';
 import {
+  actAsParamsSchema,
   campaignsQuerySchema,
   chainQuerySchema,
   compareQuerySchema,
+  contextEventsQuerySchema,
+  contextTracesQuerySchema,
   eventParamsSchema,
   eventsQuerySchema,
   facetsQuerySchema,
@@ -58,6 +66,8 @@ export interface ServerDeps {
   logger: Logger;
   clock: Clock;
   verifier: TokenVerifier;
+  /** The credentials of the `context-reader` role. Absent: the role is off and its tokens are refused like any unknown token. */
+  contextBridge?: ContextBridgeAuth;
   limiter: RateLimiter;
   auditStore: AuditStore;
   /** Raw text of events: served to administrators only, and only when config.content.enabled. */
@@ -86,6 +96,16 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
 /** The path with every :param kept as a pattern, so logs and audit events never hold ids from the URL. */
 const routeOf = (request: FastifyRequest): string => request.routeOptions?.url ?? 'unmatched';
 
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Extra facts about who is denied: the `context-reader` role is a service acting for a user, not a person. */
+interface DenyExtra {
+  actor?: { type: 'service'; id: string };
+  workspaceId?: string;
+  verifier?: string;
+  details?: Record<string, unknown>;
+}
+
 /**
  * Build the audit-api HTTP server. Every dependency is injected, so the same server runs on the real
  * adapters and, in tests, on in-memory ones. Mirrors proba-hub's server: Fastify, CORS, a trace id on
@@ -103,10 +123,23 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
     maxParamLength: 200,
   });
 
+  // The accounts of the workspace; for the `context-reader` role also only the campaigns of the goals its user owns. Read from the
+  // audit trail on every request (the link between a user and a campaign is the goal id both carry), never from a request parameter.
+  const scopeFor: ScopeResolver = async (ctx) => {
+    const base = await deps.scope(ctx);
+    if (ctx.subjectActorId === undefined) return base;
+    const campaignIds = await deps.auditStore.listOwnedCampaignIds({
+      workspaceId: ctx.workspaceId,
+      ownerId: ctx.subjectActorId,
+      limit: ANALYTICS_LIMITS.maxCampaignsInScope,
+    });
+    return { ...base, campaignIds };
+  };
+
   const reader = new AuditedReader(deps.auditStore, deps.emitter, clock);
   const analytics = new AuditedAnalyticsReader(
     new MetricsAnalytics(deps.metricsStore, { sourceGranularity: config.ingest.granularity }),
-    deps.scope,
+    scopeFor,
     deps.emitter,
     clock
   );
@@ -118,7 +151,7 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
     metricsStore: deps.metricsStore,
     reader,
     analytics,
-    scope: deps.scope,
+    scope: scopeFor,
     clock,
     chain: api.chain,
   });
@@ -148,6 +181,7 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
       statusCode: reply.statusCode,
       durationMs: Date.now() - request.startedAt,
       ...(request.session ? { actor: request.session.subject, role: request.session.role, workspaceId: request.session.workspaceId } : {}),
+      ...(request.session?.actAs ? { assertionJti: request.session.actAs.jti } : {}),
       remoteAddress: request.ip,
     });
   });
@@ -176,6 +210,16 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
       });
     }
     const status = (error as { statusCode?: number }).statusCode ?? 500;
+    const bodyError = (error as { error?: string }).error;
+    if (status === 429 || bodyError === 'rate_limited') {
+      const retryAfter = (error as { retryAfter?: string | number }).retryAfter;
+      if (retryAfter !== undefined) reply.header('Retry-After', String(retryAfter));
+      return reply.code(429).send({
+        error: 'rate_limited',
+        message: 'Too many requests. Try again shortly.',
+        traceId: request.traceId,
+      });
+    }
     if (status < 500) {
       return reply.code(status).send({ error: 'bad_request', message: 'The request could not be understood.', traceId: request.traceId });
     }
@@ -219,11 +263,27 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
   // -- Everything under /v1: authenticated, authorised, rate limited, read-only.
   await app.register(
     async (v1) => {
+      // Framework rate limit so scanners (CodeQL MissingRateLimiting) see a recognised control on
+      // authorised routes. Cap is intentionally high: deps.limiter remains the primary per-user /
+      // per-bridge control and is what the API documents and tests.
+      await v1.register(rateLimit, {
+        global: true,
+        max: Math.max(api.rateLimit.max * 100, 1_000),
+        timeWindow: api.rateLimit.windowMs,
+        errorResponseBuilder: (_request, context) => ({
+          statusCode: 429,
+          error: 'rate_limited',
+          message: 'Too many requests. Try again shortly.',
+          retryAfter: context.after,
+        }),
+      });
+
       const deny = async (
         request: FastifyRequest,
         reason: string,
         outcome: 'denied' | 'failure',
-        actorId?: string
+        actorId?: string,
+        extra: DenyExtra = {}
       ): Promise<void> => {
         // A flood of rejected calls must not flood the audit trail: a few records per reason and client per minute.
         const gate = await deps.limiter.hit(`deny-audit:${reason}:${request.ip}`, 5, 60_000);
@@ -231,15 +291,15 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
         await deps.bestEffortEmitter
           .forTrace(request.traceId)
           .emit({
-            actor: actorId ? { type: 'user', id: actorId } : { type: 'system', id: 'anonymous' },
-            workspaceId: api.workspaceId,
+            actor: extra.actor ?? (actorId ? { type: 'user', id: actorId } : { type: 'system', id: 'anonymous' }),
+            workspaceId: extra.workspaceId ?? api.workspaceId,
             action: 'auth.denied',
             category: 'auth',
             outcome,
             errorCode: reason,
             riskLevel: 'medium',
             target: { type: 'route', id: `${request.method} ${routeOf(request)}` },
-            details: { component: 'http', verifier: deps.verifier.name },
+            details: { component: 'http', verifier: extra.verifier ?? deps.verifier.name, ...extra.details },
           })
           .catch(() => null);
       };
@@ -251,13 +311,79 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
         code: string,
         message: string,
         outcome: 'denied' | 'failure',
-        actorId?: string
+        actorId?: string,
+        extra?: DenyExtra
       ): Promise<FastifyReply> => {
         await deps.limiter.hit(`auth-fail:${request.ip}`, api.rateLimit.authFailureMax, api.rateLimit.authFailureWindowMs);
         log(request).info('request refused', { code, route: routeOf(request) });
-        await deny(request, code, outcome, actorId);
+        await deny(request, code, outcome, actorId, extra);
         if (status === 401) reply.header('WWW-Authenticate', 'Bearer realm="proba-audit"');
         return reply.code(status).send({ error: code, message, traceId: request.traceId });
+      };
+
+      /**
+       * The `context-reader` role: a service token proves the bridge is calling, the Hub's act-as assertion proves for which user,
+       * and the `actorId` / `workspaceId` of the request must say the same. The order is deliberate: the route is checked before
+       * anything about the user, so the content, chain and admin routes answer 403 to this role whatever else is sent.
+       */
+      const admitBridgeCall = async (request: FastifyRequest, reply: FastifyReply, token: string, bridge: ContextBridgeAuth): Promise<FastifyReply | void> => {
+        const caller = { type: 'service' as const, id: CONTEXT_READER_ROLE };
+        const verifier = bridge.service.name;
+        let service;
+        try {
+          service = await bridge.service.verify(token);
+        } catch (err) {
+          if (err instanceof TokenVerificationError) {
+            const expired = err.code === 'token_expired';
+            return failAuth(request, reply, 401, err.code, expired ? 'Your sign-in has expired. Sign in again.' : 'Your sign-in could not be verified. Sign in again.', 'failure', undefined, { verifier });
+          }
+          log(request).error('service token verification unavailable', { err });
+          return reply.code(503).send({ error: 'auth_unavailable', message: 'Sign-in checks are unavailable right now. Try again in a moment.', traceId: request.traceId });
+        }
+        const refuse = async (status: number, code: string, message: string, extra: Record<string, unknown> = {}, workspaceId?: string): Promise<FastifyReply> => {
+          log(request).info('request refused', { code, route: routeOf(request) });
+          await deny(request, code, 'denied', undefined, { actor: caller, verifier, ...(workspaceId ? { workspaceId } : {}), details: { caller: CONTEXT_READER_ROLE, tokenJti: service.jti, ...extra } });
+          return reply.code(status).send({ error: code, message, traceId: request.traceId });
+        };
+
+        if (!CONTEXT_READER_ROUTES.has(`${request.method} ${routeOf(request)}`)) {
+          return refuse(403, 'insufficient_role', 'This role cannot use this route.');
+        }
+        const assertionHeader = request.headers[ACT_AS_HEADER];
+        if (typeof assertionHeader !== 'string' || assertionHeader.trim() === '') {
+          return refuse(400, 'act_as_required', 'The X-Act-As assertion is required.');
+        }
+        let assertion;
+        try {
+          assertion = await bridge.assertions.verify(assertionHeader.trim());
+        } catch (err) {
+          if (err instanceof TokenVerificationError) {
+            return refuse(403, err.code === 'token_expired' ? 'act_as_expired' : 'act_as_invalid', 'The X-Act-As assertion is not valid.');
+          }
+          log(request).error('act-as verification unavailable', { err });
+          return reply.code(503).send({ error: 'auth_unavailable', message: 'Sign-in checks are unavailable right now. Try again in a moment.', traceId: request.traceId });
+        }
+        const withAssertion = { assertionJti: assertion.jti };
+        const params = actAsParamsSchema.safeParse(request.query);
+        if (!params.success) {
+          return refuse(400, 'act_as_scope_required', 'actorId and workspaceId are required query parameters.', withAssertion, assertion.workspaceId);
+        }
+        if (params.data.actorId !== assertion.sub || params.data.workspaceId !== assertion.workspaceId) {
+          return refuse(403, 'act_as_mismatch', 'actorId and workspaceId must match the X-Act-As assertion.', withAssertion, assertion.workspaceId);
+        }
+
+        const session = sessionFromAssertion(assertion, service.jti);
+        request.session = session;
+        // Per user and workspace, so one busy user cannot use up the bridge's allowance for everybody else.
+        const rate = await deps.limiter.hit(`context-reader:${assertion.workspaceId}:${assertion.sub}`, api.rateLimit.max, api.rateLimit.windowMs);
+        reply.header('X-RateLimit-Limit', String(rate.limit)).header('X-RateLimit-Remaining', String(rate.remaining));
+        if (!rate.allowed) {
+          await deny(request, 'rate_limited', 'denied', undefined, { actor: caller, verifier, workspaceId: assertion.workspaceId, details: { caller: CONTEXT_READER_ROLE, tokenJti: service.jti, ...withAssertion } });
+          return reply
+            .code(429)
+            .header('Retry-After', String(rate.retryAfterSeconds))
+            .send({ error: 'rate_limited', message: 'Too many requests. Try again shortly.', traceId: request.traceId });
+        }
       };
 
       v1.addHook('preHandler', async (request, reply) => {
@@ -276,9 +402,11 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
         if (!header || !/^Bearer\s+\S+$/i.test(header)) {
           return failAuth(request, reply, 401, 'missing_token', 'Sign in to continue.', 'failure');
         }
+        const presented = header.replace(/^Bearer\s+/i, '');
+        if (deps.contextBridge?.service.claimsToBeBridge(presented)) return admitBridgeCall(request, reply, presented, deps.contextBridge);
         let identity;
         try {
-          identity = await deps.verifier.verify(header.replace(/^Bearer\s+/i, ''));
+          identity = await deps.verifier.verify(presented);
         } catch (err) {
           if (err instanceof TokenVerificationError) {
             const expired = err.code === 'token_expired';
@@ -326,11 +454,25 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
         }
         return session;
       };
-      const contextOf = (request: FastifyRequest, session: Session): AccessContext => ({
-        actor: { type: 'user', id: session.subject },
-        workspaceId: session.workspaceId,
-        traceId: request.traceId,
-      });
+      const contextOf = (request: FastifyRequest, session: Session): AccessContext => {
+        if (!session.actAs) return { actor: { type: 'user', id: session.subject }, workspaceId: session.workspaceId, traceId: request.traceId };
+        // The reader is the bridge (a service), acting for the user of the assertion; its reads are recorded under the bridge, with
+        // the ids of the assertion and the token, never under the user.
+        return {
+          actor: { type: 'service', id: CONTEXT_READER_ROLE },
+          workspaceId: session.workspaceId,
+          ...(UUID.test(session.actAs.actorId) ? { userId: session.actAs.actorId } : {}),
+          traceId: request.traceId,
+          subjectActorId: session.actAs.actorId,
+          auditDetails: { caller: CONTEXT_READER_ROLE, assertionJti: session.actAs.jti, ...(session.tokenJti ? { tokenJti: session.tokenJti } : {}) },
+        };
+      };
+      /** The query as the route's schema sees it: the `context-reader` role's `actorId` and `workspaceId` were already checked against the assertion. */
+      const queryOf = (request: FastifyRequest, session: Session): unknown => {
+        if (!session.actAs) return request.query;
+        const { actorId: _actorId, workspaceId: _workspaceId, ...rest } = (request.query ?? {}) as Record<string, unknown>;
+        return rest;
+      };
       const metaOf = (request: FastifyRequest, session: Session): ReadMeta => ({ route: `${request.method} ${routeOf(request)}`, role: session.role });
 
       v1.get('/session', async (request) => {
@@ -348,13 +490,17 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
 
       v1.get('/events', async (request) => {
         const session = need(request);
+        if (session.actAs) {
+          return reads.searchEventsForSubject(contextOf(request, session), parseWith(contextEventsQuerySchema, queryOf(request, session)), metaOf(request, session));
+        }
         return reads.searchEvents(contextOf(request, session), parseWith(eventsQuerySchema, request.query), metaOf(request, session));
       });
 
       v1.get('/events/:eventId', async (request) => {
         const session = need(request);
-        parseWith(noQuerySchema, request.query);
+        parseWith(noQuerySchema, queryOf(request, session));
         const { eventId } = parseWith(eventParamsSchema, request.params, 'path');
+        if (session.actAs) return reads.getEventForSubject(contextOf(request, session), eventId, metaOf(request, session));
         return reads.getEvent(contextOf(request, session), eventId, metaOf(request, session));
       });
 
@@ -368,13 +514,17 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
 
       v1.get('/traces', async (request) => {
         const session = need(request);
+        if (session.actAs) {
+          return reads.listTracesForSubject(contextOf(request, session), parseWith(contextTracesQuerySchema, queryOf(request, session)), metaOf(request, session));
+        }
         return reads.listTraces(contextOf(request, session), parseWith(tracesQuerySchema, request.query), metaOf(request, session));
       });
 
       v1.get('/traces/:traceId', async (request) => {
         const session = need(request);
-        parseWith(noQuerySchema, request.query);
+        parseWith(noQuerySchema, queryOf(request, session));
         const { traceId } = parseWith(traceParamsSchema, request.params, 'path');
+        if (session.actAs) return reads.getTraceForSubject(contextOf(request, session), traceId, metaOf(request, session));
         return reads.getTrace(contextOf(request, session), traceId, metaOf(request, session));
       });
 
@@ -402,17 +552,17 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
 
       v1.get('/analytics/summary', async (request) => {
         const session = need(request);
-        return reads.summary(contextOf(request, session), parseWith(summaryQuerySchema, request.query));
+        return reads.summary(contextOf(request, session), parseWith(summaryQuerySchema, queryOf(request, session)));
       });
 
       v1.get('/analytics/compare', async (request) => {
         const session = need(request);
-        return reads.compare(contextOf(request, session), parseWith(compareQuerySchema, request.query));
+        return reads.compare(contextOf(request, session), parseWith(compareQuerySchema, queryOf(request, session)));
       });
 
       v1.get('/analytics/campaigns', async (request) => {
         const session = need(request);
-        return reads.campaigns(contextOf(request, session), parseWith(campaignsQuerySchema, request.query));
+        return reads.campaigns(contextOf(request, session), parseWith(campaignsQuerySchema, queryOf(request, session)));
       });
 
       v1.get('/facets', async (request) => {

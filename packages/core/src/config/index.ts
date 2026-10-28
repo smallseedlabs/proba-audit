@@ -6,6 +6,7 @@
  */
 
 import { hostname } from 'node:os';
+import { isAbsolute } from 'node:path';
 import { config as loadDotenv } from 'dotenv';
 import { z } from 'zod';
 import { metricPlatformSchema, type MetricPlatform } from '@smallseedlabs/proba-protocol/audit';
@@ -150,6 +151,16 @@ export const envSchema = z.object({
   // Chain verification is bounded in time and in events.
   AUDIT_API_CHAIN_MAX_RANGE_HOURS: positiveInt(24),
   AUDIT_API_CHAIN_MAX_EVENTS: positiveInt(100000),
+
+  // Context bridge (role `context-reader`): reads of one user's events, traces and campaign analytics for the context bridge.
+  // Off by default. Enabling it needs both public key files: JWKS documents (Ed25519 public keys, one `kid` each) that verify the
+  // bridge's service token (CONTEXT_SERVICE_PUBLIC_KEY_FILE) and the Hub's act-as assertion (HUB_ASSERTION_PUBLIC_KEY_FILE).
+  AUDIT_API_CONTEXT_READER_ENABLED: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((v) => v === 'true'),
+  CONTEXT_SERVICE_PUBLIC_KEY_FILE: z.string().default(''),
+  HUB_ASSERTION_PUBLIC_KEY_FILE: z.string().default(''),
 
   // ClickHouse
   CLICKHOUSE_URL: nonEmpty('http://localhost:8123'),
@@ -331,6 +342,8 @@ export interface AppConfig {
     analyticsAccounts: { platform: MetricPlatform; accountId: string }[];
     scopeCacheMs: number;
     chain: { maxRangeHours: number; maxEvents: number };
+    /** The `context-reader` service role. `enabled` implies both key files are set. */
+    contextReader: { enabled: boolean; serviceKeyFile: string; assertionKeyFile: string };
   };
   clickhouse: {
     url: string;
@@ -463,6 +476,30 @@ export function loadConfig(env: EnvSource = process.env, options: LoadConfigOpti
     api: roleCredentials('api', e.CLICKHOUSE_API_USER, e.CLICKHOUSE_API_PASSWORD),
     migrator: roleCredentials('migrator', e.CLICKHOUSE_MIGRATOR_USER, e.CLICKHOUSE_MIGRATOR_PASSWORD),
   };
+  const contextReader = {
+    enabled: e.AUDIT_API_CONTEXT_READER_ENABLED,
+    serviceKeyFile: e.CONTEXT_SERVICE_PUBLIC_KEY_FILE.trim(),
+    assertionKeyFile: e.HUB_ASSERTION_PUBLIC_KEY_FILE.trim(),
+  };
+  if (contextReader.enabled) {
+    // The role is never enabled without the keys that verify its callers, whatever the environment.
+    if (contextReader.serviceKeyFile === '') issues.push('CONTEXT_SERVICE_PUBLIC_KEY_FILE: required when AUDIT_API_CONTEXT_READER_ENABLED=true');
+    if (contextReader.assertionKeyFile === '') issues.push('HUB_ASSERTION_PUBLIC_KEY_FILE: required when AUDIT_API_CONTEXT_READER_ENABLED=true');
+    if (isProduction) {
+      for (const [name, file] of [
+        ['CONTEXT_SERVICE_PUBLIC_KEY_FILE', contextReader.serviceKeyFile],
+        ['HUB_ASSERTION_PUBLIC_KEY_FILE', contextReader.assertionKeyFile],
+      ] as const) {
+        if (file !== '' && !isAbsolute(file)) issues.push(`${name}: must be an absolute path when NODE_ENV=production`);
+      }
+      if (contextReader.serviceKeyFile !== '' && contextReader.serviceKeyFile === contextReader.assertionKeyFile) {
+        issues.push('CONTEXT_SERVICE_PUBLIC_KEY_FILE and HUB_ASSERTION_PUBLIC_KEY_FILE must be different files: the bridge and the Hub never share a key');
+      }
+      if (e.AUDIT_API_TOKEN_VERIFIER === 'static') {
+        issues.push('AUDIT_API_TOKEN_VERIFIER=static is not available when NODE_ENV=production');
+      }
+    }
+  }
   if (issues.length > 0) throw new ConfigError(issues);
 
   return {
@@ -558,6 +595,7 @@ export function loadConfig(env: EnvSource = process.env, options: LoadConfigOpti
       analyticsAccounts,
       scopeCacheMs: e.AUDIT_API_SCOPE_CACHE_MS,
       chain: { maxRangeHours: e.AUDIT_API_CHAIN_MAX_RANGE_HOURS, maxEvents: e.AUDIT_API_CHAIN_MAX_EVENTS },
+      contextReader,
     },
     clickhouse: {
       url: e.CLICKHOUSE_URL,

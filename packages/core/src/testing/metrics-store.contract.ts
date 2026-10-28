@@ -328,6 +328,17 @@ export function runMetricsStoreContract(name: string, factory: () => Promise<Met
       const onlyHourSource = await store.aggregateRollups({ workspaceId: ws, bucket: 'hour', ...win, groupBy: [], accounts, sourceGranularity: 'hour' });
       expect(onlyHourSource.map((a) => a.currency).sort()).toEqual(['EUR', 'USD']);
 
+      // Narrowed to a list of campaigns: only those, in every grouping; an empty list sees nothing; with campaignId both must hold.
+      const only = await store.aggregateRollups({ workspaceId: ws, bucket: 'hour', ...win, groupBy: ['campaign'], accounts, campaignIds: ['c2', 'c3', 'c-unknown'] });
+      expect(only.map((a) => a.campaignId)).toEqual(['c2', 'c3']);
+      const onlyTotal = await store.aggregateRollups({ workspaceId: ws, bucket: 'hour', ...win, groupBy: [], accounts, campaignIds: ['c2'] });
+      expect(onlyTotal.map((a) => [a.currency, a.metrics.impressions])).toEqual([['USD', 40]]);
+      const onlyDaily = await store.aggregateRollups({ workspaceId: ws, bucket: 'day', ...win, groupBy: ['campaign'], accounts, campaignIds: ['c1'] });
+      expect(onlyDaily.map((a) => [a.campaignId, a.metrics.impressions])).toEqual([['c1', 1600]]);
+      expect(await store.aggregateRollups({ workspaceId: ws, bucket: 'hour', ...win, groupBy: ['campaign'], accounts, campaignIds: [] })).toEqual([]);
+      expect(await store.aggregateRollups({ workspaceId: ws, bucket: 'hour', ...win, groupBy: ['campaign'], accounts, campaignIds: ['c1'], campaignId: 'c2' })).toEqual([]);
+      expect(await store.aggregateRollups({ workspaceId: ws, bucket: 'hour', ...win, groupBy: ['campaign'], campaignIds: ["c1') OR 1=1 --"] })).toEqual([]);
+
       expect(await store.aggregateRollups({ workspaceId: ws, bucket: 'hour', ...win, groupBy: ['campaign'], accounts: [] })).toEqual([]);
       expect(await store.aggregateRollups({ workspaceId: ws, bucket: 'hour', ...win, groupBy: ['campaign'], accounts: [{ platform: 'meta', accountId: uniqueName('none') }] })).toEqual([]);
     });

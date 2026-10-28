@@ -31,6 +31,13 @@ export interface AccessContext {
   userId?: string;
   traceId?: string;
   parentSpanId?: string;
+  /**
+   * Set when the reader acts for one user (the `context-reader` role): analytics are limited to the campaigns of the
+   * goals this user owns. The id is the user's, not the caller's (the caller is `actor`).
+   */
+  subjectActorId?: string;
+  /** Added to the `details` of the audit event of every read (who called, which assertion). Never data. */
+  auditDetails?: Record<string, unknown>;
 }
 
 /**
@@ -142,6 +149,7 @@ export class AuditedReader {
         durationMs: this.clock.now().getTime() - started,
         errorMessage: error?.message.slice(0, 500),
         details: {
+          ...ctx.auditDetails,
           ...context,
           filters: Object.entries(filters)
             .filter(([, v]) => v !== undefined)

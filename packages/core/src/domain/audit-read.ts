@@ -44,10 +44,27 @@ export interface TraceListQuery {
   /** Traces with at least one event whose occurredAt is in [from, to). */
   from?: string;
   to?: string;
+  /** Only traces whose root event (see pickRootEvent) was written by this actor id. */
+  rootActorId?: string;
   /** Default 25, maximum 200. */
   limit?: number;
   after?: TraceCursor;
 }
+
+/**
+ * The campaigns of the goals one user owns. A goal is owned by the actor (or user) of its `goal.created`
+ * event; its campaigns are the campaign ids carried by the events of that goal.
+ */
+export interface OwnedCampaignsQuery {
+  /** Required: goals and campaigns of this workspace only. */
+  workspaceId: string;
+  /** The user id: matched against the actor id and the user id of `goal.created` events. */
+  ownerId: string;
+  /** Default and maximum 500. */
+  limit?: number;
+}
+
+export const OWNED_CAMPAIGNS_MAX_LIMIT = 500;
 
 export const TRACE_LIST_DEFAULT_LIMIT = 25;
 export const TRACE_LIST_MAX_LIMIT = 200;
