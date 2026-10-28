@@ -1,6 +1,17 @@
-import type { VerifiedIdentity } from '@smallseedlabs/proba-audit-core';
+import { CONTEXT_READER_ROLE, type ActAsAssertionClaims, type VerifiedIdentity } from '@smallseedlabs/proba-audit-core';
 
-export type Role = 'viewer' | 'admin';
+export type Role = 'viewer' | 'admin' | typeof CONTEXT_READER_ROLE;
+
+/** Who a `context-reader` call acts for, as the Hub's assertion states it. */
+export interface ActAs {
+  /** The user (assertion `sub`). */
+  actorId: string;
+  workspaceId: string;
+  goalId: string;
+  threadId: string;
+  /** Id of the assertion. */
+  jti: string;
+}
 
 /** The authenticated, authorised caller. The workspace is decided here, from configuration, never by the request. */
 export interface Session {
@@ -8,6 +19,35 @@ export interface Session {
   email: string;
   role: Role;
   workspaceId: string;
+  /** `context-reader` only: the user and workspace the call acts for, and the ids of the two tokens it carried. */
+  actAs?: ActAs;
+  tokenJti?: string;
+}
+
+/**
+ * The routes the `context-reader` role may call: one user's events and traces (never their text) and campaign analytics.
+ * Keys are `METHOD route-pattern` as Fastify reports them. Everything else (raw text, chain verification, facets, the
+ * session) answers 403 to this role.
+ */
+export const CONTEXT_READER_ROUTES: ReadonlySet<string> = new Set([
+  'GET /v1/events',
+  'GET /v1/events/:eventId',
+  'GET /v1/traces',
+  'GET /v1/traces/:traceId',
+  'GET /v1/analytics/summary',
+  'GET /v1/analytics/compare',
+  'GET /v1/analytics/campaigns',
+]);
+
+export function sessionFromAssertion(assertion: ActAsAssertionClaims, tokenJti: string): Session {
+  return {
+    subject: CONTEXT_READER_ROLE,
+    email: '',
+    role: CONTEXT_READER_ROLE,
+    workspaceId: assertion.workspaceId,
+    actAs: { actorId: assertion.sub, workspaceId: assertion.workspaceId, goalId: assertion.goalId, threadId: assertion.threadId, jti: assertion.jti },
+    tokenJti,
+  };
 }
 
 export interface AccessPolicy {

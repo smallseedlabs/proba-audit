@@ -2,6 +2,7 @@ import {
   AnalyticsValidationError,
   buildTraceTree,
   digestAuditContent,
+  pickRootEvent,
   verifyChain,
   type AccessContext,
   type AnchorStore,
@@ -33,6 +34,8 @@ import {
   traceCursor,
   type CampaignsQuery,
   type ChainQuery,
+  type ContextEventsQuery,
+  type ContextTracesQuery,
   type CompareQueryParams,
   type EventsQuery,
   type FacetsQuery,
@@ -194,6 +197,126 @@ export class ReadService {
       order: q.order,
       limit: q.limit,
     };
+  }
+
+  // -- The `context-reader` role. Every method reads for ONE user (`ctx.subjectActorId`, the assertion's `sub`) in ONE workspace
+  // (`ctx.workspaceId`, the assertion's), and the store is always asked with both. Raw text and its digest are never part of
+  // the answer, whatever the deployment's content settings, and an event does not even say whether it has text.
+
+  private subjectOf(ctx: AccessContext): string {
+    if (ctx.subjectActorId === undefined || ctx.subjectActorId === '') throw new Error('a context-reader read needs the user it acts for');
+    return ctx.subjectActorId;
+  }
+
+  /** The event without text or digest. The acting user's id is kept (the caller sent it); any other actor id is pseudonymised. */
+  private exposeToSubject(event: StoredAuditEvent, actorId: string, workspaceId: string): ApiEvent {
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    const { content: _content, contentDigest: _digest, ...rest } = event;
+    return rest.actor.id === actorId ? rest : applyActorVisibility(rest, 'viewer', workspaceId);
+  }
+
+  /** The user's own events, newest first. */
+  async searchEventsForSubject(ctx: AccessContext, q: ContextEventsQuery, meta: ReadMeta): Promise<EventsPage> {
+    const actorId = this.subjectOf(ctx);
+    const window = resolveWindow({ ...(q.since ? { from: q.since } : {}) }, { now: this.d.clock.now(), ...API_LIMITS.contextReader, anchored: q.goalId !== undefined });
+    const after = q.cursor === undefined ? undefined : eventCursor.decode(q.cursor, 'desc');
+    const page = await this.d.reader.read(
+      ctx,
+      'events.search',
+      { actorId, ...q, ...window },
+      (p) => p.events.length,
+      () =>
+        this.d.auditStore.search({
+          workspaceId: ctx.workspaceId,
+          actorId,
+          ...(window.from ? { from: window.from } : {}),
+          ...(q.goalId ? { goalId: q.goalId } : {}),
+          ...(q.actionPrefix ? { actionPrefix: q.actionPrefix } : {}),
+          order: 'desc',
+          limit: q.limit,
+          ...(after ? { after } : {}),
+        }),
+      meta
+    );
+    return {
+      events: page.events.map((e) => this.exposeToSubject(e, actorId, ctx.workspaceId)),
+      nextCursor: page.nextCursor ? eventCursor.encode(page.nextCursor, 'desc') : null,
+      from: window.from ?? null,
+      to: null,
+      order: 'desc',
+      limit: q.limit,
+    };
+  }
+
+  /** One event, only when the user is its actor: an event of anybody else is answered as if it did not exist. */
+  async getEventForSubject(ctx: AccessContext, eventId: string, meta: ReadMeta): Promise<ApiEvent> {
+    const actorId = this.subjectOf(ctx);
+    const event = await this.d.reader.read(
+      ctx,
+      'events.get',
+      { eventId },
+      (e) => (e ? 1 : 0),
+      async () => {
+        const found = await this.d.auditStore.getEvent(ctx.workspaceId, eventId);
+        return found && found.actor.id === actorId ? found : null;
+      },
+      meta
+    );
+    if (!event) throw new ApiError(404, 'not_found', 'There is no event with this id.');
+    return this.exposeToSubject(event, actorId, ctx.workspaceId);
+  }
+
+  /** Traces whose root event is the user's. */
+  async listTracesForSubject(ctx: AccessContext, q: ContextTracesQuery, meta: ReadMeta): Promise<TracesPage> {
+    const actorId = this.subjectOf(ctx);
+    const window = resolveWindow({ ...(q.since ? { from: q.since } : {}) }, { now: this.d.clock.now(), ...API_LIMITS.contextReaderTraces });
+    const after = q.cursor === undefined ? undefined : traceCursor.decode(q.cursor);
+    const page = await this.d.reader.read(
+      ctx,
+      'traces.list',
+      { actorId, ...q, ...window },
+      (p) => p.traces.length,
+      () =>
+        this.d.auditStore.listTraces({
+          workspaceId: ctx.workspaceId,
+          rootActorId: actorId,
+          ...(window.from ? { from: window.from } : {}),
+          limit: q.limit,
+          ...(after ? { after } : {}),
+        }),
+      meta
+    );
+    return {
+      traces: page.traces,
+      nextCursor: page.nextCursor ? traceCursor.encode(page.nextCursor) : null,
+      from: window.from ?? null,
+      to: null,
+      limit: q.limit,
+    };
+  }
+
+  /** One trace as a span tree, only when its root event is the user's. Other actors in it are pseudonymised. */
+  async getTraceForSubject(ctx: AccessContext, traceId: string, meta: ReadMeta): Promise<TraceTree> {
+    const actorId = this.subjectOf(ctx);
+    const page = await this.d.reader.read(
+      ctx,
+      'traces.get',
+      { actorId, traceId },
+      (p) => p.events.length,
+      async () => {
+        const loaded = await this.d.auditStore.search({ workspaceId: ctx.workspaceId, traceId, order: 'asc', limit: API_LIMITS.traceMaxEvents });
+        return pickRootEvent(loaded.events)?.actor.id === actorId ? loaded : { events: [], nextCursor: null };
+      },
+      meta
+    );
+    if (page.events.length === 0) throw new ApiError(404, 'not_found', 'There is no trace with this id.');
+    const tree = buildTraceTree(traceId, page.events, { truncated: page.nextCursor !== null });
+    const maskNode = (node: (typeof tree.roots)[number]): typeof node => ({
+      ...node,
+      actor: node.actor.id === actorId ? node.actor : { ...node.actor, id: pseudonymizeActorId(ctx.workspaceId, node.actor.id) },
+      children: node.children.map(maskNode),
+    });
+    return { ...tree, roots: tree.roots.map(maskNode) };
   }
 
   async getEvent(ctx: AccessContext, eventId: string, meta: ReadMeta): Promise<ApiEvent> {

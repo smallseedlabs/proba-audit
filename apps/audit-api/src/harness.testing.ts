@@ -29,7 +29,13 @@ import {
   ManualClock,
   SequentialIdGenerator,
   StaticTokenVerifier,
+  createContextBridgeAuth,
+  createContextBridgeSigners,
+  type AssertionOptions,
+  type ContextBridgeSigners,
+  type ServiceTokenOptions,
 } from '@smallseedlabs/proba-audit-adapters';
+import { randomUUID } from 'node:crypto';
 import type { OutgoingHttpHeaders } from 'node:http';
 import type { FastifyInstance } from 'fastify';
 import { buildServer, type ReadinessCheck } from './server.js';
@@ -77,6 +83,8 @@ export function testConfig(overrides: Record<string, string> = {}): AppConfig {
 
 export interface HarnessOptions {
   env?: Record<string, string>;
+  /** Turn the `context-reader` role on, with its two key files written to a temporary directory. */
+  contextReader?: boolean;
   limiter?: RateLimiter;
   readiness?: ReadinessCheck[];
   /** Replace the emitter used for reads (to make auditing fail). */
@@ -94,14 +102,40 @@ export interface Harness {
   logger: MemoryLogger;
   clock: ManualClock;
   get(path: string, token?: string | null, headers?: Record<string, string>): Promise<{ status: number; body: any; headers: OutgoingHttpHeaders }>;
+  /** The signers of the bridge's service token and the Hub's assertion (present when `contextReader` is on). */
+  signers: ContextBridgeSigners;
+  /**
+   * A call as the `context-reader` role: a valid service token and a valid assertion for `actorId` in `workspaceId` unless
+   * overridden, with `actorId` and `workspaceId` appended to the query unless `query` is false.
+   */
+  asContextReader(
+    path: string,
+    options?: {
+      actorId?: string;
+      workspaceId?: string;
+      assertion?: AssertionOptions | string | null;
+      service?: ServiceTokenOptions | string | null;
+      /** The actorId / workspaceId query parameters sent: default the acting user's. `false` sends none. */
+      query?: { actorId?: string | null; workspaceId?: string | null } | false;
+    }
+  ): Promise<{ status: number; body: any; headers: OutgoingHttpHeaders }>;
   /** Everything the API published on the audit topic so far. */
   emitted(): Promise<AuditEvent[]>;
   close(): Promise<void>;
 }
 
 export async function createHarness(options: HarnessOptions = {}): Promise<Harness> {
-  const config = testConfig(options.env);
   const clock = new ManualClock('2026-10-25T12:00:00.000Z');
+  const signers = await createContextBridgeSigners(() => clock.now());
+  const keyEnv: Record<string, string> = options.contextReader
+    ? {
+        AUDIT_API_CONTEXT_READER_ENABLED: 'true',
+        CONTEXT_SERVICE_PUBLIC_KEY_FILE: await signers.service.writeJwks(),
+        HUB_ASSERTION_PUBLIC_KEY_FILE: await signers.hub.writeJwks(),
+      }
+    : {};
+  const config = testConfig({ ...keyEnv, ...options.env });
+  const contextBridge = await createContextBridgeAuth(config, { now: () => clock.now() });
   const ids = new SequentialIdGenerator();
   const logger = new MemoryLogger();
   const store = new InMemoryAuditStore();
@@ -117,6 +151,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
     logger,
     clock,
     verifier: new StaticTokenVerifier({ tokens: config.api.staticTokens, nodeEnv: config.env }),
+    ...(contextBridge ? { contextBridge } : {}),
     limiter,
     auditStore: store,
     auditContentStore: contentStore,
@@ -129,6 +164,20 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
   });
 
   let reader: Subscription | undefined;
+  const request = async (path: string, token: string | null, headers: Record<string, string>) => {
+    const res = await app.inject({
+      method: 'GET',
+      url: path,
+      headers: { ...(token ? { authorization: `Bearer ${token}` } : {}), ...headers },
+    });
+    let body: unknown;
+    try {
+      body = res.json();
+    } catch {
+      body = res.body;
+    }
+    return { status: res.statusCode, body, headers: res.headers };
+  };
   return {
     app,
     config,
@@ -139,19 +188,25 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
     bus,
     logger,
     clock,
+    signers,
     async get(path, token = TOKENS.viewer, headers = {}) {
-      const res = await app.inject({
-        method: 'GET',
-        url: path,
-        headers: { ...(token ? { authorization: `Bearer ${token}` } : {}), ...headers },
-      });
-      let body: unknown;
-      try {
-        body = res.json();
-      } catch {
-        body = res.body;
+      return request(path, token, headers);
+    },
+    async asContextReader(path, o = {}) {
+      const actorId = o.actorId ?? randomUUID();
+      const workspaceId = o.workspaceId ?? WORKSPACE;
+      const token = typeof o.service === 'string' ? o.service : o.service === null ? null : await signers.mintServiceToken(o.service);
+      const assertion =
+        typeof o.assertion === 'string' ? o.assertion : o.assertion === null ? null : await signers.mintAssertion({ sub: actorId, workspaceId, ...o.assertion });
+      const params = new URLSearchParams();
+      if (o.query !== false) {
+        const actor = o.query?.actorId === undefined ? actorId : o.query.actorId;
+        const workspace = o.query?.workspaceId === undefined ? workspaceId : o.query.workspaceId;
+        if (actor !== null) params.set('actorId', actor);
+        if (workspace !== null) params.set('workspaceId', workspace);
       }
-      return { status: res.statusCode, body, headers: res.headers };
+      const joined = params.size > 0 ? `${path}${path.includes('?') ? '&' : '?'}${params.toString()}` : path;
+      return request(joined, token, assertion ? { 'x-act-as': assertion } : {});
     },
     async emitted() {
       reader ??= await bus.subscribe({ topic: TOPIC, group: 'test-reader', consumer: 'c1' });
