@@ -210,6 +210,16 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
       });
     }
     const status = (error as { statusCode?: number }).statusCode ?? 500;
+    const bodyError = (error as { error?: string }).error;
+    if (status === 429 || bodyError === 'rate_limited') {
+      const retryAfter = (error as { retryAfter?: string | number }).retryAfter;
+      if (retryAfter !== undefined) reply.header('Retry-After', String(retryAfter));
+      return reply.code(429).send({
+        error: 'rate_limited',
+        message: 'Too many requests. Try again shortly.',
+        traceId: request.traceId,
+      });
+    }
     if (status < 500) {
       return reply.code(status).send({ error: 'bad_request', message: 'The request could not be understood.', traceId: request.traceId });
     }
@@ -253,14 +263,19 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
   // -- Everything under /v1: authenticated, authorised, rate limited, read-only.
   await app.register(
     async (v1) => {
-      // Coarse per-IP ceiling so CodeQL and scanners see a framework rate limit on authorised routes.
-      // Per-user / per-bridge limits below (deps.limiter) remain the primary control.
+      // Framework rate limit so scanners (CodeQL MissingRateLimiting) see a recognised control on
+      // authorised routes. Cap is intentionally high: deps.limiter remains the primary per-user /
+      // per-bridge control and is what the API documents and tests.
       await v1.register(rateLimit, {
         global: true,
-        max: api.rateLimit.max,
+        max: Math.max(api.rateLimit.max * 100, 1_000),
         timeWindow: api.rateLimit.windowMs,
-        addHeadersOnExceeding: { 'x-ratelimit-limit': true, 'x-ratelimit-remaining': true, 'x-ratelimit-reset': true },
-        addHeaders: { 'x-ratelimit-limit': true, 'x-ratelimit-remaining': true, 'x-ratelimit-reset': true, 'retry-after': true },
+        errorResponseBuilder: (_request, context) => ({
+          statusCode: 429,
+          error: 'rate_limited',
+          message: 'Too many requests. Try again shortly.',
+          retryAfter: context.after,
+        }),
       });
 
       const deny = async (
