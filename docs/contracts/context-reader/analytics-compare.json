@@ -1,0 +1,83 @@
+{
+  "description": "Two periods side by side, for the user's campaigns.",
+  "request": {
+    "method": "GET",
+    "path": "/v1/analytics/compare",
+    "query": {
+      "actorId": "660e8400-e29b-41d4-a716-446655440001",
+      "workspaceId": "seedbed",
+      "currentFrom": "2026-10-25T00:00:00Z",
+      "currentTo": "2026-10-26T00:00:00Z",
+      "granularity": "hour"
+    },
+    "headers": {
+      "Authorization": "Bearer <service token>",
+      "X-Act-As": "<act-as assertion>"
+    }
+  },
+  "response": {
+    "status": 200,
+    "body": {
+      "workspaceId": "seedbed",
+      "granularity": "hour",
+      "current": {
+        "from": "2026-10-25T00:00:00.000Z",
+        "to": "2026-10-26T00:00:00.000Z",
+        "totals": [
+          {
+            "currency": "USD",
+            "impressions": 12000,
+            "clicks": 240,
+            "spend": 96.5,
+            "conversions": 12,
+            "ctr": 0.02,
+            "cpc": 0.402083,
+            "cpm": 8.041667,
+            "cpa": 8.041667,
+            "roas": null,
+            "observationCount": 1
+          }
+        ]
+      },
+      "previous": {
+        "from": "2026-10-24T00:00:00.000Z",
+        "to": "2026-10-25T00:00:00.000Z",
+        "totals": []
+      },
+      "comparison": [
+        {
+          "currency": "USD",
+          "impressions": {
+            "current": 12000,
+            "previous": 0,
+            "change": 12000,
+            "changePct": null
+          },
+          "clicks": {
+            "current": 240,
+            "previous": 0,
+            "change": 240,
+            "changePct": null
+          },
+          "spend": {
+            "current": 96.5,
+            "previous": 0,
+            "change": 96.5,
+            "changePct": null
+          },
+          "conversions": {
+            "current": 12,
+            "previous": 0,
+            "change": 12,
+            "changePct": null
+          }
+        }
+      ],
+      "freshness": {
+        "asOf": "2026-10-25T11:05:00.000Z",
+        "rollupsComputedAt": "2026-10-25T12:00:00.000Z",
+        "observationsFetchedAt": "2026-10-25T11:05:00.000Z"
+      }
+    }
+  }
+}

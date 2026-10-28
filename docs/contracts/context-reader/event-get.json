@@ -1,0 +1,46 @@
+{
+  "description": "One of the user's events that has raw text elsewhere: the answer carries no text, digest or hint of it.",
+  "request": {
+    "method": "GET",
+    "path": "/v1/events/aa0e8400-e29b-41d4-a716-000000000008",
+    "query": {
+      "actorId": "660e8400-e29b-41d4-a716-446655440001",
+      "workspaceId": "seedbed"
+    },
+    "headers": {
+      "Authorization": "Bearer <service token>",
+      "X-Act-As": "<act-as assertion>"
+    }
+  },
+  "response": {
+    "status": 200,
+    "body": {
+      "eventId": "aa0e8400-e29b-41d4-a716-000000000008",
+      "traceId": "aa0e8400-e29b-41d4-a716-00000000006c",
+      "workspaceId": "seedbed",
+      "actor": {
+        "type": "user",
+        "id": "660e8400-e29b-41d4-a716-446655440001"
+      },
+      "service": "hub",
+      "action": "thread.message_received",
+      "category": "command",
+      "outcome": "success",
+      "occurredAt": "2026-10-25T10:08:00.000Z",
+      "details": {},
+      "spanId": "c000000000000001",
+      "goalId": "770e8400-e29b-41d4-a716-446655440002",
+      "threadId": "880e8400-e29b-41d4-a716-446655440003",
+      "version": 1,
+      "tags": [
+        "category:command",
+        "outcome:success",
+        "service:hub"
+      ],
+      "prevHash": null,
+      "ingestedAt": "2026-10-25T10:00:00.000Z",
+      "schemaVersion": 1,
+      "hash": "4b3768e72add7d6c44181de22faba217fbbac8f0adbde3d945d398053379628c"
+    }
+  }
+}
