@@ -59,6 +59,8 @@ CMD ["node", "apps/audit-consumer/dist/index.js"]
 FROM runtime AS audit-api
 COPY --from=builder --chown=proba:proba /app/apps/audit-api/package.json /app/apps/audit-api/
 COPY --from=builder --chown=proba:proba /app/apps/audit-api/dist /app/apps/audit-api/dist
+# npm may nest this workspace dep under apps/audit-api/node_modules (not hoisted to the root).
+COPY --from=prod-deps --chown=proba:proba /app/apps/audit-api/node_modules ./apps/audit-api/node_modules
 ENV PORT=3100
 EXPOSE 3100
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
