@@ -77,15 +77,15 @@ describe('ClickHouse migrations', () => {
       const migrations = loadMigrations(migrationsDir);
 
       const first = await runMigrations(db, migrations);
-      expect(first.applied).toHaveLength(9);
+      expect(first.applied).toHaveLength(10);
       const second = await runMigrations(db, migrations);
       expect(second.applied).toEqual([]);
-      expect(second.skipped).toHaveLength(9);
+      expect(second.skipped).toHaveLength(10);
 
       const rows = await (
         await client.query({ query: 'SELECT version, name FROM schema_migrations ORDER BY version', format: 'JSONEachRow' })
       ).json<{ version: number; name: string }>();
-      expect(rows.map((r) => r.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
+      expect(rows.map((r) => r.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
 
       const tables = await (
         await client.query({
@@ -106,6 +106,7 @@ describe('ClickHouse migrations', () => {
         audit_event_content: 'ReplacingMergeTree',
         audit_events: 'MergeTree',
         ingest_checkpoints: 'ReplacingMergeTree',
+        metric_campaign_map: 'ReplacingMergeTree',
         metric_observation_quarantine: 'MergeTree',
         metric_observations: 'ReplacingMergeTree',
         metric_rollups_daily: 'ReplacingMergeTree',

@@ -442,6 +442,124 @@ serves one workspace's connectors (`INGEST_WORKSPACE_ID`) until the tables get a
    audit events and read functions are the same. Existing development data stays in the tables under `stub:` source refs; clear it (or use a fresh database)
    before pointing a platform at real data.
 
+### Closed loop: campaign analytics to bounded actions (planned)
+
+This section extends the metrics flow already specified above. It does **not** add a second executor, a second event bus, or a Grok/chat routine. proba-audit **stores and serves** events and metric projections. It **does not** emit campaign commands. The analytics bot is a **logical evaluator**. The existing **proba-llm-gateway** owns the bounded LLM/tool loop, Hub approvals, cancel/stop, and Ads-domain dispatch. Replay of the audit/metrics stream **rebuilds projections only** and is never permission to repeat side effects.
+
+First campaign slice: **user-supplied landing page URL** + **one provider** (Reddit first; Microsoft next; Google later; Meta last). Page generation and extra providers stay out of this slice.
+
+```mermaid
+flowchart LR
+  PR[Provider analytics<br/>pull and optional webhook]
+  AD[PlatformConnector adapter]
+  MAP[Normalize + map<br/>workspace / account / probaCampaignId]
+  BUS[(Existing EventBus / outbox)]
+  C[audit-consumer]
+  ING[metrics-ingester]
+  R[rollup]
+  CH[(ClickHouse<br/>observations + rollups)]
+  API[audit-api query<br/>tenant scoped]
+  CTX[Context analytics section]
+  BOT[Analytics bot evaluator]
+  GW[Gateway preflight + locked policy]
+  HUB[Hub exact-action approval]
+  ADS[Ads domain HTTP]
+  PA[Provider action adapter]
+  PR --> AD --> MAP
+  MAP --> ING
+  ING --> CH
+  ING -. metrics.* events .-> BUS --> C
+  C --> CH
+  CH --> R --> CH
+  API --> CH
+  CTX --> API
+  BOT --> CTX
+  BOT -->|decision event only| BUS
+  BOT -->|command via Hub/gateway| GW
+  GW --> HUB
+  GW --> ADS --> PA
+  PA -. execution outcome .-> BUS
+  PA --> PR
+```
+
+#### Four event kinds (do not collapse)
+
+| Kind | Where | Side effects? |
+|------|--------|----------------|
+| **Raw metric observation** | `MetricObservation` → `metric_observations` | No. Higher `revision` restates; missing fields stay absent, never coerced to 0. |
+| **Queryable projection** | hourly/daily rollups + `GET /v1/analytics/*` | No. Derived CTR/CPC/CPM/CPA/ROAS labelled derived; never mixed currencies; `reach` never summed. |
+| **Decision event** | `AuditEvent` (`analytics.evaluated` / report / no-action / blocked) | No. Snapshot + policy version + evidence ids. |
+| **Action command** | Hub `CommandEnvelope` → gateway `POST /v1/runs` → Ads `POST /v1/campaign-actions` | Yes, once, under idempotency. Stream replay must not re-POST. |
+
+#### Mapping and schema (on top of protocol `MetricObservation` v1)
+
+Keep protocol fields: `platform`, provider `accountId` / `campaignId`, optional `adsetId`/`adId`, `granularity`, `periodStart`/`periodEnd` (UTC `Z`), `timezone`, `currency`, `fetchedAt`, `revision`, opaque `sourceRef` (never credentials, never `stub:` for live data).
+
+**Ads event envelope (ad-domain PR #5, head `74d44969cc4fdf55864ff054a9b2333f0a1d10ab`)** — inspect the event, do not assume a summary-only contract:
+
+- `metrics.ingested` `details.observations: [MetricObservation]` plus flattened `platform`, `accountId`, `campaignId` (provider id), `granularity`, `periodStart`/`periodEnd`, `impressions`, `clicks`, `spend`, `conversions`, `currency`, `revision`, `sourceRef`.
+- Audit `event.campaignId` is the **proba** campaign id; `observation.campaignId` is the provider id.
+- `campaign.metrics_attributed` is counts/window only — never a source of observations.
+- Required `conversions` null at Ads is quarantined there (never stored as 0). The same rule applies if a bad event still reaches audit.
+- Source timezone other than UTC is refused by Ads and quarantined here (`timezone_not_utc`); local-midnight bounds are not invented.
+- Dedupe key remains `(workspaceId, platform, accountId, providerCampaignId, granularity, periodStart)` with `revision` replace (not sum).
+
+`audit-consumer` projects those observations into the existing `MetricsStore` after the audit row is durable and before XACK. Identical redelivery upserts again (idempotent). Period totals whose window matches the grain are rolled up; a window longer than two grains is stored as a **cumulative snapshot** and is **not** summed. `GET /v1/analytics/*` is unchanged.
+
+`probaCampaignId` mapping lives in `metric_campaign_map` (migration `0010`, additive `CREATE TABLE IF NOT EXISTS`). Context-reader `campaignIds` (proba UUIDs from `listOwnedCampaignIds`) are translated at query time. `AUDIT_API_SCOPE_SOURCE=metrics` lists accounts from stored observations and does not call a provider.
+
+Protocol v1 currently **requires** impressions, clicks, spend, conversions. A live adapter must **not invent** those: either skip the row, quarantine it, or a later protocol revision makes unsupplied metrics optional. Do not guarantee the same fields across providers.
+
+**Workspace column** is on the metric tables (migration `0009`). `probaCampaignId` is on the mapping table, not rewritten onto `MetricObservation.campaignId` (that field stays the provider id).
+
+Webhook (only where the provider actually supports it): same `PlatformConnector` validation and `upsertObservations` path as pull. Delivery id is the cursor equivalent. Webhooks do not bypass quarantine, revision, or leases.
+
+#### Evaluator (analytics bot) — not an executor
+
+Logical component (process TBD: Hub job or gateway `review_performance` driver). It:
+
+1. Coalesces windowed updates **per `probaCampaignId`** (debounce/cooldown; no LLM per observation).
+2. Cheap deterministic gates **before** any paid model: freshness watermark (`asOf`), sample size / conversion lag window, `run.budget` remaining, cooldown, campaign decision version, kill switch. Fail → `no-action` or **deterministic stop/cap** (below), never a DeepSeek call.
+3. Reads Context `review_performance` packet (analytics section + `analytics_compare` needs already designed). Snapshot/reference: `asOf`, rollup revision/watermark, campaign ids, policy id/version.
+4. Emits one **decision event**: `report` | `no-action` | `blocked` | `propose` (dry-run) | `execute` (only if workspace policy explicitly delegates that exact verb).
+5. If a command is needed, calls **Hub → gateway** with structured `stepType` / verb / `probaCampaignId` / args. It does **not** POST Ads or mint provider tokens.
+
+**Stop/cap safety path is deterministic** and must not require a paid model to pause or apply a configured amount cap. Emergency stop remains Hub `emergency_stop`.
+
+Automated targeting / budget **decrease** / pause: **only** when workspace policy lists that exact verb, within hard decrease/frequency/cooldown/hysteresis limits. Otherwise Hub **exact-action** approval. Targeting edits can increase effective spend or risk; they are **not** automatically “safe”.
+
+New spend / resume / budget **increase**: billing eligibility, hard budgets, Ads revalidation, Hub approval unless **explicitly** delegated. Gateway locked policy already relaxes **ad balance** for analysis/report/pause; it **never** relaxes auth, required Ads readiness, or model caps.
+
+**Stale competing decisions:** one coordination version per `probaCampaignId` (compare-and-set on Ads domain or run store). A decision whose `asOf` / mapping version is behind the campaign version is `blocked`, not executed. Ambiguous Ads/LLM outcomes stay ambiguous; no blind retry of the same idempotency key.
+
+#### Audit linkage
+
+Every decision and command carries `traceId`, `decisionId`, `commandId` / idempotency key, policy id+version, triggering evidence (`asOf`, query window, campaign ids — not raw SQL). Gateway already redacts prompts/replies into `audit_event_content`. Execution outcomes (`tool.executed` / `tool.failed` / Ads domain events) join the same `traceId`. Crash/replay of consumer or bot: projections rebuild; commands are idempotent no-ops if the key already completed.
+
+#### Acceptance sequence (design)
+
+1. Provider (stub first, then one live adapter) → observations in ClickHouse, queryable via `GET /v1/analytics/summary` for that workspace/campaign, `asOf` set. Missing metric not stored as 0.
+2. Context `review_performance` packet contains analytics (or honest `no_analytics_for_campaign`).
+3. Bot emits a **report** decision event (no command).
+4. Bot emits a **dry-run proposal** (pause or cap) with exact args hash; Hub/gateway `awaiting_approval`.
+5. Exact approval → gateway mutate preflight → Ads domain → adapter outcome audited; or reject → no mutate.
+6. Follow-up ingest shows restated metrics; bot `no-action` if within policy.
+7. Negative: duplicate/late observation (revision) does not double-count or re-fire. Insufficient billing blocks **create/resume/increase**, not pause. Stale `asOf` blocks execute. Unauthorized scopes 403. Deterministic stop without LLM. Crash/replay does not duplicate the Ads POST.
+
+#### Already implemented vs still missing
+
+| Piece | Status |
+|-------|--------|
+| EventBus, outbox, audit-consumer, ClickHouse `audit_events` | Implemented |
+| `PlatformConnector` port, stub ingest, revision/cursor, quarantine, rollup, `MetricsAnalytics`, `GET /v1/analytics/*`, context-reader analytics | Implemented (stub data, not live providers) |
+| Ads `metrics.ingested` → existing MetricsStore + `metric_campaign_map` + `AUDIT_API_SCOPE_SOURCE=metrics` + recover/replay from `audit_events` | Implemented in this repo (no evaluator, no provider calls) |
+| Context analytics section + `analytics_compare` | Implemented |
+| Gateway preflight graph, billing lock, Ads HTTP **client**, fail-closed unconfigured Ads, Hub-bound approval gate | Implemented (no Ads service behind the URL) |
+| Live analytics **adapters** (pull/webhook) inside audit | **Out of scope here** (Ads domain fetches; audit consumes events) |
+| Analytics bot evaluator, coalesce/cadence, decision events, dry-run, campaign coordination version | **Missing** (not in audit) |
+| Hub gateway client (approvals/resume/cancel to `/v1/runs`) | **Missing** (not in audit) |
+| Companion LLM function-name mapping on **merged** LLM main | **Missing** on `main` (unmerged `a6af1aa`) |
+
 ### Configuration
 
 | Variable | Default | Meaning |
@@ -467,6 +585,25 @@ docker compose --profile metrics-e2e down
 ```
 
 The profile sets `NODE_ENV=development` and `ALLOW_STUB_CONNECTOR=true` for its own services only; the `apps` profile stays production-like and refuses the stub.
+
+### Recover / replay metrics from the audit log
+
+Audit replay rebuilds ClickHouse observations from `audit_events`. It is **never** permission to call Reddit/Meta/Google or to re-POST Ads commands.
+
+```bash
+# 1. Apply pending migrations to the target database (0010 is CREATE TABLE IF NOT EXISTS).
+#    Do not run this against a shared volume you did not mean to change; local/test DBs only until operators schedule it.
+npm run migrate
+
+# 2. Rebuild one workspace from the durable log (consumer ClickHouse role: INSERT+SELECT).
+npm run build
+node apps/audit-consumer/dist/replay-metrics-cli.js --workspace=seedbed --compute-rollups
+# docker compose --profile apps run --rm --entrypoint node audit-consumer apps/audit-consumer/dist/replay-metrics-cli.js --workspace=seedbed
+```
+
+`--from` / `--to` bound `occurredAt`. The CLI does not select a PlatformConnector and does not publish. A crash between the audit write and the metrics write is also healed by consumer redelivery (identical event, upsert again).
+
+**Protocol pin.** This repo stays on the released tag `proba-protocol#v0.4.0`. Protocol 0.6.0 (`298eeb4b4ba3fe14b4bf5077810ce2f433067984`, unmerged PR #23 stacked on #22) is Zod 4 and has **no 0.6.0 git tag**. Ads analytics PR #5 still emits v0.4.0-compatible `AuditEvent` + `MetricObservation`. Pinning the unmerged SHA here would force an unsafe Zod 3→4 upgrade of every audit schema. When 0.6.0 is tagged, bump the git URL to that commit (not a fake tag).
 
 ### Failure modes (metrics)
 

@@ -35,6 +35,7 @@ GRANT INSERT, SELECT ON proba_audit.metric_rollups_hourly         TO proba_consu
 GRANT INSERT, SELECT ON proba_audit.metric_rollups_daily          TO proba_consumer;
 GRANT INSERT, SELECT ON proba_audit.ingest_checkpoints            TO proba_consumer;
 GRANT INSERT, SELECT ON proba_audit.metric_observation_quarantine TO proba_consumer;
+GRANT INSERT, SELECT ON proba_audit.metric_campaign_map           TO proba_consumer;
 
 -- api: read only.
 GRANT SELECT ON proba_audit.audit_events                  TO proba_api;
@@ -44,3 +45,4 @@ GRANT SELECT ON proba_audit.metric_rollups_hourly         TO proba_api;
 GRANT SELECT ON proba_audit.metric_rollups_daily          TO proba_api;
 GRANT SELECT ON proba_audit.ingest_checkpoints            TO proba_api;
 GRANT SELECT ON proba_audit.metric_observation_quarantine TO proba_api;
+GRANT SELECT ON proba_audit.metric_campaign_map           TO proba_api;

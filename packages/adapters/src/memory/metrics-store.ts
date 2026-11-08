@@ -4,7 +4,9 @@ import {
   alignWindow,
   bucketStart,
   dayBucket,
+  isPeriodDelta,
   type AccountRef,
+  type CampaignBinding,
   type ChangedWindow,
   type MetricsFreshness,
   type Clock,
@@ -56,6 +58,7 @@ export class InMemoryMetricsStore implements MetricsStore {
   private readonly rollups = new Map<string, StoredRollup>();
   /** Insertion sequence per key: lets changedSince work without a wall clock. */
   private readonly inserted = new Map<string, number>();
+  private readonly bindings = new Map<string, CampaignBinding>();
   private seq = 0;
 
   constructor(private readonly clock: Clock = new SystemClock()) {}
@@ -98,8 +101,8 @@ export class InMemoryMetricsStore implements MetricsStore {
     const computedAt = this.clock.isoNow();
     const inWindow = (o: MetricObservation): boolean =>
       Date.parse(o.periodStart) >= Date.parse(from) && Date.parse(o.periodStart) < Date.parse(to);
-    // An hourly rollup only summarises hourly observations.
-    const eligible = (o: MetricObservation): boolean => request.bucket === 'day' || o.granularity === 'hour';
+    // An hourly rollup only summarises hourly observations. Cumulative snapshots are stored but never summed.
+    const eligible = (o: MetricObservation): boolean => isPeriodDelta(o) && (request.bucket === 'day' || o.granularity === 'hour');
     const bucketOf = (o: MetricObservation): { start: string; date?: string; tz?: string } => {
       if (request.bucket === 'hour') return { start: bucketStart(o.periodStart, 'hour') };
       const tz = o.timezone ?? 'UTC';
@@ -281,6 +284,35 @@ export class InMemoryMetricsStore implements MetricsStore {
     }
     if (count === 0 || from === undefined || to === undefined) return null;
     return { from, to, observationCount: count, watermark: String(this.seq) };
+  }
+
+  async listAccounts(workspaceId: string): Promise<AccountRef[]> {
+    const seen = new Map<string, AccountRef>();
+    for (const { workspaceId: ws, observation: o } of this.observations.values()) {
+      if (ws !== workspaceId) continue;
+      const key = `${o.platform}|${o.accountId}`;
+      if (!seen.has(key)) seen.set(key, { platform: o.platform, accountId: o.accountId });
+    }
+    return [...seen.values()].sort((a, b) => a.platform.localeCompare(b.platform) || a.accountId.localeCompare(b.accountId));
+  }
+
+  async upsertCampaignBindings(bindings: readonly CampaignBinding[]): Promise<void> {
+    for (const b of bindings) {
+      this.bindings.set(`${b.workspaceId}|${b.probaCampaignId}`, structuredClone(b));
+    }
+  }
+
+  async resolveCampaignIds(workspaceId: string, ids: readonly string[]): Promise<string[]> {
+    if (ids.length === 0) return [];
+    const out: string[] = [];
+    const seen = new Set<string>();
+    for (const id of ids) {
+      const mapped = this.bindings.get(`${workspaceId}|${id}`)?.providerCampaignId ?? id;
+      if (seen.has(mapped)) continue;
+      seen.add(mapped);
+      out.push(mapped);
+    }
+    return out;
   }
 
   async ping(): Promise<void> {

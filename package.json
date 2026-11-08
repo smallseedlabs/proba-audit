@@ -22,6 +22,7 @@
     "test:integration": "NODE_ENV=test vitest run --config vitest.integration.config.ts",
     "test:integration:ci": "NODE_ENV=test vitest run --config vitest.integration.config.ts --reporter=default --reporter=json --outputFile.json=test-reports/integration.json && node scripts/assert-test-report.mjs test-reports/integration.json",
     "migrate": "npm run build && node packages/adapters/dist/clickhouse/migrate-cli.js",
+    "replay:metrics": "node apps/audit-consumer/dist/replay-metrics-cli.js",
     "dev:consumer": "tsx watch apps/audit-consumer/src/index.ts",
     "dev:api": "tsx watch apps/audit-api/src/index.ts",
     "dev:ingester": "tsx watch apps/metrics-ingester/src/index.ts",

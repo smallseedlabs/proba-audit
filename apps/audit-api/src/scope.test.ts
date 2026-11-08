@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
 import { MemoryLogger, type AccessContext, type PlatformConnector } from '@smallseedlabs/proba-audit-core';
-import { ManualClock } from '@smallseedlabs/proba-audit-adapters';
-import { createConnectorScope, createStaticScope } from './scope.js';
+import { makeObservation } from '@smallseedlabs/proba-audit-core/testing';
+import { InMemoryMetricsStore, ManualClock } from '@smallseedlabs/proba-audit-adapters';
+import { createConnectorScope, createMetricsStoreScope, createStaticScope } from './scope.js';
 
 const ctx = (workspaceId: string): AccessContext => ({ workspaceId, userId: '00000000-0000-4000-8000-000000000001', actor: { type: 'user', id: 'u' } }) as AccessContext;
 const connector = (accounts: string[]): PlatformConnector & { calls: number } => {
@@ -29,6 +30,15 @@ describe('scope sources', () => {
     await s.resolve(ctx('ws'));
     expect(meta.calls).toBe(2);
     expect((await s.resolve(ctx('other'))).accounts).toEqual([]);
+  });
+
+  it('metrics: lists accounts already stored for the workspace and never another', async () => {
+    const store = new InMemoryMetricsStore();
+    await store.upsertObservations('ws', [makeObservation({ accountId: 'act_a' })]);
+    await store.upsertObservations('other', [makeObservation({ accountId: 'secret' })]);
+    const s = createMetricsStoreScope(store, 1000, new ManualClock());
+    expect(await s.resolve(ctx('ws'))).toEqual({ workspaceId: 'ws', accounts: [{ platform: 'meta', accountId: 'act_a' }] });
+    expect(await s.resolve(ctx('other'))).toEqual({ workspaceId: 'other', accounts: [{ platform: 'meta', accountId: 'secret' }] });
   });
 
   it('connectors: one platform failing does not blank the others, and the last good answer is kept', async () => {

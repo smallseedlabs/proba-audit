@@ -11,9 +11,12 @@ import {
   InMemoryLeaseStore,
   InMemoryAuditStore,
   InMemoryEventBus,
+  InMemoryMetricsStore,
+  InMemoryQuarantineStore,
   ManualClock,
   SequentialIdGenerator,
 } from '@smallseedlabs/proba-audit-adapters';
+import { makeAdsMetricsIngestedEvent, makeAdsObservation } from '@smallseedlabs/proba-audit-core/testing';
 import { ConsumerHarness, makeEvent, type HarnessOptions } from './harness.testing.js';
 
 const TOPIC = 'audit';
@@ -632,6 +635,42 @@ describe('chain compatibility', () => {
     await h.pump();
     const [got] = await stored(store, 'seedbed');
     expect(got).toEqual(chainEvent(e, null, '2026-10-25T10:05:00.000Z'));
+  });
+});
+
+describe('AuditConsumer: Ads metric projection', () => {
+  it('projects metrics.ingested onto MetricsStore before ack, and a redelivery does not double-count', async () => {
+    const metricsStore = new InMemoryMetricsStore();
+    const quarantine = new InMemoryQuarantineStore();
+    const { h } = setup({ metricsStore, quarantine });
+    const event = makeAdsMetricsIngestedEvent({ workspaceId: 'seedbed' });
+    await h.publish(event);
+    await h.pump();
+    expect(await h.pending()).toBe(0);
+    const rows = await metricsStore.queryObservations({ workspaceId: 'seedbed' });
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.metrics.impressions).toBe(9);
+    expect(await metricsStore.resolveCampaignIds('seedbed', ['11111111-1111-4111-8111-111111111111'])).toEqual(['cmp_metrics']);
+
+    await h.publish(event);
+    await h.pump();
+    expect(await metricsStore.queryObservations({ workspaceId: 'seedbed' })).toHaveLength(1);
+  });
+
+  it('quarantines a non-UTC observation and still acks the audit event', async () => {
+    const metricsStore = new InMemoryMetricsStore();
+    const quarantine = new InMemoryQuarantineStore();
+    const { h, store } = setup({ metricsStore, quarantine });
+    const event = makeAdsMetricsIngestedEvent({
+      workspaceId: 'seedbed',
+      observation: makeAdsObservation({ timezone: 'Europe/London' }),
+    });
+    await h.publish(event);
+    await h.pump();
+    expect(await h.pending()).toBe(0);
+    expect(await metricsStore.queryObservations({ workspaceId: 'seedbed' })).toEqual([]);
+    expect((await quarantine.list({ workspaceId: 'seedbed' }))[0]?.reason).toBe('timezone_not_utc');
+    expect((await stored(store, 'seedbed'))[0]?.eventId).toBe(event.eventId);
   });
 });
 

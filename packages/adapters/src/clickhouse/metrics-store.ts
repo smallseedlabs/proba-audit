@@ -2,8 +2,10 @@ import type { ClickHouseClient } from '@clickhouse/client';
 import {
   METRIC_QUERY_DEFAULT_LIMIT,
   METRIC_QUERY_MAX_LIMIT,
+  PERIOD_DELTA_SQL,
   alignWindow,
   type AccountRef,
+  type CampaignBinding,
   type ChangedWindow,
   type MetricsFreshness,
   type Clock,
@@ -325,8 +327,8 @@ export class ClickHouseMetricsStore implements MetricsStore {
              toUInt32(count()) AS observation_count,
              ${TS('computedAt')} AS computed_at
       FROM metric_observations FINAL
-      -- an hourly rollup only summarises hourly observations
-      WHERE workspace_id = {workspaceId:String} AND period_start >= ${TS('from')} AND period_start < ${TS('to')} AND granularity = 'hour'
+      -- an hourly rollup only summarises hourly period totals (not cumulative snapshots)
+      WHERE workspace_id = {workspaceId:String} AND period_start >= ${TS('from')} AND period_start < ${TS('to')} AND granularity = 'hour' AND ${PERIOD_DELTA_SQL}
       GROUP BY workspace_id, platform, account_id, campaign_id, adset_id, ad_id, source_granularity, bucket_start, currency`;
     const [{ n }] = await this.rows<{ n: number }>(`SELECT count() AS n FROM (${select})`, params);
     if (Number(n) > 0) {
@@ -353,8 +355,8 @@ export class ClickHouseMetricsStore implements MetricsStore {
     const dayStart = `toStartOfDay(period_start, '${tz}')`;
     const [range] = await this.rows<{ lo: string; hi: string; n: number }>(
       `SELECT toDateTime64(min(${dayStart}), 3, 'UTC') AS lo, toDateTime64(max(${dayStart}), 3, 'UTC') AS hi, count() AS n
-       FROM metric_observations FINAL
-       WHERE workspace_id = {workspaceId:String} AND period_start >= ${TS('from')} AND period_start < ${TS('to')} AND ${inZone}`,
+      FROM metric_observations FINAL
+      WHERE workspace_id = {workspaceId:String} AND period_start >= ${TS('from')} AND period_start < ${TS('to')} AND ${inZone} AND ${PERIOD_DELTA_SQL}`,
       { workspaceId, from, to }
     );
     if (!range || Number(range.n) === 0) return 0;
@@ -378,6 +380,7 @@ export class ClickHouseMetricsStore implements MetricsStore {
       FROM metric_observations FINAL
       WHERE workspace_id = {workspaceId:String}
         AND ${inZone}
+        AND ${PERIOD_DELTA_SQL}
         AND period_start >= ${TS('lo')}
         AND period_start < ${TS('hi')} + INTERVAL 2 DAY
       GROUP BY workspace_id, platform, account_id, campaign_id, adset_id, ad_id, source_granularity, bucket_start, currency, zone_name, bucket_day
@@ -545,6 +548,56 @@ export class ClickHouseMetricsStore implements MetricsStore {
       observationCount: Number(r.n),
       watermark: since !== undefined && Date.parse(watermark) < Date.parse(since) ? since : watermark,
     };
+  }
+
+  async listAccounts(workspaceId: string): Promise<AccountRef[]> {
+    const rows = await this.rows<{ platform: AccountRef['platform']; account_id: string }>(
+      `SELECT DISTINCT platform, account_id FROM metric_observations FINAL
+       WHERE workspace_id = {workspaceId:String}
+       ORDER BY platform, account_id`,
+      { workspaceId }
+    );
+    return rows.map((r) => ({ platform: r.platform, accountId: r.account_id }));
+  }
+
+  async upsertCampaignBindings(bindings: readonly CampaignBinding[]): Promise<void> {
+    if (bindings.length === 0) return;
+    const latest = new Map<string, CampaignBinding>();
+    for (const b of bindings) latest.set(`${b.workspaceId}|${b.probaCampaignId}`, b);
+    const now = this.clock.isoNow();
+    await this.client.insert({
+      table: 'metric_campaign_map',
+      values: [...latest.values()].map((b) => ({
+        workspace_id: b.workspaceId,
+        proba_campaign_id: b.probaCampaignId,
+        platform: b.platform,
+        account_id: b.accountId,
+        provider_campaign_id: b.providerCampaignId,
+        source_event_id: b.sourceEventId,
+        source_trace_id: b.sourceTraceId,
+        updated_at: now,
+      })),
+      format: 'JSONEachRow',
+    });
+  }
+
+  async resolveCampaignIds(workspaceId: string, ids: readonly string[]): Promise<string[]> {
+    if (ids.length === 0) return [];
+    const rows = await this.rows<{ proba_campaign_id: string; provider_campaign_id: string }>(
+      `SELECT proba_campaign_id, provider_campaign_id FROM metric_campaign_map FINAL
+       WHERE workspace_id = {workspaceId:String} AND proba_campaign_id IN {ids:Array(String)}`,
+      { workspaceId, ids: [...ids] }
+    );
+    const mapped = new Map(rows.map((r) => [r.proba_campaign_id, r.provider_campaign_id]));
+    const out: string[] = [];
+    const seen = new Set<string>();
+    for (const id of ids) {
+      const resolved = mapped.get(id) ?? id;
+      if (seen.has(resolved)) continue;
+      seen.add(resolved);
+      out.push(resolved);
+    }
+    return out;
   }
 
   async ping(): Promise<void> {

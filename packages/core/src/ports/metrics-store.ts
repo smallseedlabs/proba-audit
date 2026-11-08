@@ -9,6 +9,7 @@
 
 import type {
   AccountRef,
+  CampaignBinding,
   ChangedWindow,
   MetricsFreshness,
   MetricAggregate,
@@ -58,6 +59,22 @@ export interface MetricsStore {
    * An empty account list sees nothing.
    */
   getFreshness(workspaceId: string, accounts: readonly AccountRef[]): Promise<MetricsFreshness>;
+  /**
+   * Distinct ad accounts that have observations in `workspaceId`. Used as the analytics
+   * scope when Ads (not a PlatformConnector) is the source of metrics. Never calls a provider.
+   */
+  listAccounts(workspaceId: string): Promise<AccountRef[]>;
+  /**
+   * Record workspace → probaCampaignId → provider campaign mappings from Ads audit events.
+   * Latest write per (workspace, probaCampaignId) wins. Empty input is a no-op.
+   */
+  upsertCampaignBindings(bindings: readonly CampaignBinding[]): Promise<void>;
+  /**
+   * Translate campaign ids the caller already has (proba UUID and/or provider id) into the
+   * provider campaign ids stored on observations. Unknown ids are returned unchanged so a
+   * portal query by provider id still matches. Empty input stays empty.
+   */
+  resolveCampaignIds(workspaceId: string, ids: readonly string[]): Promise<string[]>;
   /** Throws if the backing service is unreachable. */
   ping(): Promise<void>;
   close(): Promise<void>;

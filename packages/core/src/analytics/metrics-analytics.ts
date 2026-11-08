@@ -217,13 +217,33 @@ export class MetricsAnalytics {
   async getMetricsSummary(scope: AnalyticsScope, query: SummaryQuery): Promise<MetricsSummary> {
     this.checkScope(scope);
     const q = this.parseSummary(query);
+    const campaignId = q.campaignId ? (await this.store.resolveCampaignIds(scope.workspaceId, [q.campaignId]))[0] ?? q.campaignId : undefined;
+    const campaignIds = scope.campaignIds ? await this.store.resolveCampaignIds(scope.workspaceId, scope.campaignIds) : undefined;
+    const summary = await this.readSummary(scope, q, this.source, campaignId, campaignIds);
+    // Ads daily observations produce daily rollups with source_granularity=day. The default
+    // ingest grain is hour (stub). If a day query finds nothing at the configured grain, try
+    // the other grain rather than inventing zeros. Mixed grains for the same campaign still
+    // prefer the configured grain so they are not added together.
+    if (summary.totals.length === 0 && q.granularity === 'day' && this.source === 'hour') {
+      return this.readSummary(scope, q, 'day', campaignId, campaignIds);
+    }
+    return summary;
+  }
+
+  private async readSummary(
+    scope: AnalyticsScope,
+    q: { from: string; to: string; granularity: MetricGranularity; campaignId?: string },
+    sourceGranularity: MetricGranularity,
+    campaignId: string | undefined,
+    campaignIds: readonly string[] | undefined
+  ): Promise<MetricsSummary> {
     const accounts = scope.accounts;
-    const common = { workspaceId: scope.workspaceId, bucket: q.granularity, from: q.from, to: q.to, accounts, sourceGranularity: this.source, ...(q.campaignId ? { campaignId: q.campaignId } : {}), ...(scope.campaignIds ? { campaignIds: scope.campaignIds } : {}) } as const;
+    const common = { workspaceId: scope.workspaceId, bucket: q.granularity, from: q.from, to: q.to, accounts, sourceGranularity, ...(campaignId ? { campaignId } : {}), ...(campaignIds ? { campaignIds } : {}) } as const;
 
     const [total, series, byCampaign] = await Promise.all([
       this.store.aggregateRollups({ ...common, groupBy: [] }),
       this.store.aggregateRollups({ ...common, groupBy: ['bucket'], limit: ANALYTICS_LIMITS.maxRangeDays[q.granularity] * (q.granularity === 'hour' ? 24 : 1) * 4 }),
-      q.campaignId
+      campaignId
         ? Promise.resolve([] as MetricAggregate[])
         : this.store.aggregateRollups({ ...common, groupBy: ['platform', 'account', 'campaign'], limit: ANALYTICS_LIMITS.maxCampaignRows + 1 }),
     ]);

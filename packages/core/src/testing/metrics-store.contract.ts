@@ -397,6 +397,72 @@ export function runMetricsStoreContract(name: string, factory: () => Promise<Met
       expect((await store.getFreshness(ws, [{ platform: 'google', accountId }])).observationsFetchedAt).toBeNull();
     });
 
+    it('lists distinct accounts of one workspace and maps proba campaign ids without mixing workspaces', async () => {
+      const store = await create();
+      const accountId = uniqueName('act');
+      const otherAccount = uniqueName('act');
+      const otherWs = uniqueName('ws');
+      await store.upsertObservations(ws, [
+        makeObservation({ accountId, campaignId: 'prov_1', ...hour(3) }),
+        makeObservation({ accountId: otherAccount, platform: 'reddit', campaignId: 'prov_2', ...hour(4) }),
+      ]);
+      await store.upsertObservations(otherWs, [makeObservation({ accountId, campaignId: 'prov_other', ...hour(3) })]);
+      expect(await store.listAccounts(ws)).toEqual([
+        { platform: 'meta', accountId },
+        { platform: 'reddit', accountId: otherAccount },
+      ]);
+      expect(await store.listAccounts(otherWs)).toEqual([{ platform: 'meta', accountId }]);
+      expect(await store.listAccounts(uniqueName('empty'))).toEqual([]);
+
+      await store.upsertCampaignBindings([
+        {
+          workspaceId: ws,
+          probaCampaignId: 'proba-c1',
+          platform: 'meta',
+          accountId,
+          providerCampaignId: 'prov_1',
+          sourceEventId: '00000000-0000-4000-8000-000000000001',
+          sourceTraceId: '00000000-0000-4000-8000-000000000002',
+        },
+        {
+          workspaceId: otherWs,
+          probaCampaignId: 'proba-c1',
+          platform: 'meta',
+          accountId,
+          providerCampaignId: 'prov_other',
+          sourceEventId: '00000000-0000-4000-8000-000000000003',
+          sourceTraceId: '00000000-0000-4000-8000-000000000004',
+        },
+      ]);
+      expect(await store.resolveCampaignIds(ws, ['proba-c1', 'already-provider', 'proba-c1'])).toEqual(['prov_1', 'already-provider']);
+      expect(await store.resolveCampaignIds(otherWs, ['proba-c1'])).toEqual(['prov_other']);
+      expect(await store.resolveCampaignIds(ws, [])).toEqual([]);
+      await store.upsertCampaignBindings([]);
+    });
+
+    it('does not add a cumulative snapshot into period rollups', async () => {
+      const store = await create();
+      const accountId = uniqueName('act');
+      await store.upsertObservations(ws, [
+        makeObservation({ accountId, campaignId: 'delta', ...hour(3), metrics: { impressions: 10, clicks: 1, spend: 1, conversions: 0 } }),
+        makeObservation({
+          accountId,
+          campaignId: 'snap',
+          granularity: 'day',
+          periodStart: '2026-10-01T00:00:00.000Z',
+          periodEnd: '2026-10-26T00:00:00.000Z',
+          metrics: { impressions: 9_999, clicks: 9, spend: 9, conversions: 9 },
+        }),
+      ]);
+      await store.computeRollups({ workspaceId: ws, bucket: 'hour', from: '2026-10-01T00:00:00.000Z', to: '2026-10-26T00:00:00.000Z' });
+      await store.computeRollups({ workspaceId: ws, bucket: 'day', from: '2026-10-01T00:00:00.000Z', to: '2026-10-26T00:00:00.000Z' });
+      const hourRows = await store.queryRollups({ workspaceId: ws, bucket: 'hour', accountId });
+      expect(hourRows.map((r) => r.campaignId)).toEqual(['delta']);
+      const dayRows = await store.queryRollups({ workspaceId: ws, bucket: 'day', accountId });
+      expect(dayRows.map((r) => r.campaignId)).toEqual(['delta']);
+      expect((await store.queryObservations({ workspaceId: ws, accountId, campaignId: 'snap' })).map((o) => o.metrics.impressions)).toEqual([9999]);
+    });
+
     // The same platform account, campaign and period exist in two workspaces with different numbers. Every read
     // path must return the caller's workspace only, and a write in one must never replace or skip a row of the other.
     describe('workspace isolation', () => {

@@ -7,15 +7,17 @@ import {
   type IdGenerator,
   type Logger,
   type MetricPlatform,
+  type MetricsStore,
   type PlatformConnector,
   type ScopeResolver,
 } from '@smallseedlabs/proba-audit-core';
 import { createConnectors } from '@smallseedlabs/proba-audit-adapters';
 
 /**
- * Which ad accounts a workspace may see in analytics. The metrics tables carry no workspace column
- * (they are keyed by ad account), so this is where a workspace is tied to its accounts. The scope is
- * produced here, from the authenticated session's workspace, and never from a request parameter.
+ * Which ad accounts a workspace may see in analytics. Metric tables are keyed by workspace_id
+ * (migration 0009) and then ad account. The scope is produced here, from the authenticated
+ * session's workspace, and never from a request parameter. `metrics` lists accounts already
+ * stored; it does not call an ad platform.
  */
 export interface ScopeSource {
   resolve: ScopeResolver;
@@ -27,6 +29,8 @@ export interface ScopeDeps {
   logger: Logger;
   clock: Clock;
   ids: IdGenerator;
+  /** Required when AUDIT_API_SCOPE_SOURCE=metrics (Ads-driven, no provider listAccounts). */
+  metricsStore?: MetricsStore;
 }
 
 /** AUDIT_API_ANALYTICS_ACCOUNTS: a fixed list of accounts for the configured workspace. */
@@ -37,6 +41,27 @@ export function createStaticScope(workspaceId: string, accounts: readonly { plat
     },
     async close() {
       // Nothing to release.
+    },
+  };
+}
+
+/**
+ * Accounts already stored in MetricsStore for the workspace. Used when Ads emits
+ * observations onto the audit stream and there is no PlatformConnector to list.
+ * Never opens a provider HTTP client.
+ */
+export function createMetricsStoreScope(metricsStore: MetricsStore, cacheMs: number, clock: Clock): ScopeSource {
+  let cached: { at: number; workspaceId: string; scope: AnalyticsScope } | undefined;
+  return {
+    async resolve(ctx: AccessContext): Promise<AnalyticsScope> {
+      const now = clock.now().getTime();
+      if (cached && cached.workspaceId === ctx.workspaceId && now - cached.at < cacheMs) return cached.scope;
+      const accounts = await metricsStore.listAccounts(ctx.workspaceId);
+      cached = { at: now, workspaceId: ctx.workspaceId, scope: { workspaceId: ctx.workspaceId, accounts } };
+      return cached.scope;
+    },
+    async close() {
+      // The MetricsStore is owned by the runtime.
     },
   };
 }
@@ -81,5 +106,9 @@ export function createScopeRegistry(): AdapterRegistry<ScopeSource, ScopeDeps> {
     .register('connectors', async ({ config, logger, clock, ids }) => {
       const connectors = await createConnectors(config, { logger, clock, ids });
       return createConnectorScope(config.api.workspaceId, connectors, { cacheMs: config.api.scopeCacheMs, clock, logger });
+    })
+    .register('metrics', ({ metricsStore, clock, config }) => {
+      if (!metricsStore) throw new Error('AUDIT_API_SCOPE_SOURCE=metrics requires a MetricsStore');
+      return createMetricsStoreScope(metricsStore, config.api.scopeCacheMs, clock);
     });
 }
