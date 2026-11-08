@@ -24,6 +24,8 @@ runService({
     await runtime.anchorStore?.ping();
     await runtime.leaseStore?.ping();
     await runtime.eventBus.ping();
+    await runtime.metricsStore.ping();
+    await runtime.quarantineStore.ping();
 
     // The consumer audits itself through the same emitter and bus as every service.
     // 'swallow': an audit hiccup must never stop audit ingestion.
@@ -50,6 +52,8 @@ runService({
       clock: runtime.clock,
       ids: runtime.ids,
       logger,
+      metricsStore: runtime.metricsStore,
+      quarantine: runtime.quarantineStore,
       emitter,
       options: {
         topic: config.eventBus.auditTopic,

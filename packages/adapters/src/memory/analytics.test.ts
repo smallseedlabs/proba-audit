@@ -121,6 +121,49 @@ describe('getMetricsSummary', () => {
     expect(hourly.totals[0].impressions).toBe(1000);
     expect(daily.totals[0].impressions).toBe(777);
   });
+
+  it('falls back to day-source rollups when the workspace has no hour-source daily data', async () => {
+    const store = new InMemoryMetricsStore();
+    await store.upsertObservations('ws_1', [
+      makeObservation({
+        accountId: 'a',
+        campaignId: 'cmp_metrics',
+        granularity: 'day',
+        periodStart: '2026-10-26T00:00:00.000Z',
+        periodEnd: '2026-10-27T00:00:00.000Z',
+        timezone: 'UTC',
+        metrics: { impressions: 9, clicks: 1, spend: 2, conversions: 0 },
+      }),
+    ]);
+    await store.computeRollups({ workspaceId: 'ws_1', bucket: 'day', from: '2026-10-26T00:00:00.000Z', to: '2026-10-27T00:00:00.000Z' });
+    const s = await new MetricsAnalytics(store).getMetricsSummary(scope(['a']), day);
+    expect(s.totals[0].impressions).toBe(9);
+  });
+
+  it('resolves a proba campaign id through the campaign map', async () => {
+    const store = new InMemoryMetricsStore();
+    await store.upsertObservations('ws_1', [hour('2026-10-26T10:00:00.000Z', { accountId: 'a1', campaignId: 'cmp_metrics' })]);
+    await store.computeRollups({ workspaceId: 'ws_1', bucket: 'day', from: '2026-10-26T00:00:00.000Z', to: '2026-10-27T00:00:00.000Z' });
+    await store.upsertCampaignBindings([
+      {
+        workspaceId: 'ws_1',
+        probaCampaignId: '11111111-1111-4111-8111-111111111111',
+        platform: 'meta',
+        accountId: 'a1',
+        providerCampaignId: 'cmp_metrics',
+        sourceEventId: '00000000-0000-4000-8000-000000000001',
+        sourceTraceId: '00000000-0000-4000-8000-000000000002',
+      },
+    ]);
+    const analytics = new MetricsAnalytics(store);
+    const byProba = await analytics.getMetricsSummary(scope(['a1']), {
+      ...day,
+      campaignId: '11111111-1111-4111-8111-111111111111',
+    });
+    expect(byProba.totals[0].impressions).toBe(1000);
+    const unknown = await analytics.getMetricsSummary(scope(['a1']), { ...day, campaignId: 'no-such' });
+    expect(unknown.totals).toEqual([]);
+  });
 });
 
 describe('strict argument validation', () => {

@@ -3,7 +3,12 @@
  *
  * Guarantees
  * - A message is acknowledged only after the AuditStore accepted its event (or
- *   after it was recognised as an identical duplicate, or dead-lettered).
+ *   after it was recognised as an identical duplicate, or dead-lettered) and, when
+ *   a MetricsStore is wired, after Ads metric observations in that event were
+ *   projected (or quarantined). Projection never calls an ad platform.
+ * - Ads `metrics.ingested` / `metrics.restated` observations are upserted into the
+ *   existing MetricsStore (revision replace, not sum). Identical redelivery is a
+ *   no-op write. Malformed or non-UTC rows go to metric_observation_quarantine.
  * - Redelivery is harmless: events already stored with identical content are
  *   skipped BEFORE chaining, so a duplicate never leaves a gap in the hash chain.
  * - An eventId that is already stored with different content is never written; it
@@ -53,9 +58,12 @@ import {
   type IdGenerator,
   type LeaseStore,
   type Logger,
+  type MetricsStore,
+  type QuarantineStore,
   type StoredAuditContent,
   type StoredAuditEvent,
   type Subscription,
+  applyMetricEventProjection,
 } from '@smallseedlabs/proba-audit-core';
 
 export interface AuditConsumerOptions {
@@ -109,6 +117,13 @@ export interface AuditConsumerDeps {
   logger: Logger;
   /** Self-audit emitter (should be created with failureMode 'swallow'). Omit to disable self-audit. */
   emitter?: AuditEmitter;
+  /**
+   * When set with `quarantine`, Ads `metrics.ingested` observations are upserted into the
+   * existing MetricsStore after the audit row is durable and before XACK. Replay of the
+   * stream never calls an ad platform.
+   */
+  metricsStore?: MetricsStore;
+  quarantine?: QuarantineStore;
   options: AuditConsumerOptions;
 }
 
@@ -571,6 +586,13 @@ export class AuditConsumer {
       duplicates += result.duplicates;
     }
 
+    // 5c. Project Ads metric observations into MetricsStore. Must happen before XACK so a
+    // crash here retries (identical audit duplicate + another upsert, which is idempotent).
+    await this.projectMetrics(
+      [...fresh, ...redelivered].map((c) => c.event),
+      logger
+    );
+
     // 6. Acknowledge what is durable, dead-letter the rest.
     if (toAck.length > 0) await sub.ack(toAck.map((m) => m.id));
     for (const d of deadLetters) await sub.deadLetter([d.message], d.reason);
@@ -635,6 +657,26 @@ export class AuditConsumer {
       } catch (err) {
         logger.error('chain anchor not stored; will retry with the next batch', { err: new Error(errorMessage(err)), workspaceId });
       }
+    }
+  }
+
+  private async projectMetrics(events: AuditEvent[], logger: Logger): Promise<void> {
+    const { metricsStore, quarantine } = this.deps;
+    if (!metricsStore || !quarantine || events.length === 0) return;
+    const result = await applyMetricEventProjection(events, {
+      metricsStore,
+      quarantine,
+      ids: this.deps.ids,
+      clock: this.deps.clock,
+    });
+    if (result.projected > 0 || result.quarantined > 0) {
+      logger.info('metric events projected', {
+        projected: result.projected,
+        quarantined: result.quarantined,
+        written: result.written,
+        skippedStale: result.skippedStale,
+        bindings: result.bindings,
+      });
     }
   }
 

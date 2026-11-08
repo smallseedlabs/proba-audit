@@ -112,9 +112,10 @@ describe('migration runner', () => {
       '0007_audit_read_indexes.sql',
       '0008_audit_event_content.sql',
       '0009_metrics_workspace.sql',
+      '0010_metric_campaign_map.sql',
     ]);
-    expect(m.map((x) => x.statements.length)).toEqual([1, 1, 2, 1, 2, 2, 8, 2, 12]);
-    expect(new Set(m.map((x) => x.checksum)).size).toBe(9);
+    expect(m.map((x) => x.statements.length)).toEqual([1, 1, 2, 1, 2, 2, 8, 2, 12, 1]);
+    expect(new Set(m.map((x) => x.checksum)).size).toBe(10);
   });
 
   it('keeps every statement idempotent', () => {
@@ -127,9 +128,9 @@ describe('migration runner', () => {
   it('applies pending migrations in order and records them', async () => {
     const { db, commands, recorded } = fakeDb();
     const result = await runMigrations(db, loadMigrations(migrationsDir));
-    expect(result.applied).toHaveLength(9);
-    expect(commands).toHaveLength(31);
-    expect(recorded.map((r) => r.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    expect(result.applied).toHaveLength(10);
+    expect(commands).toHaveLength(32);
+    expect(recorded.map((r) => r.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
   });
 
   it('skips applied migrations and only runs new ones', async () => {
@@ -146,9 +147,10 @@ describe('migration runner', () => {
       '0007_audit_read_indexes.sql',
       '0008_audit_event_content.sql',
       '0009_metrics_workspace.sql',
+      '0010_metric_campaign_map.sql',
     ]);
-    expect(commands).toHaveLength(30);
-    expect(recorded.map((r) => r.version)).toEqual([2, 3, 4, 5, 6, 7, 8, 9]);
+    expect(commands).toHaveLength(31);
+    expect(recorded.map((r) => r.version)).toEqual([2, 3, 4, 5, 6, 7, 8, 9, 10]);
   });
 
   it('refuses to continue when an applied migration was edited', async () => {
@@ -197,6 +199,16 @@ describe('migration 0008', () => {
     expect(sql).toMatch(/CREATE TABLE IF NOT EXISTS audit_event_content/);
     expect(sql).toMatch(/ORDER BY \(workspace_id, event_id\)/);
     expect(sql).toMatch(/PARTITION BY toYYYYMM\(occurred_at\)/);
+  });
+});
+
+describe('migration 0010', () => {
+  it('adds metric_campaign_map idempotently without rebuilding observation tables', () => {
+    const m = loadMigrations(migrationsDir).find((x) => x.filename === '0010_metric_campaign_map.sql')!;
+    expect(m.statements).toHaveLength(1);
+    expect(m.statements[0]).toMatch(/^CREATE TABLE IF NOT EXISTS metric_campaign_map/);
+    expect(m.statements[0]).toMatch(/ORDER BY \(workspace_id, proba_campaign_id\)/);
+    expect(m.statements[0]).not.toMatch(/EXCHANGE TABLES|DROP TABLE metric_observations/);
   });
 });
 

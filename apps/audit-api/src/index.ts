@@ -39,7 +39,7 @@ async function main(): Promise<void> {
   const deps = { config, logger, clock: runtime.clock, ids: runtime.ids, clickhouse: clickHouseOptionsFor(config, 'api') };
   const verifier = await registries.tokenVerifier.create(config.api.adapters.tokenVerifier, deps);
   const limiter = await registries.rateLimiter.create(config.api.adapters.rateLimiter, deps);
-  const scope = await createScopeRegistry().create(config.api.adapters.scopeSource, deps);
+  const scope = await createScopeRegistry().create(config.api.adapters.scopeSource, { ...deps, metricsStore: runtime.metricsStore });
   logger.info(config.content.enabled ? 'raw text of audit events is served to administrators (AUDIT_CONTENT_ENABLED)' : 'raw text of audit events is disabled (AUDIT_CONTENT_ENABLED=false)', { lifecycle: 'content_mode', contentEnabled: config.content.enabled });
   logger.info('api adapters created', {
     lifecycle: 'adapters_created',

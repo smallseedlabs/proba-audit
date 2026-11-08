@@ -74,6 +74,7 @@ docker compose --profile metrics-e2e down
 | `npm test` / `test:ci` | Unit tests (in-memory); `test:ci` fails on skipped tests |
 | `npm run test:integration` | Contract + migration tests against real ClickHouse and Redis |
 | `npm run migrate` | Build, then create the database and apply ClickHouse migrations |
+| `npm run replay:metrics -- --workspace=<id>` | Rebuild observations from `audit_events` (no provider calls). Optional `--from`, `--to`, `--compute-rollups` |
 
 ## Swapping adapters
 
@@ -86,8 +87,11 @@ Every adapter must pass its port's contract suite (`runEventBusContract(...)` et
 
 ## Protocol dependency
 
-The audit/metric contract comes from `@smallseedlabs/proba-protocol/audit` (released in proba-protocol `v0.3.1`),
-installed from the release tag: `github:smallseedlabs/proba-protocol#v0.3.1`. Schemas are never copied into this repo.
+The audit/metric contract comes from `@smallseedlabs/proba-protocol/audit` (released in proba-protocol `v0.4.0`),
+installed from the release tag: `github:smallseedlabs/proba-protocol#v0.4.0`. Schemas are never copied into this repo.
+Protocol 0.6.0 (`298eeb4b4ba3fe14b4bf5077810ce2f433067984` on unmerged PR #23) is Zod 4 and is **not** pinned here: there is no `v0.6.0` tag, and Ads analytics PR #5 still emits v0.4.0-compatible events.
+
+Ads `POST /v1/metrics-fetch` observations arrive on Redis `proba.audit.events`. The audit-consumer writes the audit log **and** upserts those observations into the existing ClickHouse metrics tables (no second service). Rebuild from the log with `npm run replay:metrics -- --workspace=<id>` (no provider calls). Set `AUDIT_API_SCOPE_SOURCE=metrics` so analytics lists accounts from stored rows.
 
 ## License
 

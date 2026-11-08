@@ -17,6 +17,8 @@ import {
   type Clock,
   type EventBus,
   type IdGenerator,
+  type MetricsStore,
+  type QuarantineStore,
   type Subscription,
 } from '@smallseedlabs/proba-audit-core';
 import { AuditConsumer, type AuditConsumerOptions } from './consumer.js';
@@ -28,6 +30,8 @@ export interface HarnessOptions {
   anchors?: AnchorStore;
   /** Share one LeaseStore between harnesses to test several consumer instances. */
   leases?: LeaseStore;
+  metricsStore?: MetricsStore;
+  quarantine?: QuarantineStore;
   clock: Clock;
   ids: IdGenerator;
   topic: string;
@@ -79,6 +83,8 @@ export class ConsumerHarness {
       ...(h.contentStore ? { contentStore: h.contentStore } : {}),
       ...(h.anchors ? { anchors: h.anchors } : {}),
       ...(h.leases ? { leases: h.leases, leaseOwnerId: h.consumerName ?? 'consumer-1' } : {}),
+      ...(h.metricsStore ? { metricsStore: h.metricsStore } : {}),
+      ...(h.quarantine ? { quarantine: h.quarantine } : {}),
       clock: h.clock,
       ids: h.ids,
       logger: this.logger,

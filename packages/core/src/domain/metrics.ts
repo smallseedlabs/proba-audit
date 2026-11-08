@@ -189,3 +189,17 @@ export interface MetricsFreshness {
   /** When an ad platform was last asked for the data stored; null when there are none. */
   observationsFetchedAt: string | null;
 }
+
+/**
+ * Maps a Proba campaign id (audit `event.campaignId`, context-reader scope) to the
+ * provider campaign id stored on MetricObservation.campaignId.
+ */
+export interface CampaignBinding {
+  workspaceId: string;
+  probaCampaignId: string;
+  platform: MetricPlatform;
+  accountId: string;
+  providerCampaignId: string;
+  sourceEventId: string;
+  sourceTraceId: string;
+}

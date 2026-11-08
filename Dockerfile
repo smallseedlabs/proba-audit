@@ -56,6 +56,11 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
   CMD node -e "require('http').get('http://localhost:'+process.env.PORT+'/health', (r) => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"
 CMD ["node", "apps/audit-consumer/dist/index.js"]
 
+# One-shot: rebuild metric observations from audit_events. Never calls an ad platform.
+FROM audit-consumer AS metrics-replay
+HEALTHCHECK NONE
+ENTRYPOINT ["node", "apps/audit-consumer/dist/replay-metrics-cli.js"]
+
 FROM runtime AS audit-api
 COPY --from=builder --chown=proba:proba /app/apps/audit-api/package.json /app/apps/audit-api/
 COPY --from=builder --chown=proba:proba /app/apps/audit-api/dist /app/apps/audit-api/dist

@@ -11,3 +11,4 @@ export * from './runtime/index.js';
 export * from './registry.js';
 export * from './audit/index.js';
 export * from './analytics/index.js';
+export * from './metrics/index.js';
