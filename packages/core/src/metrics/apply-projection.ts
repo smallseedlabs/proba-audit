@@ -5,6 +5,7 @@
  */
 
 import type { AuditEvent } from '../domain/audit.js';
+import type { CampaignBinding } from '../domain/metrics.js';
 import type { Clock } from '../ports/clock.js';
 import type { IdGenerator } from '../ports/id-generator.js';
 import type { MetricsStore } from '../ports/metrics-store.js';
@@ -68,6 +69,7 @@ export async function applyMetricEventProjection(
     ignored: 0,
   };
   const byWorkspace = new Map<string, ProjectedObservation[]>();
+  const extraBindings: CampaignBinding[] = [];
   const quarantined: QuarantinedObservation[] = [];
   const now = deps.clock.isoNow();
 
@@ -76,6 +78,9 @@ export async function applyMetricEventProjection(
     if (extracted.ignored) {
       result.ignored += 1;
       continue;
+    }
+    if (extracted.bindings) {
+      extraBindings.push(...extracted.bindings);
     }
     for (const row of extracted.observations) {
       const list = byWorkspace.get(row.workspaceId) ?? [];
@@ -105,6 +110,11 @@ export async function applyMetricEventProjection(
       await deps.metricsStore.upsertCampaignBindings(bindings);
       result.bindings += bindings.length;
     }
+  }
+
+  if (extraBindings.length > 0) {
+    await deps.metricsStore.upsertCampaignBindings(extraBindings);
+    result.bindings += extraBindings.length;
   }
 
   return result;

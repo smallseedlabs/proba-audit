@@ -552,8 +552,11 @@ export class ClickHouseMetricsStore implements MetricsStore {
 
   async listAccounts(workspaceId: string): Promise<AccountRef[]> {
     const rows = await this.rows<{ platform: AccountRef['platform']; account_id: string }>(
-      `SELECT DISTINCT platform, account_id FROM metric_observations FINAL
-       WHERE workspace_id = {workspaceId:String}
+      `SELECT DISTINCT platform, account_id FROM (
+         SELECT platform, account_id FROM metric_observations FINAL WHERE workspace_id = {workspaceId:String}
+         UNION ALL
+         SELECT platform, account_id FROM metric_campaign_map FINAL WHERE workspace_id = {workspaceId:String}
+       )
        ORDER BY platform, account_id`,
       { workspaceId }
     );

@@ -24,6 +24,7 @@ import type { AuditEvent } from '../domain/audit.js';
 import type { CampaignBinding, MetricObservation, MetricPlatform } from '../domain/metrics.js';
 
 const PROJECT_ACTIONS = new Set(['metrics.ingested', 'metrics.restated', 'metrics.observation_stored']);
+const BINDING_ACTIONS = new Set(['campaign.launched', 'campaign.created', 'metrics.fetch_started']);
 
 const UTC_ZONES = new Set(['UTC', 'Etc/UTC']);
 
@@ -48,10 +49,11 @@ export interface ProjectedObservation {
 }
 
 export interface EventProjection {
-  /** True when the action is not a metric observation carrier. */
+  /** True when the action is not a metric observation carrier and has no campaign binding. */
   ignored: boolean;
   observations: ProjectedObservation[];
   quarantined: ProjectionIssue[];
+  bindings?: CampaignBinding[];
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -213,8 +215,34 @@ function candidateFromFlattened(event: AuditEvent, details: Record<string, unkno
   };
 }
 
+function standaloneBindingOf(event: AuditEvent): CampaignBinding | undefined {
+  if (!BINDING_ACTIONS.has(event.action)) return undefined;
+  const probaCampaignId = event.campaignId;
+  if (!probaCampaignId) return undefined;
+  const details = asRecord(event.details) ?? {};
+  const platform = asString(details.platform);
+  const accountId = asString(details.accountId) ?? asString(details.providerAccountId);
+  const providerCampaignId = asString(details.providerCampaignId);
+  if (!platform || !isMetricPlatform(platform) || !accountId || !providerCampaignId || probaCampaignId === providerCampaignId) {
+    return undefined;
+  }
+  return {
+    workspaceId: event.workspaceId,
+    probaCampaignId,
+    platform,
+    accountId,
+    providerCampaignId,
+    sourceEventId: event.eventId,
+    sourceTraceId: event.traceId,
+  };
+}
+
 export function projectMetricAuditEvent(event: AuditEvent): EventProjection {
   if (!PROJECT_ACTIONS.has(event.action)) {
+    const binding = standaloneBindingOf(event);
+    if (binding) {
+      return { ignored: false, observations: [], quarantined: [], bindings: [binding] };
+    }
     return { ignored: true, observations: [], quarantined: [] };
   }
   const details = asRecord(event.details) ?? {};
